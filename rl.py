@@ -2,6 +2,7 @@
 
 import json
 import math
+import random
 import sys
 
 _ACTIONS = {
@@ -117,12 +118,8 @@ def _reachable_cells(env):
     return seen
 
 
-def _is_finite_number(value):
-    return (
-        isinstance(value, (int, float))
-        and not isinstance(value, bool)
-        and math.isfinite(value)
-    )
+def _is_real_number(value):
+    return isinstance(value, (int, float)) and not isinstance(value, bool)
 
 
 def value_iteration(env, gamma=0.9, tolerance=1e-9, max_iterations=10000):
@@ -133,14 +130,14 @@ def value_iteration(env, gamma=0.9, tolerance=1e-9, max_iterations=10000):
     """
     if not isinstance(env, GridWorld):
         raise TypeError("env must be a GridWorld")
-    if not _is_finite_number(gamma):
-        raise TypeError("gamma must be a finite int or float")
-    if gamma < 0 or gamma >= 1:
-        raise ValueError("gamma must be in [0, 1)")
-    if not _is_finite_number(tolerance):
-        raise TypeError("tolerance must be a finite int or float")
-    if tolerance <= 0:
-        raise ValueError("tolerance must be in (0, +inf)")
+    if not _is_real_number(gamma):
+        raise TypeError("gamma must be an int or float")
+    if not math.isfinite(gamma) or gamma < 0 or gamma >= 1:
+        raise ValueError("gamma must be finite and in [0, 1)")
+    if not _is_real_number(tolerance):
+        raise TypeError("tolerance must be an int or float")
+    if not math.isfinite(tolerance) or tolerance <= 0:
+        raise ValueError("tolerance must be finite and in (0, +inf)")
     if isinstance(max_iterations, bool) or not isinstance(max_iterations, int):
         raise TypeError("max_iterations must be an int")
     if max_iterations <= 0:
@@ -171,6 +168,75 @@ def value_iteration(env, gamma=0.9, tolerance=1e-9, max_iterations=10000):
         if delta <= tolerance:
             return values, iterations
     raise RuntimeError("value iteration did not converge")
+
+
+def q_learning(env, episodes=500, alpha=0.5, gamma=0.9, epsilon=0.1, seed=0):
+    """epsilon-贪心 Q-learning，返回 {((row, col), action): float} 的 Q 表。
+
+    键覆盖从 S 四向避墙可达的所有非 G 格子与 U/R/D/L 四个动作；
+    同种子逐轨迹可复现。
+    """
+    if not isinstance(env, GridWorld):
+        raise TypeError("env must be a GridWorld")
+    if isinstance(episodes, bool) or not isinstance(episodes, int):
+        raise TypeError("episodes must be an int")
+    if episodes <= 0:
+        raise ValueError("episodes must be positive")
+    if not _is_real_number(alpha):
+        raise TypeError("alpha must be an int or float")
+    if not math.isfinite(alpha) or alpha <= 0 or alpha > 1:
+        raise ValueError("alpha must be finite and in (0, 1]")
+    if not _is_real_number(gamma):
+        raise TypeError("gamma must be an int or float")
+    if not math.isfinite(gamma) or gamma < 0 or gamma >= 1:
+        raise ValueError("gamma must be finite and in [0, 1)")
+    if not _is_real_number(epsilon):
+        raise TypeError("epsilon must be an int or float")
+    if not math.isfinite(epsilon) or epsilon < 0 or epsilon > 1:
+        raise ValueError("epsilon must be finite and in [0, 1]")
+    if isinstance(seed, bool) or not isinstance(seed, int):
+        raise TypeError("seed must be an int")
+
+    actions = tuple(_ACTIONS)
+    states = [
+        state
+        for state in sorted(_reachable_cells(env))
+        if env._cell(state) != "G"
+    ]
+    q_values = {
+        (state, action): 0.0 for state in states for action in actions
+    }
+
+    def greedy_action(state):
+        action = actions[0]
+        best_q = q_values[(state, actions[0])]
+        for candidate in actions[1:]:
+            candidate_q = q_values[(state, candidate)]
+            if candidate_q > best_q:
+                best_q = candidate_q
+                action = candidate
+        return action, best_q
+
+    rng = random.Random(seed)
+    for _ in range(episodes):
+        state = env.reset()
+        for _ in range(1000):
+            if rng.random() < epsilon:
+                action = actions[rng.randrange(4)]
+            else:
+                action = greedy_action(state)[0]
+            next_state, reward, done = env.step(action)
+            if done:
+                target = reward
+            else:
+                target = reward + gamma * greedy_action(next_state)[1]
+            q_values[(state, action)] += alpha * (
+                target - q_values[(state, action)]
+            )
+            if done:
+                break
+            state = next_state
+    return q_values
 
 
 def _format_value(value):
