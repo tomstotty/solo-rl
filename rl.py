@@ -950,6 +950,66 @@ def gae_actor_critic(
     return {"h": h_table, "v": v_table, "episodes": episode_results}
 
 
+def _to_finite_float(value, name):
+    """将非 bool 的 int/float 转为有限 float，否则抛相应异常。"""
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise TypeError("%s must be an int or float" % name)
+    try:
+        result = float(value)
+    except OverflowError:
+        raise ValueError(
+            "%s must be convertible to a finite float" % name
+        )
+    if not math.isfinite(result):
+        raise ValueError("%s must be a finite number" % name)
+    return result
+
+
+def generalized_advantage_estimate(
+    rewards, values, gamma=0.9, lambda_=0.95, bootstrap=0.0
+) -> dict:
+    """广义优势估计（GAE），返回 {"advantages": A, "returns": A+v}。
+
+    rewards、values 须为非空等长的 list 或 tuple，元素为非 bool 的
+    int/float 且可转为有限 float；gamma、lambda_、bootstrap 遵循同一
+    类型及转换规则，且 gamma、lambda_ 须在 [0, 1]。校验后复制为
+    float 序列 r、v 及 float 标量 g、l、b，不修改输入。
+
+    令 T=len(r)、n=0.0、A 为 T 个 0.0；按 t 从 T-1 降至 0，计算
+    d=r[t]+g*(b if t==T-1 else v[t+1])-v[t]、A[t]=d+g*l*n，
+    再令 n=A[t]。返回新 dict，键序固定为 advantages、returns；值依次
+    为 A 和 [A[t]+v[t] for t in range(T)]，均为按原时序排列的 float
+    新 list。
+    """
+    if not isinstance(rewards, (list, tuple)):
+        raise TypeError("rewards must be a list or tuple")
+    if not isinstance(values, (list, tuple)):
+        raise TypeError("values must be a list or tuple")
+    if not rewards or len(rewards) != len(values):
+        raise ValueError("rewards and values must be non-empty and equal length")
+    r = [_to_finite_float(reward, "reward") for reward in rewards]
+    v = [_to_finite_float(value, "value") for value in values]
+    g = _to_finite_float(gamma, "gamma")
+    l = _to_finite_float(lambda_, "lambda_")
+    b = _to_finite_float(bootstrap, "bootstrap")
+    if g < 0 or g > 1:
+        raise ValueError("gamma must be in [0, 1]")
+    if l < 0 or l > 1:
+        raise ValueError("lambda_ must be in [0, 1]")
+
+    T = len(r)
+    n = 0.0
+    A = [0.0] * T
+    for t in range(T - 1, -1, -1):
+        d = r[t] + g * (b if t == T - 1 else v[t + 1]) - v[t]
+        A[t] = d + g * l * n
+        n = A[t]
+    return {
+        "advantages": A,
+        "returns": [A[t] + v[t] for t in range(T)],
+    }
+
+
 def evaluate(env, h, episodes, max_steps, seed, window, threshold) -> dict:
     """按 softmax 策略评估偏好 H，返回回合统计与收敛判定。
 
