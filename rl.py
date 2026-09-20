@@ -1844,6 +1844,259 @@ def ppo_stability_report(data, threshold=0.9, stable_ratio=1.0) -> dict:
     }
 
 
+def ppo_reproducibility_report(left, right) -> dict:
+    """逐字段比较两份 ppo_evaluate_many 返回值，返回可复现性报告。
+
+    left、right 均须为 ppo_evaluate_many 的完整返回值：顶层键序依次为
+    results、means、passed、converged；results 为非空 list，每项为键序
+    seed、result 的 dict，seed 为非 bool 的 int（允许重复，按位置区分），
+    result 为 ppo_evaluate 的完整返回（键序 episodes、success_rate、
+    windows、converged）；episodes 为非空 list，每行恰为三项 list：
+    steps 为非 bool 正 int，reward 为有限的非 bool int/float，done 为
+    bool；success_rate 为 [0, 1] 内的有限 float；windows 为 list，每项
+    为 [0, 1] 内的有限 float；converged 为 bool。means 键序 success、
+    last_window：success 为 [0, 1] 内的有限 float，last_window 为 None
+    或 [0, 1] 内的有限 float；passed 为 0..results 项数之间的非 bool
+    int；converged 为 bool。任一参数非 dict 抛 TypeError；任一两侧的
+    逐层结构、键序、类型、bool 使用、数值有限性或 [0, 1] 范围违约抛
+    ValueError。means、passed、converged 还须满足公开汇总等式：
+    means.success 为各 success_rate 从 0.0 累加后除以项数（以
+    float.hex 逐位核对），means.last_window 为各非空 windows 末项同法
+    均值、全部为空时为 None，passed 等于 converged 为真的项数，
+    converged 等价于 passed == results 项数。两侧 results 长度不同或同
+    位置 seed 不同亦抛 ValueError。校验全程只读，不修改任一输入。
+
+    验证后按公开键序深度优先比较两侧全部字段：results 按位置比较，序列
+    先比长度再按索引逐项比较，标量类型与值均须相同，float 以
+    float.hex() 逐位比较。差异路径以 $ 开头：dict 字段追加 .name，序列
+    项追加 [i]，序列长度不同追加 .length。返回键序依次为 identical、
+    results、first_difference：results 保留种子顺序（重复 seed 各占一
+    项），每项键序 seed、identical、first_difference，后两项为对应位置
+    result 的比较结论与其内部首条差异的绝对路径；顶层 first_difference
+    深度优先覆盖 results、means、passed、converged 全部字段。无差异的
+    路径为 None；identical 仅在相应范围内全部相同时为 True。相同输入
+    逐值一致。
+    """
+    if not isinstance(left, dict) or not isinstance(right, dict):
+        raise TypeError("both reports must be dicts")
+
+    def _validate(side):
+        if list(side) != ["results", "means", "passed", "converged"]:
+            raise ValueError(
+                "report must have exactly the keys results, means,"
+                " passed, converged in that order"
+            )
+        entries = side["results"]
+        if not isinstance(entries, list) or not entries:
+            raise ValueError("report['results'] must be a non-empty list")
+
+        rates = []
+        last_windows = []
+        passed_count = 0
+        for entry in entries:
+            if not isinstance(entry, dict) or list(entry) != [
+                "seed",
+                "result",
+            ]:
+                raise ValueError(
+                    "every result entry must be a dict with keys seed,"
+                    " result in that order"
+                )
+            seed = entry["seed"]
+            if isinstance(seed, bool) or not isinstance(seed, int):
+                raise ValueError("every seed must be a non-bool int")
+            result = entry["result"]
+            if not isinstance(result, dict) or list(result) != [
+                "episodes",
+                "success_rate",
+                "windows",
+                "converged",
+            ]:
+                raise ValueError(
+                    "every result must have exactly the keys episodes,"
+                    " success_rate, windows, converged in that order"
+                )
+
+            episodes = result["episodes"]
+            if not isinstance(episodes, list) or not episodes:
+                raise ValueError("episodes must be a non-empty list")
+            for row in episodes:
+                if not isinstance(row, list) or len(row) != 3:
+                    raise ValueError(
+                        "every episode row must be a list of three fields"
+                    )
+                steps, reward, done = row
+                if isinstance(steps, bool) or not isinstance(steps, int):
+                    raise ValueError("steps must be a non-bool int")
+                if steps <= 0:
+                    raise ValueError("steps must be positive")
+                if isinstance(reward, bool) or not isinstance(
+                    reward, (int, float)
+                ):
+                    raise ValueError("reward must be a non-bool int or float")
+                if not _is_finite_number(reward):
+                    raise ValueError("reward must be finite")
+                if not isinstance(done, bool):
+                    raise ValueError("done must be a bool")
+
+            rate = result["success_rate"]
+            if not isinstance(rate, float) or not math.isfinite(rate):
+                raise ValueError("success_rate must be a finite float")
+            if rate < 0 or rate > 1:
+                raise ValueError("success_rate must be in [0, 1]")
+
+            windows = result["windows"]
+            if not isinstance(windows, list):
+                raise ValueError("windows must be a list")
+            for value in windows:
+                if not isinstance(value, float) or not math.isfinite(value):
+                    raise ValueError("windows values must be finite floats")
+                if value < 0 or value > 1:
+                    raise ValueError("windows values must be in [0, 1]")
+
+            if not isinstance(result["converged"], bool):
+                raise ValueError("result converged must be a bool")
+
+            rates.append(rate)
+            if windows:
+                last_windows.append(windows[-1])
+            if result["converged"]:
+                passed_count += 1
+
+        means = side["means"]
+        if not isinstance(means, dict) or list(means) != [
+            "success",
+            "last_window",
+        ]:
+            raise ValueError(
+                "means must have exactly the keys success, last_window in"
+                " that order"
+            )
+        success_mean = means["success"]
+        if not isinstance(success_mean, float) or not math.isfinite(
+            success_mean
+        ):
+            raise ValueError("means['success'] must be a finite float")
+        if success_mean < 0 or success_mean > 1:
+            raise ValueError("means['success'] must be in [0, 1]")
+        last_window_mean = means["last_window"]
+        if last_window_mean is not None:
+            if not isinstance(
+                last_window_mean, float
+            ) or not math.isfinite(last_window_mean):
+                raise ValueError(
+                    "means['last_window'] must be None or a finite float"
+                )
+            if last_window_mean < 0 or last_window_mean > 1:
+                raise ValueError("means['last_window'] must be in [0, 1]")
+
+        passed = side["passed"]
+        if isinstance(passed, bool) or not isinstance(passed, int):
+            raise ValueError("passed must be a non-bool int")
+        if passed < 0 or passed > len(entries):
+            raise ValueError("passed must be in [0, len(results)]")
+        if not isinstance(side["converged"], bool):
+            raise ValueError("converged must be a bool")
+
+        expected_success = sum(rates, 0.0) / len(rates)
+        if float.hex(expected_success) != float.hex(success_mean):
+            raise ValueError(
+                "means['success'] must equal the mean of the result"
+                " success_rate values"
+            )
+        if last_windows:
+            expected_last_window = sum(last_windows, 0.0) / len(last_windows)
+            if last_window_mean is None or float.hex(
+                expected_last_window
+            ) != float.hex(last_window_mean):
+                raise ValueError(
+                    "means['last_window'] must equal the mean of the"
+                    " non-empty windows' last values"
+                )
+        elif last_window_mean is not None:
+            raise ValueError(
+                "means['last_window'] must be None when every windows"
+                " list is empty"
+            )
+        if passed != passed_count:
+            raise ValueError(
+                "passed must equal the number of converged results"
+            )
+        if side["converged"] != (passed == len(entries)):
+            raise ValueError(
+                "converged must equal (passed == len(results))"
+            )
+
+    _validate(left)
+    _validate(right)
+
+    left_entries = left["results"]
+    right_entries = right["results"]
+    if len(left_entries) != len(right_entries):
+        raise ValueError(
+            "both reports must contain the same number of results"
+        )
+    for i, (left_entry, right_entry) in enumerate(
+        zip(left_entries, right_entries)
+    ):
+        if left_entry["seed"] != right_entry["seed"]:
+            raise ValueError(
+                "seed mismatch at results position %d" % i
+            )
+
+    def _first_difference(a, b, path):
+        if isinstance(a, dict):
+            for key in a:
+                found = _first_difference(
+                    a[key], b[key], path + "." + key
+                )
+                if found is not None:
+                    return found
+            return None
+        if isinstance(a, list):
+            if len(a) != len(b):
+                return path + ".length"
+            for i, (a_item, b_item) in enumerate(zip(a, b)):
+                found = _first_difference(
+                    a_item, b_item, path + "[%d]" % i
+                )
+                if found is not None:
+                    return found
+            return None
+        if isinstance(a, float) or isinstance(b, float):
+            if type(a) is not type(b) or float.hex(a) != float.hex(b):
+                return path
+            return None
+        if type(a) is not type(b) or a != b:
+            return path
+        return None
+
+    top_first = _first_difference(left, right, "$")
+
+    report_entries = []
+    for i, (left_entry, right_entry) in enumerate(
+        zip(left_entries, right_entries)
+    ):
+        first = _first_difference(
+            left_entry["result"],
+            right_entry["result"],
+            "$.results[%d].result" % i,
+        )
+        report_entries.append(
+            {
+                "seed": left_entry["seed"],
+                "identical": first is None,
+                "first_difference": first,
+            }
+        )
+
+    return {
+        "identical": top_first is None,
+        "results": report_entries,
+        "first_difference": top_first,
+    }
+
+
 def convergence_report(
     episode_results, window=20, tolerance=0.01, patience=3
 ) -> dict:
