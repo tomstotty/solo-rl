@@ -639,6 +639,151 @@ def actor_critic(
     return {"h": h_table, "v": v_table, "episodes": episode_results}
 
 
+def nstep_actor_critic(
+    env,
+    episodes=500,
+    alpha=0.05,
+    beta=0.1,
+    gamma=0.9,
+    n_steps=5,
+    seed=0,
+    max_steps=1000,
+) -> dict:
+    """n 步 actor-critic（FIFO 缓冲在线更新），返回 h/v 表与逐回合统计。
+
+    H 覆盖从 S 可达的非 G 格与 U/R/D/L 的全部组合，V 覆盖同样的格子，
+    初始均为 0.0。每回合 reset，至 done 或 max_steps 步；每步按
+    softmax(H[s,·]) 采样动作，仅调用一次 random()。采样时记录
+    (s, a, p, v)，v 为旧 V[s]；step 后记录 (r, done, v2)，done 时
+    v2=0.0，否则为当时 V[s2]，一并入 FIFO。FIFO 满 n_steps 即以头起
+    m=n_steps 项更新并弹头：G=Σ(k=0..m-1) gamma^k*r[k]+gamma^m*B，
+    末项 done 则 B=0.0，否则 B=其 v2；A=G-头项 v，按头项旧 p 先对各 b
+    同时作 H[s,b]+=alpha*A*(I[b=a]-p[b])，再作 V[s]+=beta*A。回合
+    结束后按头到尾冲刷，每次 m 取当前长度；终止尾不自举，截断尾用
+    所存 v2 自举。全部随机性来自一个 random.Random(seed)。
+
+    返回键依次为 h、v、episodes；h 项按坐标升序为
+    [r, c, hU, hR, hD, hL]，v 项为 [r, c, V]，其中数均为 float；
+    episodes 项为 [steps, reward, done]，类型依次为 int/int/bool，
+    reward 为未折扣回报和。
+    """
+    if not isinstance(env, GridWorld):
+        raise TypeError("env must be a GridWorld")
+    if isinstance(episodes, bool) or not isinstance(episodes, int):
+        raise TypeError("episodes must be an int")
+    if isinstance(seed, bool) or not isinstance(seed, int):
+        raise TypeError("seed must be an int")
+    if isinstance(max_steps, bool) or not isinstance(max_steps, int):
+        raise TypeError("max_steps must be an int")
+    if isinstance(n_steps, bool) or not isinstance(n_steps, int):
+        raise TypeError("n_steps must be an int")
+    if isinstance(alpha, bool) or not isinstance(alpha, (int, float)):
+        raise TypeError("alpha must be an int or float")
+    if isinstance(beta, bool) or not isinstance(beta, (int, float)):
+        raise TypeError("beta must be an int or float")
+    if isinstance(gamma, bool) or not isinstance(gamma, (int, float)):
+        raise TypeError("gamma must be an int or float")
+    if episodes <= 0:
+        raise ValueError("episodes must be positive")
+    if max_steps <= 0:
+        raise ValueError("max_steps must be positive")
+    if n_steps <= 0:
+        raise ValueError("n_steps must be positive")
+    if not _is_finite_number(alpha) or alpha <= 0 or alpha > 1:
+        raise ValueError("alpha must be finite and in (0, 1]")
+    if not _is_finite_number(beta) or beta <= 0 or beta > 1:
+        raise ValueError("beta must be finite and in (0, 1]")
+    if not _is_finite_number(gamma) or gamma < 0 or gamma >= 1:
+        raise ValueError("gamma must be finite and in [0, 1)")
+
+    actions = tuple(_ACTIONS)  # U, R, D, L
+    states = sorted(
+        state
+        for state in _reachable_cells(env)
+        if env._cell(state) != "G"
+    )
+    h = {(state, action): 0.0 for state in states for action in actions}
+    v = {state: 0.0 for state in states}
+    rng = random.Random(seed)
+    episode_results = []
+
+    for _ in range(episodes):
+        state = env.reset()
+        buffer = []
+        steps = 0
+        total_reward = 0
+        done = False
+        for _ in range(max_steps):
+            m = max(h[(state, a)] for a in actions)
+            weights = [math.exp(h[(state, a)] - m) for a in actions]
+            total = sum(weights)
+            probs = [weight / total for weight in weights]
+            u = rng.random()
+            cumulative = 0.0
+            action = "L"
+            for a, p_a in zip(actions, probs):
+                cumulative += p_a
+                if cumulative > u:
+                    action = a
+                    break
+            prob = dict(zip(actions, probs))
+            value = v[state]
+            next_state, reward, done = env.step(action)
+            value_next = 0.0 if done else v[next_state]
+            buffer.append(
+                (state, action, prob, value, reward, done, value_next)
+            )
+            steps += 1
+            total_reward += reward
+            if len(buffer) == n_steps:
+                head = buffer[0]
+                g = 0.0 if buffer[-1][5] else buffer[-1][6]
+                for k in range(len(buffer) - 1, -1, -1):
+                    g = buffer[k][4] + gamma * g
+                advantage = g - head[3]
+                for b in actions:
+                    indicator = 1.0 if b == head[1] else 0.0
+                    h[(head[0], b)] += (
+                        alpha * advantage * (indicator - head[2][b])
+                    )
+                v[head[0]] += beta * advantage
+                buffer.pop(0)
+            if done:
+                break
+            state = next_state
+        episode_results.append([steps, total_reward, done])
+
+        while buffer:
+            head = buffer[0]
+            g = 0.0 if buffer[-1][5] else buffer[-1][6]
+            for k in range(len(buffer) - 1, -1, -1):
+                g = buffer[k][4] + gamma * g
+            advantage = g - head[3]
+            for b in actions:
+                indicator = 1.0 if b == head[1] else 0.0
+                h[(head[0], b)] += (
+                    alpha * advantage * (indicator - head[2][b])
+                )
+            v[head[0]] += beta * advantage
+            buffer.pop(0)
+
+    h_table = [
+        [
+            float(r),
+            float(c),
+            h[((r, c), "U")],
+            h[((r, c), "R")],
+            h[((r, c), "D")],
+            h[((r, c), "L")],
+        ]
+        for (r, c) in states
+    ]
+    v_table = [
+        [float(r), float(c), v[(r, c)]] for (r, c) in states
+    ]
+    return {"h": h_table, "v": v_table, "episodes": episode_results}
+
+
 def gae_actor_critic(
     env,
     episodes=500,
