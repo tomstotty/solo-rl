@@ -1017,6 +1017,98 @@ def generalized_advantage_estimate(
     return {"advantages": A, "returns": returns}
 
 
+def ppo_clipped_surrogate(
+    old_log_probs, new_log_probs, advantages, clip_epsilon=0.2
+) -> dict:
+    """PPO 截断代理目标，返回固定键序 ratios、objectives、
+    mean_objective 的 dict。
+
+    old_log_probs、new_log_probs、advantages 须为等长非空的
+    list/tuple，各元素为非 bool 的 int/float；clip_epsilon 为非 bool
+    的 int/float 且须在 [0, 1)。所有输入先复制并转换为 float（转换
+    溢出或结果非有限均抛 ValueError），不修改原序列。逐项计算
+    d=n[i]-o[i]、r=exp(d)、c=min(max(r,1-e),1+e)、u=r*a[i]、
+    v=c*a[i]、z=min(u,v)；d 或乘积非有限、exp 溢出均抛 ValueError，
+    exp 下溢为 0.0 合法。ratios、objectives 分别为 r、z 的 float
+    列表，mean_objective 为 sum(z, 0.0)/len(z)；求和或均值非有限
+    抛 ValueError。
+    """
+    if not isinstance(old_log_probs, (list, tuple)):
+        raise TypeError("old_log_probs must be a list or tuple")
+    if not isinstance(new_log_probs, (list, tuple)):
+        raise TypeError("new_log_probs must be a list or tuple")
+    if not isinstance(advantages, (list, tuple)):
+        raise TypeError("advantages must be a list or tuple")
+    if (
+        len(old_log_probs) == 0
+        or len(new_log_probs) == 0
+        or len(advantages) == 0
+    ):
+        raise ValueError("sequences must be non-empty")
+    if not (
+        len(old_log_probs) == len(new_log_probs) == len(advantages)
+    ):
+        raise ValueError("sequences must have equal length")
+
+    def _to_float(item, name):
+        if isinstance(item, bool) or not isinstance(item, (int, float)):
+            raise TypeError(f"{name} must contain only int or float")
+        try:
+            result = float(item)
+        except OverflowError:
+            raise ValueError(f"{name} must convert to a finite float")
+        if not math.isfinite(result):
+            raise ValueError(f"{name} must contain only finite numbers")
+        return result
+
+    o = [_to_float(item, "old_log_probs") for item in old_log_probs]
+    n = [_to_float(item, "new_log_probs") for item in new_log_probs]
+    a = [_to_float(item, "advantages") for item in advantages]
+
+    if isinstance(clip_epsilon, bool) or not isinstance(
+        clip_epsilon, (int, float)
+    ):
+        raise TypeError("clip_epsilon must be an int or float")
+    try:
+        e = float(clip_epsilon)
+    except OverflowError:
+        raise ValueError("clip_epsilon must convert to a finite float")
+    if not math.isfinite(e):
+        raise ValueError("clip_epsilon must be finite")
+    if e < 0.0 or e >= 1.0:
+        raise ValueError("clip_epsilon must be in [0, 1)")
+
+    ratios = []
+    objectives = []
+    for i in range(len(o)):
+        d = n[i] - o[i]
+        if not math.isfinite(d):
+            raise ValueError("log-probability difference must be finite")
+        try:
+            r = math.exp(d)
+        except OverflowError:
+            raise ValueError("probability ratio overflowed")
+        c = min(max(r, 1.0 - e), 1.0 + e)
+        u = r * a[i]
+        v = c * a[i]
+        if not math.isfinite(u) or not math.isfinite(v):
+            raise ValueError("objective product must be finite")
+        ratios.append(r)
+        objectives.append(min(u, v))
+
+    total = sum(objectives, 0.0)
+    if not math.isfinite(total):
+        raise ValueError("objective sum must be finite")
+    mean = total / len(objectives)
+    if not math.isfinite(mean):
+        raise ValueError("mean objective must be finite")
+    return {
+        "ratios": ratios,
+        "objectives": objectives,
+        "mean_objective": mean,
+    }
+
+
 def evaluate(env, h, episodes, max_steps, seed, window, threshold) -> dict:
     """按 softmax 策略评估偏好 H，返回回合统计与收敛判定。
 
