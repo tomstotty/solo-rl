@@ -1641,6 +1641,70 @@ def ppo_evaluate(
     }
 
 
+def ppo_evaluate_many(
+    env, h, seeds, episodes=100, max_steps=1000, window=20, threshold=0.9
+) -> dict:
+    """按多种子评估 PPO 风格 logits 表，返回汇总统计。
+
+    seeds 须为非空 list/tuple，元素为非 bool 的 int，允许重复且不修改
+    seeds；容器或元素类型不符抛 TypeError，空序列抛 ValueError。其余
+    参数校验与异常沿用 ppo_evaluate。按 seeds 顺序逐项复用
+    ppo_evaluate，每项仅替换 seed（各自创建独立随机流），h 不变。
+
+    返回键依次为 results、means、passed、converged；results 与 seeds
+    同序，每项为键序 seed、result 的 dict，result 即对应 ppo_evaluate
+    的完整返回值。means 键序 success、last_window：success 为各
+    result.success_rate 按 results 序从 0.0 累加后除以项数所得
+    float；last_window 对 windows 非空的 result 的末项同算，无项则
+    为 None。passed 为 result.converged 为 True 的数量；converged
+    等价于 passed == len(seeds)。相同输入逐值一致。
+    """
+    if not isinstance(seeds, (list, tuple)):
+        raise TypeError("seeds must be a list or tuple")
+    if not seeds:
+        raise ValueError("seeds must be non-empty")
+    for seed in seeds:
+        if isinstance(seed, bool) or not isinstance(seed, int):
+            raise TypeError("every seed must be a non-bool int")
+
+    results = []
+    for seed in seeds:
+        result = ppo_evaluate(
+            env,
+            h,
+            episodes=episodes,
+            max_steps=max_steps,
+            seed=seed,
+            window=window,
+            threshold=threshold,
+        )
+        results.append({"seed": seed, "result": result})
+
+    success_total = 0.0
+    for item in results:
+        success_total += item["result"]["success_rate"]
+    success_mean = success_total / len(results)
+
+    last_window_total = 0.0
+    last_window_count = 0
+    for item in results:
+        windows = item["result"]["windows"]
+        if windows:
+            last_window_total += windows[-1]
+            last_window_count += 1
+    last_window_mean = (
+        last_window_total / last_window_count if last_window_count else None
+    )
+
+    passed = sum(1 for item in results if item["result"]["converged"])
+    return {
+        "results": results,
+        "means": {"success": success_mean, "last_window": last_window_mean},
+        "passed": passed,
+        "converged": passed == len(seeds),
+    }
+
+
 def convergence_report(
     episode_results, window=20, tolerance=0.01, patience=3
 ) -> dict:
