@@ -1844,6 +1844,268 @@ def ppo_stability_report(data, threshold=0.9, stable_ratio=1.0) -> dict:
     }
 
 
+def _validate_evaluate_many_payload(data, name):
+    """校验一份 ppo_evaluate_many 完整返回值，返回 results 项列表。"""
+    if list(data) != ["results", "means", "passed", "converged"]:
+        raise ValueError(
+            f"{name} must have exactly the keys results, means,"
+            " passed, converged"
+        )
+    entries = data["results"]
+    if not isinstance(entries, list) or not entries:
+        raise ValueError(f"{name}['results'] must be a non-empty list")
+
+    for entry in entries:
+        if not isinstance(entry, dict) or list(entry) != ["seed", "result"]:
+            raise ValueError(
+                f"every {name} result entry must be a dict with keys"
+                " seed, result"
+            )
+        seed = entry["seed"]
+        if isinstance(seed, bool) or not isinstance(seed, int):
+            raise ValueError(f"every {name} seed must be a non-bool int")
+        result = entry["result"]
+        if not isinstance(result, dict) or list(result) != [
+            "episodes",
+            "success_rate",
+            "windows",
+            "converged",
+        ]:
+            raise ValueError(
+                f"every {name} result must have exactly the keys"
+                " episodes, success_rate, windows, converged"
+            )
+        episodes = result["episodes"]
+        if not isinstance(episodes, list) or not episodes:
+            raise ValueError(f"{name} episodes must be a non-empty list")
+        for row in episodes:
+            if not isinstance(row, list) or len(row) != 3:
+                raise ValueError(
+                    f"every {name} episode row must be a list of three"
+                    " fields"
+                )
+            steps, reward, success = row
+            if isinstance(steps, bool) or not isinstance(steps, int):
+                raise ValueError(f"{name} steps must be a non-bool int")
+            if steps <= 0:
+                raise ValueError(f"{name} steps must be positive")
+            if isinstance(reward, bool) or not isinstance(
+                reward, (int, float)
+            ):
+                raise ValueError(f"{name} reward must be an int or float")
+            if not _is_finite_number(reward):
+                raise ValueError(f"{name} reward must be finite")
+            if not isinstance(success, bool):
+                raise ValueError(f"{name} success flag must be a bool")
+        rate = result["success_rate"]
+        if not isinstance(rate, float):
+            raise ValueError(f"{name} success_rate must be a float")
+        if not math.isfinite(rate):
+            raise ValueError(f"{name} success_rate must be finite")
+        if rate < 0.0 or rate > 1.0:
+            raise ValueError(f"{name} success_rate must be in [0, 1]")
+        windows = result["windows"]
+        if not isinstance(windows, list):
+            raise ValueError(f"{name} windows must be a list")
+        for value in windows:
+            if not isinstance(value, float):
+                raise ValueError(
+                    f"{name} windows values must be floats"
+                )
+            if not math.isfinite(value):
+                raise ValueError(
+                    f"{name} windows values must be finite floats"
+                )
+            if value < 0.0 or value > 1.0:
+                raise ValueError(
+                    f"{name} windows values must be in [0, 1]"
+                )
+        if not isinstance(result["converged"], bool):
+            raise ValueError(f"{name} result converged flag must be a bool")
+
+    means = data["means"]
+    if not isinstance(means, dict) or list(means) != [
+        "success",
+        "last_window",
+    ]:
+        raise ValueError(
+            f"{name} means must be a dict with keys success, last_window"
+        )
+    success_mean = means["success"]
+    if not isinstance(success_mean, float):
+        raise ValueError(f"{name} means.success must be a float")
+    if not math.isfinite(success_mean):
+        raise ValueError(f"{name} means.success must be finite")
+    if success_mean < 0.0 or success_mean > 1.0:
+        raise ValueError(f"{name} means.success must be in [0, 1]")
+    last_window_mean = means["last_window"]
+    if last_window_mean is not None:
+        if not isinstance(last_window_mean, float):
+            raise ValueError(
+                f"{name} means.last_window must be None or a float"
+            )
+        if not math.isfinite(last_window_mean):
+            raise ValueError(
+                f"{name} means.last_window must be finite when not None"
+            )
+        if last_window_mean < 0.0 or last_window_mean > 1.0:
+            raise ValueError(
+                f"{name} means.last_window must be in [0, 1]"
+            )
+    passed = data["passed"]
+    if isinstance(passed, bool) or not isinstance(passed, int):
+        raise ValueError(f"{name} passed must be a non-bool int")
+    if not isinstance(data["converged"], bool):
+        raise ValueError(f"{name} converged must be a bool")
+
+    success_total = 0.0
+    for entry in entries:
+        success_total += entry["result"]["success_rate"]
+    expected_success = success_total / len(entries)
+    if float.hex(expected_success) != float.hex(success_mean):
+        raise ValueError(
+            f"{name} means.success must equal the mean of success_rate"
+        )
+
+    last_total = 0.0
+    last_count = 0
+    for entry in entries:
+        windows = entry["result"]["windows"]
+        if windows:
+            last_total += windows[-1]
+            last_count += 1
+    if last_count == 0:
+        if last_window_mean is not None:
+            raise ValueError(
+                f"{name} means.last_window must be None when no result"
+                " has windows"
+            )
+    else:
+        expected_last = last_total / last_count
+        if float.hex(expected_last) != float.hex(last_window_mean):
+            raise ValueError(
+                f"{name} means.last_window must equal the mean of the"
+                " last window values"
+            )
+
+    expected_passed = sum(
+        1 for entry in entries if entry["result"]["converged"]
+    )
+    if passed != expected_passed:
+        raise ValueError(
+            f"{name} passed must equal the number of converged results"
+        )
+    if data["converged"] != (expected_passed == len(entries)):
+        raise ValueError(
+            f"{name} converged must equal (passed == number of results)"
+        )
+    return entries
+
+
+def ppo_reproducibility_report(left, right) -> dict:
+    """逐值比较两份 ppo_evaluate_many 返回值，输出可复现性报告。
+
+    left、right 须为 dict，否则抛 TypeError；每份都须严格符合
+    ppo_evaluate_many 的完整返回契约：顶层键序为 results、means、
+    passed、converged；results 为非空 list，每项键序为 seed、result，
+    seed 为非 bool int（允许重复），result 键序为 episodes、
+    success_rate、windows、converged；episodes 为非空 list，行恰为
+    [steps, reward, success]，steps 为非 bool 正 int，reward 为有限的
+    非 bool int/float，success 为 bool；success_rate 为 [0, 1] 内有限
+    float，windows 为 [0, 1] 内有限 float 的 list（可空），converged
+    为 bool；means 键序为 success、last_window，前者为 [0, 1] 内有限
+    float，后者为同类 float 或 None；passed 为非 bool int，converged
+    为 bool。means 两字段、passed、converged 还须分别等于公开汇总等式
+    （success_rate 自 0.0 累加均值、对 windows 非空 result 的末窗同算
+    均值或无项时 None、converged 计数、passed==results 项数）。任一
+    层结构、键序、类型、非 bool、有限性或范围违约均抛 ValueError；
+    不修改输入。
+
+    两侧 results 长度不同或同位置 seed 不同抛 ValueError；重复 seed
+    按位置区分。校验通过后按公开键序深度优先比较全部字段，results 按
+    位置比较：序列先比长度（路径追加 .length），再按索引（追加 [i]）；
+    标量要求类型与值均相同，float 以 float.hex() 比较（故 0.0 与
+    -0.0 视为不同），int 与 float 即使数值相同也视为不同。差异路径以
+    $ 开头，字典字段追加 .name，无差异路径为 None。
+
+    返回键序为 identical、results、first_difference：results 按种子
+    顺序保留（含重复），每项键序为 seed、identical、first_difference，
+    后两项为该位置整项（seed、result）的比较结论与首差绝对路径；
+    顶层 first_difference 覆盖全部字段（results 先于 means、passed、
+    converged）；identical 仅在相应范围逐值相同时为 True。相同输入
+    逐值一致，仅用标准库，不引入命令行入口。
+    """
+    if not isinstance(left, dict):
+        raise TypeError("left must be a dict")
+    if not isinstance(right, dict):
+        raise TypeError("right must be a dict")
+    left_entries = _validate_evaluate_many_payload(left, "left")
+    right_entries = _validate_evaluate_many_payload(right, "right")
+
+    if len(left_entries) != len(right_entries):
+        raise ValueError(
+            "left and right results lists must have equal length"
+        )
+    for index, (left_entry, right_entry) in enumerate(
+        zip(left_entries, right_entries)
+    ):
+        if left_entry["seed"] != right_entry["seed"]:
+            raise ValueError(
+                f"seeds at position {index} must match"
+            )
+
+    def _scalar_equal(a, b):
+        if type(a) is not type(b):
+            return False
+        if isinstance(a, float):
+            return float.hex(a) == float.hex(b)
+        return a == b
+
+    def _first_difference(a, b, path):
+        """深度优先按公开键序返回首个差异路径，无差异返回 None。"""
+        if isinstance(a, dict):
+            for key in a:
+                difference = _first_difference(
+                    a[key], b[key], f"{path}.{key}"
+                )
+                if difference is not None:
+                    return difference
+            return None
+        if isinstance(a, list):
+            if len(a) != len(b):
+                return f"{path}.length"
+            for index, (item_a, item_b) in enumerate(zip(a, b)):
+                difference = _first_difference(
+                    item_a, item_b, f"{path}[{index}]"
+                )
+                if difference is not None:
+                    return difference
+            return None
+        return None if _scalar_equal(a, b) else path
+
+    items = []
+    for index, (left_entry, right_entry) in enumerate(
+        zip(left_entries, right_entries)
+    ):
+        entry_path = f"$.results[{index}]"
+        difference = _first_difference(
+            left_entry, right_entry, entry_path
+        )
+        items.append(
+            {
+                "seed": left_entry["seed"],
+                "identical": difference is None,
+                "first_difference": difference,
+            }
+        )
+    overall = _first_difference(left, right, "$")
+    return {
+        "identical": overall is None,
+        "results": items,
+        "first_difference": overall,
+    }
+
+
 def convergence_report(
     episode_results, window=20, tolerance=0.01, patience=3
 ) -> dict:
