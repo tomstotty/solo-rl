@@ -1,6 +1,7 @@
 """GridWorld 环境与命令行入口，仅用标准库。"""
 
 import json
+import math
 import sys
 
 _ACTIONS = {
@@ -97,22 +98,105 @@ class GridWorld:
         return self._move(state, action)
 
 
+def _reachable_cells(env):
+    """从起点 S 四向避墙可达的格子（含起点）。"""
+    start = env._start
+    seen = {start}
+    stack = [start]
+    while stack:
+        state = stack.pop()
+        if env._cell(state) == "G":
+            continue
+        for action in _ACTIONS:
+            nxt, _, _ = env._move(state, action)
+            if nxt not in seen:
+                seen.add(nxt)
+                stack.append(nxt)
+    return seen
+
+
+def value_iteration(env, gamma=0.9, tolerance=1e-9, max_iterations=10000):
+    """同步值迭代，返回 (values, iterations)。"""
+    if not isinstance(env, GridWorld):
+        raise TypeError("env must be a GridWorld")
+    if isinstance(gamma, bool) or not isinstance(gamma, (int, float)):
+        raise TypeError("gamma must be an int or float")
+    if isinstance(tolerance, bool) or not isinstance(tolerance, (int, float)):
+        raise TypeError("tolerance must be an int or float")
+    if isinstance(max_iterations, bool) or not isinstance(max_iterations, int):
+        raise TypeError("max_iterations must be an int")
+    gamma = float(gamma)
+    tolerance = float(tolerance)
+    if not math.isfinite(gamma) or not 0.0 <= gamma < 1.0:
+        raise ValueError("gamma must be in [0, 1)")
+    if not (math.isfinite(tolerance) and tolerance > 0.0):
+        raise ValueError("tolerance must be in (0, +inf)")
+    if max_iterations <= 0:
+        raise ValueError("max_iterations must be a positive int")
+
+    cells = _reachable_cells(env)
+    values = {cell: 0.0 for cell in cells}
+    actions = ("U", "R", "D", "L")
+    iterations = 0
+    for _ in range(max_iterations):
+        iterations += 1
+        new_values = {}
+        delta = 0.0
+        for state in cells:
+            if env._cell(state) == "G":
+                new_values[state] = 0.0
+                continue
+            best = None
+            for action in actions:
+                nxt, reward, _ = env.transition(state, action)
+                candidate = reward + gamma * values[nxt]
+                if best is None or candidate > best:
+                    best = candidate
+            new_values[state] = best
+            change = abs(best - values[state])
+            if change > delta:
+                delta = change
+        values = new_values
+        if delta <= tolerance:
+            return values, iterations
+    raise RuntimeError("value iteration did not converge within max_iterations")
+
+
+def _format_value(value):
+    if abs(value) < 0.5e-12:
+        value = 0.0
+    return format(value, ".12f")
+
+
 def _run(argv):
-    if len(argv) != 4 or argv[1] != "run":
-        return 2
-    try:
-        env = GridWorld(tuple(argv[2].split("/")))
-        actions = argv[3]
-        if not actions:
-            raise ValueError("actions must be non-empty")
-        out = []
-        for action in actions:
-            state, reward, done = env.step(action)
-            out.append([state[0], state[1], reward, done])
-    except (TypeError, ValueError, RuntimeError):
-        return 2
-    sys.stdout.write(json.dumps(out, separators=(",", ":")) + "\n")
-    return 0
+    if len(argv) == 4 and argv[1] == "run":
+        try:
+            env = GridWorld(tuple(argv[2].split("/")))
+            actions = argv[3]
+            if not actions:
+                raise ValueError("actions must be non-empty")
+            out = []
+            for action in actions:
+                state, reward, done = env.step(action)
+                out.append([state[0], state[1], reward, done])
+        except (TypeError, ValueError, RuntimeError):
+            return 2
+        sys.stdout.write(json.dumps(out, separators=(",", ":")) + "\n")
+        return 0
+    if len(argv) == 3 and argv[1] == "value":
+        try:
+            env = GridWorld(tuple(argv[2].split("/")))
+            values, iterations = value_iteration(env)
+        except (TypeError, ValueError, RuntimeError):
+            return 2
+        ordered = [
+            [r, c, _format_value(values[(r, c)])]
+            for r, c in sorted(values)
+        ]
+        payload = {"iterations": iterations, "values": ordered}
+        sys.stdout.write(json.dumps(payload, separators=(",", ":")) + "\n")
+        return 0
+    return 2
 
 
 if __name__ == "__main__":
