@@ -410,6 +410,98 @@ def reinforce(env, episodes=500, alpha=0.05, gamma=0.9, seed=0) -> dict:
     return h
 
 
+def evaluate(env, h, episodes, max_steps, seed, window, threshold) -> dict:
+    """按 softmax 策略评估偏好 H，返回逐回合统计字典。
+
+    h 须为 {(state, action): 有限数}，键恰为从 S 可达的非 G 格与
+    U/R/D/L 的全部组合；h 不会被修改。每回合 reset，单回合最多
+    max_steps 步；每步按 p[a] ∝ exp(H[s,a]) 采样动作，全部随机性
+    来自一个 random.Random(seed)。
+
+    返回 {"episodes": [...], "success_rate": float, "converged": bool}，
+    episodes 元素为 [实际步数, 未折扣 reward 和, 是否到达 G]；
+    converged 仅当 episodes >= window 且末 window 回合成功率
+    >= threshold 时为 True。
+    """
+    if not isinstance(env, GridWorld):
+        raise TypeError("env must be a GridWorld")
+    if not isinstance(h, dict):
+        raise TypeError("h must be a dict")
+    if isinstance(episodes, bool) or not isinstance(episodes, int):
+        raise TypeError("episodes must be an int")
+    if isinstance(max_steps, bool) or not isinstance(max_steps, int):
+        raise TypeError("max_steps must be an int")
+    if isinstance(seed, bool) or not isinstance(seed, int):
+        raise TypeError("seed must be an int")
+    if isinstance(window, bool) or not isinstance(window, int):
+        raise TypeError("window must be an int")
+    if isinstance(threshold, bool) or not isinstance(threshold, (int, float)):
+        raise TypeError("threshold must be an int or float")
+    if episodes <= 0:
+        raise ValueError("episodes must be positive")
+    if max_steps <= 0:
+        raise ValueError("max_steps must be positive")
+    if window <= 0:
+        raise ValueError("window must be positive")
+    if not _is_finite_number(threshold) or threshold < 0 or threshold > 1:
+        raise ValueError("threshold must be finite and in [0, 1]")
+
+    actions = tuple(_ACTIONS)  # U, R, D, L
+    states = sorted(
+        state
+        for state in _reachable_cells(env)
+        if env._cell(state) != "G"
+    )
+    expected = {(state, action) for state in states for action in actions}
+    if set(h) != expected:
+        raise ValueError(
+            "h must map every (reachable non-G state, action) pair"
+        )
+    for value in h.values():
+        if not _is_finite_number(value):
+            raise ValueError("h values must be finite numbers")
+
+    rng = random.Random(seed)
+    results = []
+    for _ in range(episodes):
+        state = env.reset()
+        steps = 0
+        total_reward = 0
+        success = False
+        for _ in range(max_steps):
+            m = max(h[(state, a)] for a in actions)
+            weights = [math.exp(h[(state, a)] - m) for a in actions]
+            total = sum(weights)
+            probs = [weight / total for weight in weights]
+            u = rng.random()
+            cumulative = 0.0
+            action = "L"
+            for a, p_a in zip(actions, probs):
+                cumulative += p_a
+                if cumulative > u:
+                    action = a
+                    break
+            state, reward, done = env.step(action)
+            steps += 1
+            total_reward += reward
+            if done:
+                success = True
+                break
+        results.append([steps, total_reward, success])
+
+    successes = sum(1 for _steps, _reward, ok in results if ok)
+    success_rate = successes / episodes
+    converged = episodes >= window and (
+        sum(1 for _steps, _reward, ok in results[-window:] if ok) / window
+        >= threshold
+    )
+    return {
+        "episodes": results,
+        "success_rate": success_rate,
+        "converged": converged,
+    }
+
+
 def _format_value(value):
     if abs(value) < 0.5e-12:
         value = 0.0
