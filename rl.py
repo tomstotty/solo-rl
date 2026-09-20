@@ -639,6 +639,151 @@ def actor_critic(
     return {"h": h_table, "v": v_table, "episodes": episode_results}
 
 
+def nstep_actor_critic(
+    env,
+    episodes=500,
+    alpha=0.05,
+    beta=0.1,
+    gamma=0.9,
+    n_steps=5,
+    seed=0,
+    max_steps=1000,
+) -> dict:
+    """在线 n 步 actor-critic，返回 h/v 表与逐回合统计。
+
+    H 覆盖从 S 可达的非 G 格与 U/R/D/L 的全部组合，V 覆盖同样的格子，
+    初始均为 0.0。每回合 reset，至 done 或 max_steps 步；每步按
+    softmax(H[s,·]) 采样动作，仅调用一次 random()。step 前保留
+    (s, a, p, v)，v 为旧 V[s]；step 得 (s2, r, done) 后再存
+    (r, done, v2) 入 FIFO，done 时 v2=0.0，否则 v2 为当时 V[s2]。
+    FIFO 满 n_steps 即取队头起 m=n_steps 项更新并弹头：
+    G=Σ(k=0..m-1) gamma^k*r[k]+gamma^m*B，末项 done 则 B=0.0，
+    否则 B 为其 v2；A=G-头项 v，按头项旧 p 先对各动作 b 同时作
+    H[s,b]+=alpha*A*(I[b=a]-p[b])，再作 V[s]+=beta*A。回合因 done
+    或 max_steps 结束后按头到尾冲刷 FIFO，每次 m 取当前长度；终止尾
+    不自举，截断尾用所存 v2 自举。全部随机性来自一个
+    random.Random(seed)。n_steps=1 时与 actor_critic 逐值等同。
+
+    返回键依次为 h、v、episodes；h 项按坐标升序为
+    [r, c, hU, hR, hD, hL]，v 项为 [r, c, V]，其中数均为 float；
+    episodes 项为 [steps, reward, done]，类型依次为 int/int/bool，
+    reward 为未折扣回报和。
+    """
+    if not isinstance(env, GridWorld):
+        raise TypeError("env must be a GridWorld")
+    if isinstance(episodes, bool) or not isinstance(episodes, int):
+        raise TypeError("episodes must be an int")
+    if isinstance(seed, bool) or not isinstance(seed, int):
+        raise TypeError("seed must be an int")
+    if isinstance(max_steps, bool) or not isinstance(max_steps, int):
+        raise TypeError("max_steps must be an int")
+    if isinstance(n_steps, bool) or not isinstance(n_steps, int):
+        raise TypeError("n_steps must be an int")
+    if isinstance(alpha, bool) or not isinstance(alpha, (int, float)):
+        raise TypeError("alpha must be an int or float")
+    if isinstance(beta, bool) or not isinstance(beta, (int, float)):
+        raise TypeError("beta must be an int or float")
+    if isinstance(gamma, bool) or not isinstance(gamma, (int, float)):
+        raise TypeError("gamma must be an int or float")
+    if episodes <= 0:
+        raise ValueError("episodes must be positive")
+    if max_steps <= 0:
+        raise ValueError("max_steps must be positive")
+    if n_steps <= 0:
+        raise ValueError("n_steps must be positive")
+    if not _is_finite_number(alpha) or alpha <= 0 or alpha > 1:
+        raise ValueError("alpha must be finite and in (0, 1]")
+    if not _is_finite_number(beta) or beta <= 0 or beta > 1:
+        raise ValueError("beta must be finite and in (0, 1]")
+    if not _is_finite_number(gamma) or gamma < 0 or gamma >= 1:
+        raise ValueError("gamma must be finite and in [0, 1)")
+
+    actions = tuple(_ACTIONS)  # U, R, D, L
+    states = sorted(
+        state
+        for state in _reachable_cells(env)
+        if env._cell(state) != "G"
+    )
+    h = {(state, action): 0.0 for state in states for action in actions}
+    v = {state: 0.0 for state in states}
+    rng = random.Random(seed)
+    episode_results = []
+
+    def update(queue, m):
+        """以队头起 m 项计算 n 步回报，仅更新队头状态。"""
+        _s, _a, prob, value, _r, tail_done, tail_v2 = queue[m - 1]
+        bootstrap = 0.0 if tail_done else tail_v2
+        g = 0.0
+        discount = 1.0
+        for k in range(m):
+            g += discount * queue[k][4]
+            discount *= gamma
+        g += discount * bootstrap
+        head_state, head_action, head_prob, head_value = queue[0][:4]
+        advantage = g - head_value
+        for b in actions:
+            indicator = 1.0 if b == head_action else 0.0
+            h[(head_state, b)] += (
+                alpha * advantage * (indicator - head_prob[b])
+            )
+        v[head_state] += beta * advantage
+
+    for _ in range(episodes):
+        state = env.reset()
+        queue = []
+        steps = 0
+        total_reward = 0
+        done = False
+        for _ in range(max_steps):
+            m = max(h[(state, a)] for a in actions)
+            weights = [math.exp(h[(state, a)] - m) for a in actions]
+            total = sum(weights)
+            probs = [weight / total for weight in weights]
+            u = rng.random()
+            cumulative = 0.0
+            action = "L"
+            for a, p_a in zip(actions, probs):
+                cumulative += p_a
+                if cumulative > u:
+                    action = a
+                    break
+            prob = dict(zip(actions, probs))
+            value = v[state]
+            next_state, reward, done = env.step(action)
+            value_next = 0.0 if done else v[next_state]
+            queue.append(
+                (state, action, prob, value, reward, done, value_next)
+            )
+            steps += 1
+            total_reward += reward
+            if len(queue) == n_steps:
+                update(queue, n_steps)
+                queue.pop(0)
+            if done:
+                break
+            state = next_state
+        while queue:
+            update(queue, len(queue))
+            queue.pop(0)
+        episode_results.append([steps, total_reward, done])
+
+    h_table = [
+        [
+            float(r),
+            float(c),
+            h[((r, c), "U")],
+            h[((r, c), "R")],
+            h[((r, c), "D")],
+            h[((r, c), "L")],
+        ]
+        for (r, c) in states
+    ]
+    v_table = [
+        [float(r), float(c), v[(r, c)]] for (r, c) in states
+    ]
+    return {"h": h_table, "v": v_table, "episodes": episode_results}
+
+
 def gae_actor_critic(
     env,
     episodes=500,
