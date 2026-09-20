@@ -1705,6 +1705,129 @@ def ppo_evaluate_many(
     }
 
 
+def ppo_stability_report(data, threshold=0.9, stable_ratio=1.0) -> dict:
+    """汇总 ppo_evaluate_many 各 seed 的滑窗通过率，判定稳定窗口。
+
+    data 须为 ppo_evaluate_many 的完整返回值：顶层键依次为 results、
+    means、passed、converged；results 为非空 list，每项为键序 seed、
+    result 的 dict，result 即 ppo_evaluate 的完整返回（键依次为
+    episodes、success_rate、windows、converged）；episodes 每项为三项
+    list 行，windows 各项为取值 [0, 1] 的有限 float。data 非 dict 抛
+    TypeError；顶层键序、results 非空、seed/result 层级、episodes 三项
+    行或 windows 的 [0, 1] 有限 float 约束违约均抛 ValueError。seed
+    允许重复；data 不被修改。
+
+    threshold、stable_ratio 须为非 bool 的 int/float，类型不符抛
+    TypeError；非有限或越出 [0, 1] 抛 ValueError。
+
+    按 i 升序取各 result.windows[i]（缺失者略过），依 results 序从 0.0
+    累加，每项为 [i, count, mean, min, max, pass_rate]：i、count 为
+    int，mean、min、max、pass_rate 为 float；pass_rate 为该位窗口值
+    >= threshold 的比例。stable_window 为首个覆盖全部 results（count
+    等于 results 项数）且 pass_rate >= stable_ratio 的 i，无则 None。
+
+    返回键依次为 seeds、windows、stable_window、stable；seeds 依
+    results 序保序（含重复），stable 等价于 stable_window 非 None；无
+    任何窗口时 windows 为 []。相同输入逐值一致。
+    """
+    if not isinstance(data, dict):
+        raise TypeError("data must be a dict")
+
+    if list(data.keys()) != ["results", "means", "passed", "converged"]:
+        raise ValueError(
+            "data keys must be results, means, passed, converged"
+        )
+    results = data["results"]
+    if not isinstance(results, list) or not results:
+        raise ValueError("data results must be a non-empty list")
+
+    seed_windows = []
+    for item in results:
+        if not isinstance(item, dict) or list(item.keys()) != [
+            "seed",
+            "result",
+        ]:
+            raise ValueError("each results item must have keys seed, result")
+        result = item["result"]
+        if not isinstance(result, dict) or list(result.keys()) != [
+            "episodes",
+            "success_rate",
+            "windows",
+            "converged",
+        ]:
+            raise ValueError(
+                "each result must have keys episodes, success_rate,"
+                " windows, converged"
+            )
+        episodes = result["episodes"]
+        if not isinstance(episodes, list):
+            raise ValueError("episodes must be a list")
+        for row in episodes:
+            if not isinstance(row, list) or len(row) != 3:
+                raise ValueError("every episode row must have 3 fields")
+        windows = result["windows"]
+        if not isinstance(windows, list):
+            raise ValueError("windows must be a list")
+        for value in windows:
+            if not isinstance(value, float) or not math.isfinite(value):
+                raise ValueError(
+                    "window values must be finite floats in [0, 1]"
+                )
+            if value < 0.0 or value > 1.0:
+                raise ValueError(
+                    "window values must be finite floats in [0, 1]"
+                )
+        seed_windows.append((item["seed"], windows))
+
+    if isinstance(threshold, bool) or not isinstance(
+        threshold, (int, float)
+    ):
+        raise TypeError("threshold must be an int or float")
+    if isinstance(stable_ratio, bool) or not isinstance(
+        stable_ratio, (int, float)
+    ):
+        raise TypeError("stable_ratio must be an int or float")
+    if not _is_finite_number(threshold) or threshold < 0 or threshold > 1:
+        raise ValueError("threshold must be finite and in [0, 1]")
+    if (
+        not _is_finite_number(stable_ratio)
+        or stable_ratio < 0
+        or stable_ratio > 1
+    ):
+        raise ValueError("stable_ratio must be finite and in [0, 1]")
+
+    total_runs = len(seed_windows)
+    longest = max((len(windows) for _, windows in seed_windows), default=0)
+    window_rows = []
+    stable_window = None
+    for i in range(longest):
+        values = [
+            windows[i]
+            for _, windows in seed_windows
+            if i < len(windows)
+        ]
+        count = len(values)
+        mean = sum(values, 0.0) / count
+        passed = sum(1 for value in values if value >= threshold)
+        pass_rate = passed / count
+        window_rows.append(
+            [i, count, mean, min(values), max(values), pass_rate]
+        )
+        if (
+            stable_window is None
+            and count == total_runs
+            and pass_rate >= stable_ratio
+        ):
+            stable_window = i
+
+    return {
+        "seeds": [seed for seed, _ in seed_windows],
+        "windows": window_rows,
+        "stable_window": stable_window,
+        "stable": stable_window is not None,
+    }
+
+
 def convergence_report(
     episode_results, window=20, tolerance=0.01, patience=3
 ) -> dict:
