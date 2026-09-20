@@ -2,6 +2,7 @@
 
 import json
 import math
+import random
 import sys
 
 _ACTIONS = {
@@ -117,14 +118,6 @@ def _reachable_cells(env):
     return seen
 
 
-def _is_finite_number(value):
-    return (
-        isinstance(value, (int, float))
-        and not isinstance(value, bool)
-        and math.isfinite(value)
-    )
-
-
 def value_iteration(env, gamma=0.9, tolerance=1e-9, max_iterations=10000):
     """同步值迭代，返回 (values, iterations)。
 
@@ -133,14 +126,14 @@ def value_iteration(env, gamma=0.9, tolerance=1e-9, max_iterations=10000):
     """
     if not isinstance(env, GridWorld):
         raise TypeError("env must be a GridWorld")
-    if not _is_finite_number(gamma):
-        raise TypeError("gamma must be a finite int or float")
-    if gamma < 0 or gamma >= 1:
-        raise ValueError("gamma must be in [0, 1)")
-    if not _is_finite_number(tolerance):
-        raise TypeError("tolerance must be a finite int or float")
-    if tolerance <= 0:
-        raise ValueError("tolerance must be in (0, +inf)")
+    if isinstance(gamma, bool) or not isinstance(gamma, (int, float)):
+        raise TypeError("gamma must be an int or float")
+    if not math.isfinite(gamma) or gamma < 0 or gamma >= 1:
+        raise ValueError("gamma must be finite and in [0, 1)")
+    if isinstance(tolerance, bool) or not isinstance(tolerance, (int, float)):
+        raise TypeError("tolerance must be an int or float")
+    if not math.isfinite(tolerance) or tolerance <= 0:
+        raise ValueError("tolerance must be finite and in (0, +inf)")
     if isinstance(max_iterations, bool) or not isinstance(max_iterations, int):
         raise TypeError("max_iterations must be an int")
     if max_iterations <= 0:
@@ -171,6 +164,65 @@ def value_iteration(env, gamma=0.9, tolerance=1e-9, max_iterations=10000):
         if delta <= tolerance:
             return values, iterations
     raise RuntimeError("value iteration did not converge")
+
+
+def q_learning(env, episodes=500, alpha=0.5, gamma=0.9, epsilon=0.1, seed=0):
+    """Q-learning，返回 {((row, col), action): float}。
+
+    Q 覆盖从 S 可达的非 G 格与 U/R/D/L 的全部组合，初始为 0.0。
+    每回合 reset，单回合最多 1000 步；全部随机性来自一个
+    random.Random(seed)。
+    """
+    if not isinstance(env, GridWorld):
+        raise TypeError("env must be a GridWorld")
+    if isinstance(episodes, bool) or not isinstance(episodes, int):
+        raise TypeError("episodes must be an int")
+    if isinstance(seed, bool) or not isinstance(seed, int):
+        raise TypeError("seed must be an int")
+    if isinstance(alpha, bool) or not isinstance(alpha, (int, float)):
+        raise TypeError("alpha must be an int or float")
+    if isinstance(gamma, bool) or not isinstance(gamma, (int, float)):
+        raise TypeError("gamma must be an int or float")
+    if isinstance(epsilon, bool) or not isinstance(epsilon, (int, float)):
+        raise TypeError("epsilon must be an int or float")
+    if episodes <= 0:
+        raise ValueError("episodes must be positive")
+    if not math.isfinite(alpha) or alpha <= 0 or alpha > 1:
+        raise ValueError("alpha must be finite and in (0, 1]")
+    if not math.isfinite(gamma) or gamma < 0 or gamma >= 1:
+        raise ValueError("gamma must be finite and in [0, 1)")
+    if not math.isfinite(epsilon) or epsilon < 0 or epsilon > 1:
+        raise ValueError("epsilon must be finite and in [0, 1]")
+
+    actions = tuple(_ACTIONS)  # U, R, D, L
+    q = {
+        (state, action): 0.0
+        for state in sorted(_reachable_cells(env))
+        if env._cell(state) != "G"
+        for action in actions
+    }
+    rng = random.Random(seed)
+
+    for _ in range(episodes):
+        state = env.reset()
+        for _ in range(1000):
+            if rng.random() < epsilon:
+                action = actions[rng.randrange(4)]
+            else:
+                action = max(actions, key=lambda a: q[(state, a)])
+            next_state, reward, done = env.step(action)
+            if done:
+                target = reward
+            else:
+                target = reward + gamma * max(
+                    q[(next_state, a)] for a in actions
+                )
+            key = (state, action)
+            q[key] += alpha * (target - q[key])
+            if done:
+                break
+            state = next_state
+    return q
 
 
 def _format_value(value):
