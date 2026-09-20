@@ -181,7 +181,7 @@ def q_learning(
     epsilon=0.1,
     seed=0,
     epsilon_end=None,
-):
+) -> dict:
     """Q-learning，返回 {((row, col), action): float}。
 
     Q 覆盖从 S 可达的非 G 格与 U/R/D/L 的全部组合，初始为 0.0。
@@ -258,6 +258,86 @@ def q_learning(
             if done:
                 break
             state = next_state
+    return q
+
+
+def sarsa_lambda(
+    env,
+    episodes=500,
+    alpha=0.5,
+    gamma=0.9,
+    epsilon=0.1,
+    lambda_=0.9,
+    seed=0,
+) -> dict:
+    """SARSA(λ)，累积资格迹，返回 {((row, col), action): float}。
+
+    Q 覆盖从 S 可达的非 G 格与 U/R/D/L 的全部组合，初始为 0.0。
+    每回合 reset 且资格迹清零，先选动作再行动；单回合最多 1000
+    步；全部随机性来自一个 random.Random(seed)。
+    """
+    if not isinstance(env, GridWorld):
+        raise TypeError("env must be a GridWorld")
+    if isinstance(episodes, bool) or not isinstance(episodes, int):
+        raise TypeError("episodes must be an int")
+    if isinstance(seed, bool) or not isinstance(seed, int):
+        raise TypeError("seed must be an int")
+    if isinstance(alpha, bool) or not isinstance(alpha, (int, float)):
+        raise TypeError("alpha must be an int or float")
+    if isinstance(gamma, bool) or not isinstance(gamma, (int, float)):
+        raise TypeError("gamma must be an int or float")
+    if isinstance(epsilon, bool) or not isinstance(epsilon, (int, float)):
+        raise TypeError("epsilon must be an int or float")
+    if isinstance(lambda_, bool) or not isinstance(lambda_, (int, float)):
+        raise TypeError("lambda_ must be an int or float")
+    if episodes <= 0:
+        raise ValueError("episodes must be positive")
+    if not _is_finite_number(alpha) or alpha <= 0 or alpha > 1:
+        raise ValueError("alpha must be finite and in (0, 1]")
+    if not _is_finite_number(gamma) or gamma < 0 or gamma >= 1:
+        raise ValueError("gamma must be finite and in [0, 1)")
+    if not _is_finite_number(epsilon) or epsilon < 0 or epsilon > 1:
+        raise ValueError("epsilon must be finite and in [0, 1]")
+    if not _is_finite_number(lambda_) or lambda_ < 0 or lambda_ > 1:
+        raise ValueError("lambda_ must be finite and in [0, 1]")
+
+    actions = tuple(_ACTIONS)  # U, R, D, L
+    q = {
+        (state, action): 0.0
+        for state in sorted(_reachable_cells(env))
+        if env._cell(state) != "G"
+        for action in actions
+    }
+    rng = random.Random(seed)
+
+    def choose(state):
+        if rng.random() < epsilon:
+            return actions[rng.randrange(4)]
+        return max(actions, key=lambda a: q[(state, a)])
+
+    for _ in range(episodes):
+        state = env.reset()
+        e = {key: 0.0 for key in q}
+        action = choose(state)
+        for _ in range(1000):
+            next_state, reward, done = env.step(action)
+            if done:
+                delta = reward - q[(state, action)]
+            else:
+                next_action = choose(next_state)
+                delta = (
+                    reward
+                    + gamma * q[(next_state, next_action)]
+                    - q[(state, action)]
+                )
+            e[(state, action)] += 1.0
+            for key in q:
+                q[key] += alpha * delta * e[key]
+                e[key] *= gamma * lambda_
+            if done:
+                break
+            state = next_state
+            action = next_action
     return q
 
 
