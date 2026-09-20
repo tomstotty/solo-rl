@@ -1008,6 +1008,91 @@ def evaluate(env, h, episodes, max_steps, seed, window, threshold) -> dict:
     }
 
 
+def convergence_report(
+    episode_results, window=20, tolerance=0.01, patience=3
+) -> dict:
+    """根据逐回合 reward 的滑窗均值判定收敛，返回报告字典。
+
+    episode_results 每项须为 [steps, reward, done] 三项 list：steps 为
+    非 bool 正 int，reward 为可转为有限 float 的非 bool int/float，
+    done 为 bool；空列表合法且视为未收敛。window、patience 为非 bool
+    正 int，tolerance 为非 bool 有限 int/float 且 >= 0。
+
+    对每个长度为 window 的完整连续滑窗按
+    sum(map(float, r), 0.0) / window 求 reward 均值，依序得 float
+    列表 M。找最小 j >= patience，使 abs(M[k]-M[k-1]) <= tolerance
+    对 k=j-patience+1..j 均成立。命中时返回
+    True、window+j（从 1 起的回合号）、M[j]、M；否则返回
+    False、None、None、M。M 不截断，输入不被修改。
+    """
+    if not isinstance(episode_results, list):
+        raise TypeError("episode_results must be a list")
+    if isinstance(window, bool) or not isinstance(window, int):
+        raise TypeError("window must be an int")
+    if isinstance(patience, bool) or not isinstance(patience, int):
+        raise TypeError("patience must be an int")
+    if isinstance(tolerance, bool) or not isinstance(
+        tolerance, (int, float)
+    ):
+        raise TypeError("tolerance must be an int or float")
+    if window <= 0:
+        raise ValueError("window must be positive")
+    if patience <= 0:
+        raise ValueError("patience must be positive")
+    if not _is_finite_number(tolerance) or tolerance < 0:
+        raise ValueError("tolerance must be finite and >= 0")
+
+    for row in episode_results:
+        if not isinstance(row, list):
+            raise TypeError("every episode result must be a list")
+        if len(row) != 3:
+            raise ValueError("every episode result must have 3 fields")
+        steps, reward, done = row
+        if isinstance(steps, bool) or not isinstance(steps, int):
+            raise TypeError("steps must be an int")
+        if steps <= 0:
+            raise ValueError("steps must be positive")
+        if isinstance(reward, bool) or not isinstance(
+            reward, (int, float)
+        ):
+            raise TypeError("reward must be an int or float")
+        try:
+            reward_float = float(reward)
+        except OverflowError:
+            raise ValueError(
+                "reward must be convertible to a finite float"
+            )
+        if not math.isfinite(reward_float):
+            raise ValueError("reward must be a finite number")
+        if not isinstance(done, bool):
+            raise TypeError("done must be a bool")
+
+    rewards = [row[1] for row in episode_results]
+    means = []
+    for start in range(len(rewards) - window + 1):
+        r = rewards[start:start + window]
+        means.append(sum(map(float, r), 0.0) / window)
+
+    converged = False
+    episode = None
+    reward_mean = None
+    for j in range(patience, len(means)):
+        if all(
+            abs(means[k] - means[k - 1]) <= tolerance
+            for k in range(j - patience + 1, j + 1)
+        ):
+            converged = True
+            episode = window + j
+            reward_mean = means[j]
+            break
+    return {
+        "converged": converged,
+        "episode": episode,
+        "reward_mean": reward_mean,
+        "windows": means,
+    }
+
+
 def _format_value(value):
     if abs(value) < 0.5e-12:
         value = 0.0
