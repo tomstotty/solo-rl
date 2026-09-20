@@ -1111,6 +1111,146 @@ def ppo_clipped_surrogate(
     }
 
 
+def ppo_update(logits, batch, lr=0.05, c=0.2, epochs=4) -> dict:
+    """PPO 截断策略梯度多轮更新，返回固定键序 logits、objectives、
+    probabilities 的 dict。
+
+    logits 须为非空矩形 list，每行为非空 list 且元素为有限 float；
+    batch 须为非空 list，每项为四项 list [s, a, o, A]，s、a 为非 bool
+    的 int 且分别为有效行、列索引，o、A 为有限 float；lr、c 为有限
+    float 且依次属 (0, 1]、[0, 1)；epochs 为非 bool 正 int。类型不符
+    抛 TypeError，其余约束不符抛 ValueError。输入不被修改。
+
+    每轮先冻结 L（logits 的 float 副本）；对每行取 m=max(L)，算
+    q_j=L_j-m-log(Σexp(L_k-m))、p_j=exp(q_j)。按 batch 顺序取 q_a，
+    以 ppo_clipped_surrogate 求概率比 r 与更新前均值目标。若 A>0 且
+    r>1+c 或 A<0 且 r<1-c，该样本梯度为 0；否则行 s 列 j 的梯度为
+    r*A*(I[j=a]-p_j)。依样本、列序累加，除以 batch 长度后同步
+    L+=lr*g。新运算结果非有限抛 ValueError。
+
+    返回键依次为 logits、objectives、probabilities：最终 L、各轮
+    均值 float 列表、最终 softmax 二维列表；数值均为 float。
+    """
+    if not isinstance(logits, list):
+        raise TypeError("logits must be a list")
+    for row in logits:
+        if not isinstance(row, list):
+            raise TypeError("every row of logits must be a list")
+        for value in row:
+            if not isinstance(value, float):
+                raise TypeError("logits values must be floats")
+    if not isinstance(batch, list):
+        raise TypeError("batch must be a list")
+    for item in batch:
+        if not isinstance(item, list):
+            raise TypeError("every batch item must be a list")
+        if len(item) != 4:
+            raise ValueError("every batch item must have 4 fields")
+        s, a, o, adv = item
+        if isinstance(s, bool) or not isinstance(s, int):
+            raise TypeError("s must be an int")
+        if isinstance(a, bool) or not isinstance(a, int):
+            raise TypeError("a must be an int")
+        if not isinstance(o, float):
+            raise TypeError("o must be a float")
+        if not isinstance(adv, float):
+            raise TypeError("A must be a float")
+    if not isinstance(lr, float):
+        raise TypeError("lr must be a float")
+    if not isinstance(c, float):
+        raise TypeError("c must be a float")
+    if isinstance(epochs, bool) or not isinstance(epochs, int):
+        raise TypeError("epochs must be an int")
+
+    if not logits:
+        raise ValueError("logits must be non-empty")
+    width = len(logits[0])
+    if width == 0:
+        raise ValueError("logits rows must be non-empty")
+    for row in logits:
+        if len(row) == 0:
+            raise ValueError("logits rows must be non-empty")
+        if len(row) != width:
+            raise ValueError("logits must be rectangular")
+        for value in row:
+            if not math.isfinite(value):
+                raise ValueError("logits values must be finite")
+    if not batch:
+        raise ValueError("batch must be non-empty")
+    for item in batch:
+        s, a, o, adv = item
+        if not 0 <= s < len(logits):
+            raise ValueError("s must be a valid row index")
+        if not 0 <= a < width:
+            raise ValueError("a must be a valid column index")
+        if not math.isfinite(o):
+            raise ValueError("o must be finite")
+        if not math.isfinite(adv):
+            raise ValueError("A must be finite")
+    if not math.isfinite(lr) or lr <= 0.0 or lr > 1.0:
+        raise ValueError("lr must be finite and in (0, 1]")
+    if not math.isfinite(c) or c < 0.0 or c >= 1.0:
+        raise ValueError("c must be finite and in [0, 1)")
+    if epochs <= 0:
+        raise ValueError("epochs must be positive")
+
+    def _softmax(row):
+        m = max(row)
+        log_total = math.log(sum(math.exp(v - m) for v in row))
+        q = [v - m - log_total for v in row]
+        p = [math.exp(v) for v in q]
+        return q, p
+
+    n = len(batch)
+    L = [[float(v) for v in row] for row in logits]
+    objectives = []
+    for _ in range(epochs):
+        frozen = [row[:] for row in L]
+        q_rows = []
+        p_rows = []
+        for row in frozen:
+            q, p = _softmax(row)
+            q_rows.append(q)
+            p_rows.append(p)
+        result = ppo_clipped_surrogate(
+            [item[2] for item in batch],
+            [q_rows[item[0]][item[1]] for item in batch],
+            [item[3] for item in batch],
+            c,
+        )
+        objectives.append(result["mean_objective"])
+        g = [[0.0] * width for _ in range(len(frozen))]
+        for (s, a, _o, adv), r in zip(batch, result["ratios"]):
+            if (adv > 0.0 and r > 1.0 + c) or (adv < 0.0 and r < 1.0 - c):
+                continue
+            p_row = p_rows[s]
+            for j in range(width):
+                indicator = 1.0 if j == a else 0.0
+                term = r * adv * (indicator - p_row[j])
+                if not math.isfinite(term):
+                    raise ValueError("gradient term must be finite")
+                g[s][j] += term
+                if not math.isfinite(g[s][j]):
+                    raise ValueError("gradient sum must be finite")
+        for i in range(len(frozen)):
+            for j in range(width):
+                averaged = g[i][j] / n
+                new_value = frozen[i][j] + lr * averaged
+                if not math.isfinite(new_value):
+                    raise ValueError("updated logits must be finite")
+                L[i][j] = new_value
+
+    probabilities = []
+    for row in L:
+        _q, p = _softmax(row)
+        probabilities.append(p)
+    return {
+        "logits": L,
+        "objectives": objectives,
+        "probabilities": probabilities,
+    }
+
+
 def evaluate(env, h, episodes, max_steps, seed, window, threshold) -> dict:
     """按 softmax 策略评估偏好 H，返回回合统计与收敛判定。
 
