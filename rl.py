@@ -340,6 +340,76 @@ def sarsa_lambda(
     return q
 
 
+def reinforce(env, episodes=500, alpha=0.05, gamma=0.9, seed=0) -> dict:
+    """REINFORCE（带平均回报基线），返回 {((row, col), action): float}。
+
+    H 覆盖从 S 可达的非 G 格与 U/R/D/L 的全部组合，初始为 0.0。
+    按 softmax 偏好 H 采样动作；每回合 reset，单回合最多 1000 步。
+    回合末以各步回报 G 的均值为基线 B，按 A=G-B 更新 H。
+    全部随机性来自一个 random.Random(seed)。
+    """
+    if not isinstance(env, GridWorld):
+        raise TypeError("env must be a GridWorld")
+    if isinstance(episodes, bool) or not isinstance(episodes, int):
+        raise TypeError("episodes must be an int")
+    if isinstance(seed, bool) or not isinstance(seed, int):
+        raise TypeError("seed must be an int")
+    if isinstance(alpha, bool) or not isinstance(alpha, (int, float)):
+        raise TypeError("alpha must be an int or float")
+    if isinstance(gamma, bool) or not isinstance(gamma, (int, float)):
+        raise TypeError("gamma must be an int or float")
+    if episodes <= 0:
+        raise ValueError("episodes must be positive")
+    if not _is_finite_number(alpha) or alpha <= 0 or alpha > 1:
+        raise ValueError("alpha must be finite and in (0, 1]")
+    if not _is_finite_number(gamma) or gamma < 0 or gamma >= 1:
+        raise ValueError("gamma must be finite and in [0, 1)")
+
+    actions = tuple(_ACTIONS)  # U, R, D, L
+    states = sorted(
+        state
+        for state in _reachable_cells(env)
+        if env._cell(state) != "G"
+    )
+    h = {(state, action): 0.0 for state in states for action in actions}
+    rng = random.Random(seed)
+
+    for _ in range(episodes):
+        state = env.reset()
+        trajectory = []
+        for _ in range(1000):
+            m = max(h[(state, a)] for a in actions)
+            weights = [math.exp(h[(state, a)] - m) for a in actions]
+            total = sum(weights)
+            probs = [weight / total for weight in weights]
+            u = rng.random()
+            cumulative = 0.0
+            action = "L"
+            for a, p_a in zip(actions, probs):
+                cumulative += p_a
+                if cumulative > u:
+                    action = a
+                    break
+            prob = dict(zip(actions, probs))
+            next_state, reward, done = env.step(action)
+            trajectory.append((state, action, reward, prob))
+            if done:
+                break
+            state = next_state
+        g = 0.0
+        returns = [0.0] * len(trajectory)
+        for t in range(len(trajectory) - 1, -1, -1):
+            g = trajectory[t][2] + gamma * g
+            returns[t] = g
+        baseline = sum(returns) / len(trajectory)
+        for (state, action, _reward, prob), g_t in zip(trajectory, returns):
+            advantage = g_t - baseline
+            for b in actions:
+                indicator = 1.0 if b == action else 0.0
+                h[(state, b)] += alpha * advantage * (indicator - prob[b])
+    return h
+
+
 def _format_value(value):
     if abs(value) < 0.5e-12:
         value = 0.0
