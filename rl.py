@@ -1543,6 +1543,99 @@ def evaluate(env, h, episodes, max_steps, seed, window, threshold) -> dict:
     }
 
 
+def ppo_evaluate(
+    env, h, episodes=100, max_steps=1000, seed=0, window=20, threshold=0.9
+) -> dict:
+    """按 softmax 策略评估列表形式的偏好 H，返回回合统计与滑窗成功率。
+
+    h 须为 list，按从 S 可达的非 G 格坐标升序排列，每行恰为六项 list
+    [r, c, lU, lR, lD, lL]，均为有限 float，且 r、c 分别等于对应坐标
+    的 float；h 或行非 list、元素非 float 抛 TypeError，空表、行长、
+    坐标域/顺序或有限性错误抛 ValueError。将 r、c 转为 int 后按
+    U/R/D/L 把四个 logit 映射为 evaluate 的
+    {((row, col), action): float} 偏好并交 evaluate 评估，不修改 h。
+    除 h 外的参数校验与异常、回合边界、URDL 稳定 softmax 采样及
+    random.Random(seed) 消费顺序均沿用 evaluate。
+
+    返回键依次为 episodes、success_rate、windows、converged；前两项及
+    episodes 内 [steps, total_reward, success] 结构沿用 evaluate；
+    windows 按起点升序含每个完整 window 的 success 算术均值 float；
+    converged 仅当 windows 非空且末项 >= threshold 时为 True。相同
+    输入与 seed 逐值一致。
+    """
+    if not isinstance(env, GridWorld):
+        raise TypeError("env must be a GridWorld")
+    if not isinstance(h, list):
+        raise TypeError("h must be a list")
+    if isinstance(episodes, bool) or not isinstance(episodes, int):
+        raise TypeError("episodes must be an int")
+    if isinstance(max_steps, bool) or not isinstance(max_steps, int):
+        raise TypeError("max_steps must be an int")
+    if isinstance(seed, bool) or not isinstance(seed, int):
+        raise TypeError("seed must be an int")
+    if isinstance(window, bool) or not isinstance(window, int):
+        raise TypeError("window must be an int")
+    if isinstance(threshold, bool) or not isinstance(
+        threshold, (int, float)
+    ):
+        raise TypeError("threshold must be an int or float")
+    if episodes <= 0:
+        raise ValueError("episodes must be positive")
+    if max_steps <= 0:
+        raise ValueError("max_steps must be positive")
+    if window <= 0:
+        raise ValueError("window must be positive")
+    if not _is_finite_number(threshold) or threshold < 0 or threshold > 1:
+        raise ValueError("threshold must be finite and in [0, 1]")
+
+    actions = tuple(_ACTIONS)  # U, R, D, L
+    states = sorted(
+        state
+        for state in _reachable_cells(env)
+        if env._cell(state) != "G"
+    )
+    if not h:
+        raise ValueError("h must be non-empty")
+    if len(h) != len(states):
+        raise ValueError(
+            "h must have exactly one row per reachable non-G cell"
+        )
+    preferences = {}
+    for (r, c), row in zip(states, h):
+        if not isinstance(row, list):
+            raise TypeError("every row of h must be a list")
+        if len(row) != 6:
+            raise ValueError("every row of h must have exactly 6 elements")
+        for item in row:
+            if not isinstance(item, float):
+                raise TypeError("h elements must be float")
+            if not math.isfinite(item):
+                raise ValueError("h elements must be finite")
+        if row[0] != float(r) or row[1] != float(c):
+            raise ValueError(
+                "h rows must match the reachable non-G cells in "
+                "ascending coordinate order"
+            )
+        for action, logit in zip(actions, row[2:]):
+            preferences[((int(row[0]), int(row[1])), action)] = logit
+
+    result = evaluate(env, preferences, episodes, max_steps, seed, window, threshold)
+    episode_results = result["episodes"]
+    windows = []
+    for start in range(len(episode_results) - window + 1):
+        successes = sum(
+            1 for item in episode_results[start:start + window] if item[2]
+        )
+        windows.append(successes / window)
+    converged = bool(windows) and windows[-1] >= threshold
+    return {
+        "episodes": episode_results,
+        "success_rate": result["success_rate"],
+        "windows": windows,
+        "converged": converged,
+    }
+
+
 def convergence_report(
     episode_results, window=20, tolerance=0.01, patience=3
 ) -> dict:
