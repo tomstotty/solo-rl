@@ -1641,6 +1641,91 @@ def ppo_evaluate(
     }
 
 
+def ppo_evaluate_many(
+    env, h, seeds, episodes=100, max_steps=1000, window=20, threshold=0.9
+) -> dict:
+    """按多个 seed 依次复用 ppo_evaluate 评估，返回逐 seed 结果与汇总。
+
+    除 seeds 外，参数校验与异常沿用 ppo_evaluate。seeds 须为非空
+    list/tuple，元素为非 bool int；容器或元素类型错误抛 TypeError，
+    空序列抛 ValueError；允许重复，且不修改 seeds 与 h。按 seeds
+    顺序逐项以该 seed 调用 ppo_evaluate（其余参数不变），每次调用
+    创建独立随机流。
+
+    返回键序为 results、means、passed、converged。results 与 seeds
+    同序，元素为键序 seed、result 的 dict，result 即对应 seed 的
+    ppo_evaluate 完整返回值。means 键序为 success、last_window：
+    success 为各 result["success_rate"] 按 results 序从 0.0 累加后
+    除以项数所得 float；last_window 对 windows 非空的 result 的末项
+    同法计算，无项则为 None。passed 为 result["converged"] 为 True
+    的数量；converged 等价于 passed == len(seeds)。相同输入逐值一致。
+    """
+    if not isinstance(env, GridWorld):
+        raise TypeError("env must be a GridWorld")
+    if not isinstance(h, list):
+        raise TypeError("h must be a list")
+    if isinstance(episodes, bool) or not isinstance(episodes, int):
+        raise TypeError("episodes must be an int")
+    if isinstance(max_steps, bool) or not isinstance(max_steps, int):
+        raise TypeError("max_steps must be an int")
+    if not isinstance(seeds, (list, tuple)):
+        raise TypeError("seeds must be a list or tuple")
+    for seed in seeds:
+        if isinstance(seed, bool) or not isinstance(seed, int):
+            raise TypeError("every seed must be an int")
+    if isinstance(window, bool) or not isinstance(window, int):
+        raise TypeError("window must be an int")
+    if isinstance(threshold, bool) or not isinstance(
+        threshold, (int, float)
+    ):
+        raise TypeError("threshold must be an int or float")
+    if episodes <= 0:
+        raise ValueError("episodes must be positive")
+    if max_steps <= 0:
+        raise ValueError("max_steps must be positive")
+    if not seeds:
+        raise ValueError("seeds must be non-empty")
+    if window <= 0:
+        raise ValueError("window must be positive")
+    if not _is_finite_number(threshold) or threshold < 0 or threshold > 1:
+        raise ValueError("threshold must be finite and in [0, 1]")
+
+    results = [
+        {
+            "seed": seed,
+            "result": ppo_evaluate(
+                env, h, episodes, max_steps, seed, window, threshold
+            ),
+        }
+        for seed in seeds
+    ]
+    success_mean = 0.0
+    for item in results:
+        success_mean += item["result"]["success_rate"]
+    success_mean /= len(results)
+    last_windows = [
+        item["result"]["windows"][-1]
+        for item in results
+        if item["result"]["windows"]
+    ]
+    last_window_mean = None
+    if last_windows:
+        last_window_mean = 0.0
+        for value in last_windows:
+            last_window_mean += value
+        last_window_mean /= len(last_windows)
+    passed = sum(1 for item in results if item["result"]["converged"])
+    return {
+        "results": results,
+        "means": {
+            "success": success_mean,
+            "last_window": last_window_mean,
+        },
+        "passed": passed,
+        "converged": passed == len(seeds),
+    }
+
+
 def convergence_report(
     episode_results, window=20, tolerance=0.01, patience=3
 ) -> dict:
