@@ -950,6 +950,73 @@ def gae_actor_critic(
     return {"h": h_table, "v": v_table, "episodes": episode_results}
 
 
+def generalized_advantage_estimate(
+    rewards, values, gamma=0.9, lambda_=0.95, bootstrap=0.0
+) -> dict:
+    """广义优势估计（GAE），返回固定键序 advantages、returns 的 dict。
+
+    rewards、values 须为等长非空的 list/tuple，各元素为非 bool 的
+    int/float；gamma、lambda_、bootstrap 为非 bool 的 int/float 标量，
+    其中 gamma、lambda_ 须在 [0, 1]。所有输入先复制并转换为 float
+    （转换溢出或结果非有限均抛 ValueError），不修改原序列。逆序递推
+    delta=r[t]+gamma*(bootstrap if t==T-1 else v[t+1])-v[t]、
+    A[t]=delta+gamma*lambda_*A[t+1]（末步之外以 v[t+1] 自举），
+    returns[t]=A[t]+v[t]；两个列表均按原时序排列。
+    """
+    if not isinstance(rewards, (list, tuple)):
+        raise TypeError("rewards must be a list or tuple")
+    if not isinstance(values, (list, tuple)):
+        raise TypeError("values must be a list or tuple")
+    if len(rewards) == 0 or len(values) == 0:
+        raise ValueError("rewards and values must be non-empty")
+    if len(rewards) != len(values):
+        raise ValueError("rewards and values must have equal length")
+
+    def _to_float(item, name):
+        if isinstance(item, bool) or not isinstance(item, (int, float)):
+            raise TypeError(f"{name} must contain only int or float")
+        try:
+            result = float(item)
+        except OverflowError:
+            raise ValueError(f"{name} must convert to a finite float")
+        if not math.isfinite(result):
+            raise ValueError(f"{name} must contain only finite numbers")
+        return result
+
+    r = [_to_float(item, "rewards") for item in rewards]
+    v = [_to_float(item, "values") for item in values]
+
+    def _to_scalar(item, name):
+        if isinstance(item, bool) or not isinstance(item, (int, float)):
+            raise TypeError(f"{name} must be an int or float")
+        try:
+            result = float(item)
+        except OverflowError:
+            raise ValueError(f"{name} must convert to a finite float")
+        if not math.isfinite(result):
+            raise ValueError(f"{name} must be finite")
+        return result
+
+    g = _to_scalar(gamma, "gamma")
+    l = _to_scalar(lambda_, "lambda_")
+    b = _to_scalar(bootstrap, "bootstrap")
+    if g < 0.0 or g > 1.0:
+        raise ValueError("gamma must be in [0, 1]")
+    if l < 0.0 or l > 1.0:
+        raise ValueError("lambda_ must be in [0, 1]")
+
+    T = len(r)
+    n = 0.0
+    A = [0.0] * T
+    for t in range(T - 1, -1, -1):
+        next_value = b if t == T - 1 else v[t + 1]
+        d = r[t] + g * next_value - v[t]
+        A[t] = d + g * l * n
+        n = A[t]
+    returns = [A[t] + v[t] for t in range(T)]
+    return {"advantages": A, "returns": returns}
+
+
 def evaluate(env, h, episodes, max_steps, seed, window, threshold) -> dict:
     """按 softmax 策略评估偏好 H，返回回合统计与收敛判定。
 
