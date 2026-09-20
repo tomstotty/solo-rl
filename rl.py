@@ -1268,6 +1268,169 @@ def ppo_update(logits, batch, lr=0.05, c=0.2, epochs=4) -> dict:
     }
 
 
+def ppo_train(
+    env,
+    episodes=100,
+    alpha=0.05,
+    gamma=0.9,
+    lambda_=0.95,
+    c=0.2,
+    epochs=4,
+    seed=0,
+    max_steps=1000,
+) -> dict:
+    """PPO（整回合采样 + GAE + ppo_update 续训），返回 h 表与逐回合记录。
+
+    从 S 可达的非 G 格按坐标升序编号 0..n-1，H 为 n x 4 的 logits
+    列表，V 覆盖同样的格子，初始均为 0.0。每回合 reset，至 done 或
+    max_steps 步；每步按稳定 softmax(H[s,·])（U/R/D/L 序）采样动作，
+    仅调用一次 random()，并记录 (s, a, r, old_logp, v, v2, done)：
+    s、a 为状态、动作索引，old_logp 为所采动作的稳定对数概率，v 为
+    采样时 V[s]，done 时 v2=0.0，否则为当时 V[s2]（步限截断仍自举）。
+    回合末逆序递推 delta=r+gamma*v2-v、A=delta+gamma*lambda_*A；
+    将 [s, a, old_logp, A] 批次传给 ppo_update(H, batch,
+    float(alpha), c, epochs) 并以其 logits 续训，再按步序作
+    V[s]+=alpha*(A+v-V[s])。全部随机性来自一个 random.Random(seed)。
+
+    返回键依次为 h、episodes、objectives；h 项按坐标升序为
+    [r, c, lU, lR, lD, lL]，其中数均为 float；episodes 项为回合步
+    列表，步项为 [r, c, action, reward, done]；objectives 项为各
+    回合 ppo_update 的 objectives。新计算量非有限均抛 ValueError。
+    """
+    if not isinstance(env, GridWorld):
+        raise TypeError("env must be a GridWorld")
+    if isinstance(episodes, bool) or not isinstance(episodes, int):
+        raise TypeError("episodes must be an int")
+    if isinstance(seed, bool) or not isinstance(seed, int):
+        raise TypeError("seed must be an int")
+    if isinstance(max_steps, bool) or not isinstance(max_steps, int):
+        raise TypeError("max_steps must be an int")
+    if isinstance(epochs, bool) or not isinstance(epochs, int):
+        raise TypeError("epochs must be a non-bool int")
+    if isinstance(alpha, bool) or not isinstance(alpha, (int, float)):
+        raise TypeError("alpha must be an int or float")
+    if isinstance(gamma, bool) or not isinstance(gamma, (int, float)):
+        raise TypeError("gamma must be an int or float")
+    if isinstance(lambda_, bool) or not isinstance(lambda_, (int, float)):
+        raise TypeError("lambda_ must be an int or float")
+    if not isinstance(c, float):
+        raise TypeError("c must be a float")
+    if episodes <= 0:
+        raise ValueError("episodes must be positive")
+    if max_steps <= 0:
+        raise ValueError("max_steps must be positive")
+    if epochs <= 0:
+        raise ValueError("epochs must be positive")
+    if not _is_finite_number(alpha) or alpha <= 0 or alpha > 1:
+        raise ValueError("alpha must be finite and in (0, 1]")
+    if not _is_finite_number(gamma) or gamma < 0 or gamma > 1:
+        raise ValueError("gamma must be finite and in [0, 1]")
+    if not _is_finite_number(lambda_) or lambda_ < 0 or lambda_ > 1:
+        raise ValueError("lambda_ must be finite and in [0, 1]")
+    if not math.isfinite(c):
+        raise ValueError("c must be finite")
+    if c < 0.0 or c >= 1.0:
+        raise ValueError("c must be in [0, 1)")
+
+    actions = tuple(_ACTIONS)  # U, R, D, L
+    states = sorted(
+        state
+        for state in _reachable_cells(env)
+        if env._cell(state) != "G"
+    )
+    index = {state: i for i, state in enumerate(states)}
+    h = [[0.0] * 4 for _ in states]
+    v = {state: 0.0 for state in states}
+    rng = random.Random(seed)
+    episode_results = []
+    objectives_results = []
+
+    for _ in range(episodes):
+        state = env.reset()
+        trajectory = []
+        step_records = []
+        done = False
+        for _ in range(max_steps):
+            row = h[index[state]]
+            m = max(row)
+            weights = [math.exp(value - m) for value in row]
+            total = sum(weights)
+            log_total = math.log(total)
+            probs = [weight / total for weight in weights]
+            u = rng.random()
+            cumulative = 0.0
+            a_idx = 3
+            for j, p_a in enumerate(probs):
+                cumulative += p_a
+                if cumulative > u:
+                    a_idx = j
+                    break
+            action = actions[a_idx]
+            old_logp = row[a_idx] - m - log_total
+            if not math.isfinite(old_logp):
+                raise ValueError("old log-prob must be finite")
+            value = v[state]
+            next_state, reward, done = env.step(action)
+            value_next = 0.0 if done else v[next_state]
+            trajectory.append(
+                (index[state], a_idx, reward, old_logp, value,
+                 value_next, done)
+            )
+            step_records.append(
+                [state[0], state[1], action, reward, done]
+            )
+            if done:
+                break
+            state = next_state
+        episode_results.append(step_records)
+
+        advantages = [0.0] * len(trajectory)
+        a_t = 0.0
+        for t in range(len(trajectory) - 1, -1, -1):
+            _s, _a, reward, _o, value, value_next, _done = trajectory[t]
+            delta = reward + gamma * value_next - value
+            if not math.isfinite(delta):
+                raise ValueError("delta must be finite")
+            a_t = delta + gamma * lambda_ * a_t
+            if not math.isfinite(a_t):
+                raise ValueError("advantage must be finite")
+            advantages[t] = a_t
+        batch = [
+            [s, a, old_logp, adv]
+            for (s, a, _r, old_logp, _v, _v2, _done), adv in zip(
+                trajectory, advantages
+            )
+        ]
+        result = ppo_update(h, batch, float(alpha), c, epochs)
+        h = result["logits"]
+        objectives_results.append(result["objectives"])
+        for (s, _a, _r, _o, value, _v2, _done), adv in zip(
+            trajectory, advantages
+        ):
+            st = states[s]
+            new_value = v[st] + alpha * (adv + value - v[st])
+            if not math.isfinite(new_value):
+                raise ValueError("updated value must be finite")
+            v[st] = new_value
+
+    h_table = [
+        [
+            float(r),
+            float(col),
+            h[i][0],
+            h[i][1],
+            h[i][2],
+            h[i][3],
+        ]
+        for i, (r, col) in enumerate(states)
+    ]
+    return {
+        "h": h_table,
+        "episodes": episode_results,
+        "objectives": objectives_results,
+    }
+
+
 def evaluate(env, h, episodes, max_steps, seed, window, threshold) -> dict:
     """按 softmax 策略评估偏好 H，返回回合统计与收敛判定。
 
