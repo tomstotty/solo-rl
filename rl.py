@@ -15,6 +15,13 @@ _ACTIONS = {
 _VALID_CELLS = frozenset("S.G#")
 
 
+def _is_finite_number(value):
+    """有限性判定，且不对大整数做 float 转换（避免 OverflowError）。"""
+    return isinstance(value, int) or (
+        isinstance(value, float) and math.isfinite(value)
+    )
+
+
 class GridWorld:
     """确定性网格世界。S 起点，G 终点，# 墙，. 空地。"""
 
@@ -128,11 +135,11 @@ def value_iteration(env, gamma=0.9, tolerance=1e-9, max_iterations=10000):
         raise TypeError("env must be a GridWorld")
     if isinstance(gamma, bool) or not isinstance(gamma, (int, float)):
         raise TypeError("gamma must be an int or float")
-    if not math.isfinite(gamma) or gamma < 0 or gamma >= 1:
+    if not _is_finite_number(gamma) or gamma < 0 or gamma >= 1:
         raise ValueError("gamma must be finite and in [0, 1)")
     if isinstance(tolerance, bool) or not isinstance(tolerance, (int, float)):
         raise TypeError("tolerance must be an int or float")
-    if not math.isfinite(tolerance) or tolerance <= 0:
+    if not _is_finite_number(tolerance) or tolerance <= 0:
         raise ValueError("tolerance must be finite and in (0, +inf)")
     if isinstance(max_iterations, bool) or not isinstance(max_iterations, int):
         raise TypeError("max_iterations must be an int")
@@ -166,12 +173,24 @@ def value_iteration(env, gamma=0.9, tolerance=1e-9, max_iterations=10000):
     raise RuntimeError("value iteration did not converge")
 
 
-def q_learning(env, episodes=500, alpha=0.5, gamma=0.9, epsilon=0.1, seed=0):
+def q_learning(
+    env,
+    episodes=500,
+    alpha=0.5,
+    gamma=0.9,
+    epsilon=0.1,
+    seed=0,
+    epsilon_end=None,
+):
     """Q-learning，返回 {((row, col), action): float}。
 
     Q 覆盖从 S 可达的非 G 格与 U/R/D/L 的全部组合，初始为 0.0。
     每回合 reset，单回合最多 1000 步；全部随机性来自一个
     random.Random(seed)。
+
+    epsilon_end 为 None 时各回合探索率恒为 epsilon；否则第 e 回合
+    （0 起）的探索率在 epsilon 与 epsilon_end 间线性变化，
+    episodes 为 1 时恒为 epsilon。
     """
     if not isinstance(env, GridWorld):
         raise TypeError("env must be a GridWorld")
@@ -185,14 +204,25 @@ def q_learning(env, episodes=500, alpha=0.5, gamma=0.9, epsilon=0.1, seed=0):
         raise TypeError("gamma must be an int or float")
     if isinstance(epsilon, bool) or not isinstance(epsilon, (int, float)):
         raise TypeError("epsilon must be an int or float")
+    if epsilon_end is not None and (
+        isinstance(epsilon_end, bool)
+        or not isinstance(epsilon_end, (int, float))
+    ):
+        raise TypeError("epsilon_end must be None, an int or float")
     if episodes <= 0:
         raise ValueError("episodes must be positive")
-    if not math.isfinite(alpha) or alpha <= 0 or alpha > 1:
+    if not _is_finite_number(alpha) or alpha <= 0 or alpha > 1:
         raise ValueError("alpha must be finite and in (0, 1]")
-    if not math.isfinite(gamma) or gamma < 0 or gamma >= 1:
+    if not _is_finite_number(gamma) or gamma < 0 or gamma >= 1:
         raise ValueError("gamma must be finite and in [0, 1)")
-    if not math.isfinite(epsilon) or epsilon < 0 or epsilon > 1:
+    if not _is_finite_number(epsilon) or epsilon < 0 or epsilon > 1:
         raise ValueError("epsilon must be finite and in [0, 1]")
+    if epsilon_end is not None and (
+        not _is_finite_number(epsilon_end)
+        or epsilon_end < 0
+        or epsilon_end > 1
+    ):
+        raise ValueError("epsilon_end must be finite and in [0, 1]")
 
     actions = tuple(_ACTIONS)  # U, R, D, L
     q = {
@@ -203,10 +233,16 @@ def q_learning(env, episodes=500, alpha=0.5, gamma=0.9, epsilon=0.1, seed=0):
     }
     rng = random.Random(seed)
 
-    for _ in range(episodes):
+    for episode in range(episodes):
+        if epsilon_end is None or episodes == 1:
+            rate = epsilon
+        else:
+            rate = epsilon + (epsilon_end - epsilon) * episode / (
+                episodes - 1
+            )
         state = env.reset()
         for _ in range(1000):
-            if rng.random() < epsilon:
+            if rng.random() < rate:
                 action = actions[rng.randrange(4)]
             else:
                 action = max(actions, key=lambda a: q[(state, a)])
