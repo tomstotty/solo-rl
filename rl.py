@@ -269,12 +269,19 @@ def sarsa_lambda(
     epsilon=0.1,
     lambda_=0.9,
     seed=0,
+    epsilon_end=None,
+    decay_steps=None,
 ) -> dict:
     """SARSA(λ)，返回 {((row, col), action): float}。
 
     Q 覆盖从 S 可达的非 G 格与 U/R/D/L 的全部组合，初始为 0.0。
     每回合 reset，资格迹 E 清零，先选动作；单回合最多 1000 步。
     全部随机性来自一个 random.Random(seed)。
+
+    epsilon_end 为 None 时 decay_steps 也须为 None，各回合探索率恒为
+    epsilon；否则第 e 回合（0 起）e>=decay_steps 时探索率为
+    epsilon_end，之前令 t=e/decay_steps，探索率为
+    epsilon_end+(epsilon-epsilon_end)*(1+cos(pi*t))/2。
     """
     if not isinstance(env, GridWorld):
         raise TypeError("env must be a GridWorld")
@@ -290,6 +297,15 @@ def sarsa_lambda(
         raise TypeError("epsilon must be an int or float")
     if isinstance(lambda_, bool) or not isinstance(lambda_, (int, float)):
         raise TypeError("lambda_ must be an int or float")
+    if epsilon_end is not None and (
+        isinstance(epsilon_end, bool)
+        or not isinstance(epsilon_end, (int, float))
+    ):
+        raise TypeError("epsilon_end must be None, an int or float")
+    if decay_steps is not None and (
+        isinstance(decay_steps, bool) or not isinstance(decay_steps, int)
+    ):
+        raise TypeError("decay_steps must be None or an int")
     if episodes <= 0:
         raise ValueError("episodes must be positive")
     if not _is_finite_number(alpha) or alpha <= 0 or alpha > 1:
@@ -300,6 +316,18 @@ def sarsa_lambda(
         raise ValueError("epsilon must be finite and in [0, 1]")
     if not _is_finite_number(lambda_) or lambda_ < 0 or lambda_ > 1:
         raise ValueError("lambda_ must be finite and in [0, 1]")
+    if epsilon_end is None:
+        if decay_steps is not None:
+            raise ValueError(
+                "decay_steps must be None when epsilon_end is None"
+            )
+    else:
+        if not _is_finite_number(epsilon_end) or (
+            epsilon_end < 0 or epsilon_end > 1
+        ):
+            raise ValueError("epsilon_end must be finite and in [0, 1]")
+        if decay_steps is None or decay_steps <= 0:
+            raise ValueError("decay_steps must be positive")
 
     actions = tuple(_ACTIONS)  # U, R, D, L
     states = sorted(
@@ -310,21 +338,30 @@ def sarsa_lambda(
     q = {(state, action): 0.0 for state in states for action in actions}
     rng = random.Random(seed)
 
-    def choose_action(state):
-        if rng.random() < epsilon:
+    def choose_action(state, rate):
+        if rng.random() < rate:
             return actions[rng.randrange(4)]
         return max(actions, key=lambda a: q[(state, a)])
 
-    for _ in range(episodes):
+    for episode in range(episodes):
+        if epsilon_end is None:
+            rate = epsilon
+        elif episode >= decay_steps:
+            rate = epsilon_end
+        else:
+            t = episode / decay_steps
+            rate = epsilon_end + (epsilon - epsilon_end) * (
+                1 + math.cos(math.pi * t)
+            ) / 2
         state = env.reset()
         eligibility = {key: 0.0 for key in q}
-        action = choose_action(state)
+        action = choose_action(state, rate)
         for _ in range(1000):
             next_state, reward, done = env.step(action)
             if done:
                 delta = reward - q[(state, action)]
             else:
-                next_action = choose_action(next_state)
+                next_action = choose_action(next_state, rate)
                 delta = (
                     reward
                     + gamma * q[(next_state, next_action)]
