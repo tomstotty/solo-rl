@@ -2419,6 +2419,116 @@ def ppo_seed_reproducibility_report(runs) -> dict:
     }
 
 
+def ppo_seed_trajectory_report(runs) -> dict:
+    """按 seed 分组汇总多种子评估轨迹的逐值一致性报告。
+
+    runs 须为至少两项的 list：非 list 抛 TypeError，少于两项抛
+    ValueError。每项须为键序恰为 seed、payload 的 dict：seed 为非
+    bool 的 int；payload 须完整符合 ppo_evaluate_many 的返回契约
+    （结构、键序、类型、非 bool、有限性、范围及汇总等式，与
+    ppo_reproducibility_report 单侧输入一致）。项或 payload 非
+    dict、seed 为 bool 或非 int 抛 TypeError；键序错或 payload
+    违背契约抛 ValueError。先按索引完整校验全部项，再按 seed 首次
+    出现顺序分组、组内保持原序；任一 seed 少于两项、同组 payload
+    的 results 长度不一或同位置 seed 不同均抛 ValueError，任一失败
+    都不返回部分结果，且不修改输入。
+
+    对每组以组内首个 payload 为基准，按组内原序（含基准自身）逐次
+    调用 ppo_reproducibility_report；逐值比较、首差路径、报告结构
+    及异常均沿用该接口。返回键序为 identical、groups、
+    unreproducible_seeds：groups 按 seed 首次出现序排列，每项键序
+    为 seed、indices、reports、identical，indices 为该组各项在原
+    runs 中的零基索引升序 list，reports 为按组内原序排列的完整
+    ppo_reproducibility_report 返回值 list，组 identical 当且仅当
+    各报告 identical 全真；unreproducible_seeds 按组序收集组
+    identical 为 False 的 seed；顶层 identical 当且仅当
+    unreproducible_seeds 为空。重复调用及深拷贝逐值一致，仅用标准
+    库，不引入命令行入口。
+    """
+    if not isinstance(runs, list):
+        raise TypeError("runs must be a list")
+    if len(runs) < 2:
+        raise ValueError("runs must contain at least two entries")
+
+    validated = []
+    for index, item in enumerate(runs):
+        if not isinstance(item, dict):
+            raise TypeError(f"runs[{index}] must be a dict")
+        if list(item) != ["seed", "payload"]:
+            raise ValueError(
+                f"runs[{index}] must have exactly the keys seed, payload"
+            )
+        seed = item["seed"]
+        if isinstance(seed, bool) or not isinstance(seed, int):
+            raise TypeError(f"runs[{index}] seed must be a non-bool int")
+        payload = item["payload"]
+        if not isinstance(payload, dict):
+            raise TypeError(f"runs[{index}] payload must be a dict")
+        _validate_evaluate_many_payload(
+            payload, f"runs[{index}] payload"
+        )
+        validated.append((seed, payload))
+
+    seed_order = []
+    indices_by_seed = {}
+    payloads_by_seed = {}
+    for index, (seed, payload) in enumerate(validated):
+        if seed not in indices_by_seed:
+            seed_order.append(seed)
+            indices_by_seed[seed] = []
+            payloads_by_seed[seed] = []
+        indices_by_seed[seed].append(index)
+        payloads_by_seed[seed].append(payload)
+
+    for seed in seed_order:
+        group_payloads = payloads_by_seed[seed]
+        if len(group_payloads) < 2:
+            raise ValueError(f"seed {seed} must have at least two runs")
+        baseline_entries = group_payloads[0]["results"]
+        for payload in group_payloads[1:]:
+            entries = payload["results"]
+            if len(entries) != len(baseline_entries):
+                raise ValueError(
+                    "left and right results lists must have equal length"
+                )
+            for position, (baseline_entry, entry) in enumerate(
+                zip(baseline_entries, entries)
+            ):
+                if baseline_entry["seed"] != entry["seed"]:
+                    raise ValueError(
+                        f"seeds at position {position} must match"
+                    )
+
+    groups = []
+    unreproducible_seeds = []
+    for seed in seed_order:
+        group_payloads = payloads_by_seed[seed]
+        baseline = group_payloads[0]
+        reports = [
+            ppo_reproducibility_report(baseline, payload)
+            for payload in group_payloads
+        ]
+        group_identical = all(
+            report["identical"] for report in reports
+        )
+        groups.append(
+            {
+                "seed": seed,
+                "indices": indices_by_seed[seed],
+                "reports": reports,
+                "identical": group_identical,
+            }
+        )
+        if not group_identical:
+            unreproducible_seeds.append(seed)
+
+    return {
+        "identical": not unreproducible_seeds,
+        "groups": groups,
+        "unreproducible_seeds": unreproducible_seeds,
+    }
+
+
 def convergence_report(
     episode_results, window=20, tolerance=0.01, patience=3
 ) -> dict:
