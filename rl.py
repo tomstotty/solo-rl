@@ -2325,6 +2325,104 @@ def ppo_reproducibility_fingerprint_consensus(items) -> dict:
     }
 
 
+def ppo_seed_reproducibility_report(runs) -> dict:
+    """按 seed 分组汇总多份指纹载荷的可复现性，返回报告字典。
+
+    runs 须为至少两项的 list：非 list 抛 TypeError，少于两项抛
+    ValueError。各项须为键序恰为 seed、payload 的 dict：seed 须为非
+    bool 的 int；payload 须为 dict 且完整符合
+    ppo_reproducibility_fingerprint_compare 的单侧载荷契约（键序须恰为
+    algorithm、fingerprint、results，algorithm 须为 "sha256"，
+    fingerprint 须为 64 位小写十六进制 str，results 须为非空 list，成员
+    为同格式 str）。项本身或字段类型错抛 TypeError；键序、算法值、摘要
+    格式或空列表错误抛 ValueError。
+
+    先按索引完整校验全部项，再做分组约束：任一 seed 出现少于两次，或同
+    seed 各 payload 的 results 长度不一，均抛 ValueError。任一校验失败
+    均不返回部分结果，不修改输入。
+
+    校验通过后按 seed 首次出现顺序分组，组内保持原输入顺序；对各组按序
+    取出的 payload 列表调用
+    ppo_reproducibility_fingerprint_consensus。返回键序为 identical、
+    groups、divergent_seeds：groups 与分组同序，每项键序为 seed、
+    indices、consensus，indices 为该组各项在原输入中的零基索引升序
+    list，consensus 为该组 consensus 的完整返回；divergent_seeds 按组
+    序收集 consensus.identical 为 False 的 seed；顶层 identical 当且仅当
+    divergent_seeds 为空。重复调用及深拷贝逐值一致，仅用标准库，不引入
+    命令行入口。
+    """
+    if not isinstance(runs, list):
+        raise TypeError("runs must be a list")
+    if len(runs) < 2:
+        raise ValueError("runs must contain at least two entries")
+
+    seeds = []
+    payloads = []
+    result_lengths = []
+    for index, item in enumerate(runs):
+        if not isinstance(item, dict):
+            raise TypeError(f"runs[{index}] must be a dict")
+        if list(item) != ["seed", "payload"]:
+            raise ValueError(
+                f"runs[{index}] must have exactly the keys seed, payload"
+            )
+        seed = item["seed"]
+        if isinstance(seed, bool) or not isinstance(seed, int):
+            raise TypeError(f"runs[{index}] seed must be a non-bool int")
+        payload = item["payload"]
+        if not isinstance(payload, dict):
+            raise TypeError(f"runs[{index}] payload must be a dict")
+        _, results = _validate_fingerprint_payload(
+            payload, f"runs[{index}] payload"
+        )
+        seeds.append(seed)
+        payloads.append(payload)
+        result_lengths.append(len(results))
+
+    group_order = []
+    group_indices = {}
+    for index, seed in enumerate(seeds):
+        if seed not in group_indices:
+            group_indices[seed] = []
+            group_order.append(seed)
+        group_indices[seed].append(index)
+
+    for seed in group_order:
+        indices = group_indices[seed]
+        if len(indices) < 2:
+            raise ValueError(f"seed {seed} must appear at least twice")
+        baseline_length = result_lengths[indices[0]]
+        for index in indices[1:]:
+            if result_lengths[index] != baseline_length:
+                raise ValueError(
+                    f"all payloads for seed {seed} must have results lists"
+                    " of equal length"
+                )
+
+    groups = []
+    divergent_seeds = []
+    for seed in group_order:
+        indices = group_indices[seed]
+        consensus = ppo_reproducibility_fingerprint_consensus(
+            [payloads[index] for index in indices]
+        )
+        groups.append(
+            {
+                "seed": seed,
+                "indices": indices,
+                "consensus": consensus,
+            }
+        )
+        if not consensus["identical"]:
+            divergent_seeds.append(seed)
+
+    return {
+        "identical": not divergent_seeds,
+        "groups": groups,
+        "divergent_seeds": divergent_seeds,
+    }
+
+
 def convergence_report(
     episode_results, window=20, tolerance=0.01, patience=3
 ) -> dict:
