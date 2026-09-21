@@ -4850,6 +4850,72 @@ def ppo_trace_bytes(data) -> bytes:
     ).encode("utf-8")
 
 
+_UTF8_BOM = b"\xef\xbb\xbf"
+
+
+def ppo_trace_from_bytes(payload) -> dict:
+    """将 ppo_trace_bytes 的产物严格解析回 PPO 轨迹结构。
+
+    payload 须恰为 bytes（bytearray、memoryview 等均拒绝），否则
+    抛 TypeError；空字节、严格 UTF-8 解码失败、BOM、JSON 语法错误
+    或尾随内容、重复对象键、根值非 dict，或任一层违反
+    ppo_trace_bytes 输入契约，均抛 ValueError。解析保留对象键序，
+    拒绝 NaN、Infinity、-Infinity；不重算也不改写任何汇总字段。
+
+    仅接受规范单行紧凑 ASCII JSON：末尾恰一个 LF，无 BOM 或额外
+    空白/换行；数值拼写、整数/浮点类型及 -0.0 均以
+    ppo_trace_bytes 重编码后的字节逐字节核对。返回解析得到的独立
+    新容器，同一 payload 多次解析逐值一致。仅用标准库，不引入命令
+    行入口。
+    """
+    if not isinstance(payload, bytes):
+        raise TypeError("payload must be bytes")
+    if not payload:
+        raise ValueError("payload must not be empty")
+    if payload.startswith(_UTF8_BOM):
+        raise ValueError("payload must not start with a BOM")
+    try:
+        text = payload.decode("utf-8")
+    except UnicodeDecodeError as exc:
+        raise ValueError("payload must be valid UTF-8") from exc
+    if not text.endswith("\n"):
+        raise ValueError("payload must end with exactly one LF")
+    body = text[:-1]
+
+    def reject_constant(value):
+        raise ValueError(f"invalid JSON constant: {value}")
+
+    def reject_duplicate_keys(pairs):
+        result = {}
+        for key, value in pairs:
+            if key in result:
+                raise ValueError(f"duplicate object key: {key!r}")
+            result[key] = value
+        return result
+
+    decoder = json.JSONDecoder(
+        object_pairs_hook=reject_duplicate_keys,
+        parse_constant=reject_constant,
+    )
+    try:
+        data, end = decoder.raw_decode(body)
+    except RecursionError as exc:
+        raise ValueError("payload nesting too deep") from exc
+    except json.JSONDecodeError as exc:
+        raise ValueError("payload must be valid JSON") from exc
+    if end != len(body):
+        raise ValueError("payload must not contain trailing content")
+    if not isinstance(data, dict):
+        raise ValueError("payload root value must be a dict")
+
+    canonical = ppo_trace_bytes(data)
+    if canonical != payload:
+        raise ValueError(
+            "payload must be canonical ppo_trace_bytes output"
+        )
+    return data
+
+
 def _format_value(value):
     if abs(value) < 0.5e-12:
         value = 0.0
