@@ -475,6 +475,99 @@ def watkins_q_lambda(
     return q
 
 
+def off_policy_mc_control(
+    env,
+    episodes=500,
+    gamma=0.9,
+    epsilon=0.1,
+    seed=0,
+    max_steps=1000,
+) -> dict:
+    """离轨策略 MC 控制（加权重要性采样），返回键序 q、c 的 dict。
+
+    Q、C 均覆盖从 S 可达的非 G 格与 U/R/D/L 的全部组合，初始为
+    0.0，二者同键序、同键域且互相独立。每回合 reset，至 done 或
+    max_steps 步；每步以当前 Q 在 s 上 URDL 首个最大动作为 g，先调
+    一次 random()，其值 < epsilon 时再调 randrange(4) 取探索动作，
+    否则取 g；记录 [s, a, r, b]，b 为行为策略选中 a 的概率：
+    a==g 时为 1-epsilon+epsilon/4，否则为 epsilon/4。
+
+    回合末令 G=0.0、W=1.0，逆序对每项先作 G=r+gamma*G、
+    C[s,a]+=W、Q[s,a]+=W/C[s,a]*(G-Q[s,a])，任一新值非有限即抛
+    ValueError；再按更新后的 Q 取该 s 的 g，若 a!=g 则停止，否则
+    作 W/=b 后继续，epsilon=0 时 b 恒为 1 不会除零。done 与步限
+    截断均不自举。全部随机性来自一个 random.Random(seed)。
+    """
+    if not isinstance(env, GridWorld):
+        raise TypeError("env must be a GridWorld")
+    if isinstance(episodes, bool) or not isinstance(episodes, int):
+        raise TypeError("episodes must be an int")
+    if isinstance(seed, bool) or not isinstance(seed, int):
+        raise TypeError("seed must be an int")
+    if isinstance(gamma, bool) or not isinstance(gamma, (int, float)):
+        raise TypeError("gamma must be an int or float")
+    if isinstance(epsilon, bool) or not isinstance(epsilon, (int, float)):
+        raise TypeError("epsilon must be an int or float")
+    if isinstance(max_steps, bool) or not isinstance(max_steps, int):
+        raise TypeError("max_steps must be an int")
+    if episodes <= 0:
+        raise ValueError("episodes must be positive")
+    if not _is_finite_number(gamma) or gamma < 0 or gamma >= 1:
+        raise ValueError("gamma must be finite and in [0, 1)")
+    if not _is_finite_number(epsilon) or epsilon < 0 or epsilon > 1:
+        raise ValueError("epsilon must be finite and in [0, 1]")
+    if max_steps <= 0:
+        raise ValueError("max_steps must be positive")
+
+    actions = tuple(_ACTIONS)  # U, R, D, L
+    states = sorted(
+        state
+        for state in _reachable_cells(env)
+        if env._cell(state) != "G"
+    )
+    q = {(state, action): 0.0 for state in states for action in actions}
+    c = {(state, action): 0.0 for state in states for action in actions}
+    rng = random.Random(seed)
+
+    for _ in range(episodes):
+        state = env.reset()
+        trajectory = []
+        for _ in range(max_steps):
+            greedy = max(actions, key=lambda a: q[(state, a)])
+            if rng.random() < epsilon:
+                action = actions[rng.randrange(4)]
+            else:
+                action = greedy
+            if action == greedy:
+                behavior_prob = 1 - epsilon + epsilon / 4
+            else:
+                behavior_prob = epsilon / 4
+            next_state, reward, done = env.step(action)
+            trajectory.append([state, action, reward, behavior_prob])
+            if done:
+                break
+            state = next_state
+
+        g_return = 0.0
+        weight = 1.0
+        for s, a, r, b in reversed(trajectory):
+            g_return = r + gamma * g_return
+            if not math.isfinite(g_return):
+                raise ValueError("return must remain finite")
+            key = (s, a)
+            c[key] += weight
+            if not math.isfinite(c[key]):
+                raise ValueError("C value must remain finite")
+            q[key] += weight / c[key] * (g_return - q[key])
+            if not math.isfinite(q[key]):
+                raise ValueError("Q value must remain finite")
+            greedy = max(actions, key=lambda act: q[(s, act)])
+            if a != greedy:
+                break
+            weight /= b
+    return {"q": q, "c": c}
+
+
 def true_online_sarsa_lambda(
     env,
     episodes=500,
