@@ -3178,7 +3178,8 @@ def ppo_policy_kl(old_logits, new_logits) -> dict:
     dict。
 
     old_logits、new_logits 均须为非空矩形 list，每行须为非空 list 且
-    元素恰为有限 float；参数、行或元素类型不符抛 TypeError，空表、
+    元素恰为有限 float（type(x) is float，float 子类按类型不符处理）；
+    参数、行或元素类型不符抛 TypeError，空表、
     空行、非矩形、两侧形状不同或元素非有限抛 ValueError。先对两侧做
     全量校验再计算，且不修改输入。逐行按原列序作稳定 log-softmax：
     m=max(row)、z=sum(exp(x-m), 0.0)、q[j]=row[j]-m-log(z)；旧策略另取
@@ -3205,7 +3206,7 @@ def ppo_policy_kl(old_logits, new_logits) -> dict:
             elif len(row) != width:
                 raise ValueError(name + " must be rectangular")
             for item in row:
-                if not isinstance(item, float):
+                if type(item) is not float:
                     raise TypeError(name + " must contain only float")
                 if not math.isfinite(item):
                     raise ValueError(
@@ -3442,7 +3443,206 @@ def ppo_train(
     }
 
 
-def evaluate(env, h, episodes, max_steps, seed, window, threshold) -> dict:
+def ppo_train_kl(
+    env,
+    episodes=100,
+    alpha=0.05,
+    gamma=0.9,
+    lambda_=0.95,
+    c=0.2,
+    epochs=4,
+    target_kl=0.01,
+    seed=0,
+    max_steps=1000,
+) -> dict:
+    """PPO 训练（每回合以 KL 早停更新器续训），返回 h 表、逐回合步表、
+    目标值、KL 与早停标记。
+
+    参数校验、状态编号、H/V 初值、逐回合采样、GAE 递推、终止/截断处理
+    及回合末 V 更新均沿用 ppo_train；target_kl 须为非 bool 的
+    int/float，类型不符（含 bool）抛 TypeError，转 float 溢出、非有限
+    或 <=0 抛 ValueError，并在任何采样开始前完成全部校验。每回合将同一
+    batch 传给
+    ppo_update_kl(H, batch, float(alpha), c, epochs, target_kl)，以其
+    返回 logits 续训；更新器本身不消耗随机数，故轨迹与 ppo_train 同参
+    同种子时一致。
+
+    返回键依次为 h、episodes、objectives、kls、stopped；h、episodes
+    沿用 ppo_train；objectives、kls、stopped 均与回合数等长，第 e 项
+    依次为该回合更新器返回的 objectives 浮点列表、kls 浮点列表、
+    stopped 布尔值。新运算结果非有限均抛 ValueError，且不返回部分结果。
+    仅用标准库，同参同 seed 逐值一致。
+    """
+    if not isinstance(env, GridWorld):
+        raise TypeError("env must be a GridWorld")
+    if isinstance(episodes, bool) or not isinstance(episodes, int):
+        raise TypeError("episodes must be an int")
+    if isinstance(seed, bool) or not isinstance(seed, int):
+        raise TypeError("seed must be an int")
+    if isinstance(max_steps, bool) or not isinstance(max_steps, int):
+        raise TypeError("max_steps must be an int")
+    if isinstance(alpha, bool) or not isinstance(alpha, (int, float)):
+        raise TypeError("alpha must be an int or float")
+    if isinstance(gamma, bool) or not isinstance(gamma, (int, float)):
+        raise TypeError("gamma must be an int or float")
+    if isinstance(lambda_, bool) or not isinstance(lambda_, (int, float)):
+        raise TypeError("lambda_ must be an int or float")
+    if episodes <= 0:
+        raise ValueError("episodes must be positive")
+    if max_steps <= 0:
+        raise ValueError("max_steps must be positive")
+    if not _is_finite_number(alpha) or alpha <= 0 or alpha > 1:
+        raise ValueError("alpha must be finite and in (0, 1]")
+    if not _is_finite_number(gamma) or gamma < 0 or gamma > 1:
+        raise ValueError("gamma must be finite and in [0, 1]")
+    if not _is_finite_number(lambda_) or lambda_ < 0 or lambda_ > 1:
+        raise ValueError("lambda_ must be finite and in [0, 1]")
+    if not isinstance(c, float):
+        raise TypeError("c must be a float")
+    if not math.isfinite(c):
+        raise ValueError("c must be finite")
+    if c < 0.0 or c >= 1.0:
+        raise ValueError("c must be in [0, 1)")
+    if isinstance(epochs, bool) or not isinstance(epochs, int):
+        raise TypeError("epochs must be a non-bool int")
+    if epochs <= 0:
+        raise ValueError("epochs must be positive")
+    if isinstance(target_kl, bool) or not isinstance(
+        target_kl, (int, float)
+    ):
+        raise TypeError("target_kl must be an int or float")
+    try:
+        target_kl_value = float(target_kl)
+    except OverflowError:
+        raise ValueError("target_kl must convert to a finite float")
+    if not math.isfinite(target_kl_value) or target_kl_value <= 0.0:
+        raise ValueError("target_kl must be finite and > 0")
+
+    actions = tuple(_ACTIONS)  # U, R, D, L
+    states = sorted(
+        state
+        for state in _reachable_cells(env)
+        if env._cell(state) != "G"
+    )
+    state_index = {state: i for i, state in enumerate(states)}
+    h = [[0.0 for _ in actions] for _ in states]
+    values = [0.0 for _ in states]
+    rng = random.Random(seed)
+    all_episodes = []
+    all_objectives = []
+    all_kls = []
+    all_stopped = []
+
+    for _ in range(episodes):
+        state = env.reset()
+        trajectory = []
+        step_records = []
+        for _ in range(max_steps):
+            s = state_index[state]
+            row = h[s]
+            m = max(row)
+            weights = [math.exp(logit - m) for logit in row]
+            total = sum(weights)
+            if not math.isfinite(total) or total <= 0.0:
+                raise ValueError(
+                    "softmax normalizer must be finite and positive"
+                )
+            probs = [weight / total for weight in weights]
+            log_total = math.log(total)
+            u = rng.random()
+            cumulative = 0.0
+            a = 3
+            for k, p_k in enumerate(probs):
+                cumulative += p_k
+                if cumulative > u:
+                    a = k
+                    break
+            action = actions[a]
+            old_logp = row[a] - m - log_total
+            if not math.isfinite(old_logp):
+                raise ValueError("log-probabilities must be finite")
+            value = values[s]
+            next_state, reward, done = env.step(action)
+            value_next = 0.0 if done else values[state_index[next_state]]
+            trajectory.append(
+                (s, a, reward, old_logp, value, value_next, done)
+            )
+            step_records.append(
+                [state[0], state[1], action, reward, done]
+            )
+            if done:
+                break
+            state = next_state
+
+        advantages = [0.0] * len(trajectory)
+        a_t = 0.0
+        for t in range(len(trajectory) - 1, -1, -1):
+            (
+                _s,
+                _a,
+                reward,
+                _old_logp,
+                value,
+                value_next,
+                _done,
+            ) = trajectory[t]
+            delta = reward + gamma * value_next - value
+            if not math.isfinite(delta):
+                raise ValueError("GAE delta must be finite")
+            a_t = delta + gamma * lambda_ * a_t
+            if not math.isfinite(a_t):
+                raise ValueError("GAE advantage must be finite")
+            advantages[t] = a_t
+
+        batch = [
+            [s, a, old_logp, adv]
+            for (s, a, _r, old_logp, _v, _v2, _done), adv in zip(
+                trajectory, advantages
+            )
+        ]
+        result = ppo_update_kl(
+            h,
+            batch,
+            float(alpha),
+            c,
+            epochs,
+            target_kl_value,
+        )
+        h = result["logits"]
+        all_objectives.append(result["objectives"])
+        all_kls.append(result["kls"])
+        all_stopped.append(result["stopped"])
+
+        for (s, _a, _r, _old_logp, value, _v2, _done), adv in zip(
+            trajectory, advantages
+        ):
+            new_value = values[s] + alpha * (
+                adv + value - values[s]
+            )
+            if not math.isfinite(new_value):
+                raise ValueError("updated value must be finite")
+            values[s] = new_value
+        all_episodes.append(step_records)
+
+    h_table = [
+        [
+            float(r),
+            float(c),
+            h[i][0],
+            h[i][1],
+            h[i][2],
+            h[i][3],
+        ]
+        for i, (r, c) in enumerate(states)
+    ]
+    return {
+        "h": h_table,
+        "episodes": all_episodes,
+        "objectives": all_objectives,
+        "kls": all_kls,
+        "stopped": all_stopped,
+    }
+
     """按 softmax 策略评估偏好 H，返回回合统计与收敛判定。
 
     h 须为 {((row, col), action): float}，恰覆盖从 S 可达的非 G 格
