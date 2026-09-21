@@ -1,5 +1,6 @@
 """GridWorld 环境与命令行入口，仅用标准库。"""
 
+import hashlib
 import json
 import math
 import random
@@ -2103,6 +2104,63 @@ def ppo_reproducibility_report(left, right) -> dict:
         "identical": overall is None,
         "results": items,
         "first_difference": overall,
+    }
+
+
+def ppo_reproducibility_fingerprint(data) -> dict:
+    """对一份 ppo_evaluate_many 返回值计算可复现性指纹。
+
+    data 须为 dict，否则抛 TypeError；并须严格符合
+    ppo_reproducibility_report 单侧输入的完整契约（见
+    _validate_evaluate_many_payload），任一违约抛 ValueError；
+    不修改输入。
+
+    按公开键序递归编码：None 记 ``N;``；bool 记 ``B0;``/``B1;``；
+    int 记 ``I`` + 十进制 + ``;``；float 记 ``F`` + float.hex() +
+    ``;``；str 记 ``S`` + UTF-8 字节数 + ``:`` + 原文；list 记 ``L``
+    + 元素数 + ``:`` 后顺次拼接各元素编码；dict 记 ``D`` + 键数 +
+    ``:`` 后按插入（公开）键序顺次拼接键、值编码。所得文本取
+    UTF-8 字节，对完整 data 及 results 各完整项（含 seed、result）
+    分别求 sha256。
+
+    返回键序为 algorithm、fingerprint、results：依次为 ``"sha256"``、
+    总体摘要、与 results 同序的逐项摘要 list；摘要均为小写 64 位
+    十六进制 str。深拷贝数据摘要相同；0.0 与 -0.0、int 与 float
+    摘要不同。仅用标准库，不引入命令行入口。
+    """
+    if not isinstance(data, dict):
+        raise TypeError("data must be a dict")
+    _validate_evaluate_many_payload(data, "data")
+
+    def _encode(value):
+        if value is None:
+            return "N;"
+        if isinstance(value, bool):
+            return "B1;" if value else "B0;"
+        if isinstance(value, int):
+            return f"I{value};"
+        if isinstance(value, float):
+            return f"F{float.hex(value)};"
+        if isinstance(value, str):
+            return f"S{len(value.encode('utf-8'))}:{value}"
+        if isinstance(value, list):
+            parts = [f"L{len(value)}:"]
+            for item in value:
+                parts.append(_encode(item))
+            return "".join(parts)
+        parts = [f"D{len(value)}:"]
+        for key, item in value.items():
+            parts.append(_encode(key))
+            parts.append(_encode(item))
+        return "".join(parts)
+
+    def _digest(value):
+        return hashlib.sha256(_encode(value).encode("utf-8")).hexdigest()
+
+    return {
+        "algorithm": "sha256",
+        "fingerprint": _digest(data),
+        "results": [_digest(entry) for entry in data["results"]],
     }
 
 
