@@ -475,6 +475,97 @@ def watkins_q_lambda(
     return q
 
 
+def double_q_learning(
+    env,
+    episodes=500,
+    alpha=0.5,
+    gamma=0.9,
+    epsilon=0.1,
+    seed=0,
+    max_steps=1000,
+) -> dict:
+    """Double Q-learning，返回键序为 q1、q2、q 的 dict。
+
+    Q1、Q2 均覆盖从 S 可达的非 G 格与 U/R/D/L 的全部组合，键序一致，
+    初始为 0.0。每回合 reset，单回合最多 max_steps 步。全部随机性
+    来自一个 random.Random(seed)。
+
+    每步先调一次 random()，其值小于 epsilon 才按 URDL 调
+    randrange(4) 随机选动作，否则取 Q1+Q2 最大且 URDL 首个动作。
+    step 后必调一次 randrange(2)：0 更新 Q1、1 更新 Q2。若 done
+    目标为 r；否则更新 Qi 时取 g 为 Qi 在 s2 的 URDL 首个最大动作，
+    目标为 r+gamma*Qj[s2,g]；随后 Qi[s,a]+=alpha*(目标-Qi[s,a])。
+    新值非有限抛 ValueError；done 即停，步限末步未终止仍自举更新。
+
+    返回键依次为 q1、q2、q；q1、q2 为独立 dict，q 同键序且
+    q[k]=(q1[k]+q2[k])/2.0，值均为 float。同参同 seed 逐值一致。
+    """
+    if not isinstance(env, GridWorld):
+        raise TypeError("env must be a GridWorld")
+    if isinstance(episodes, bool) or not isinstance(episodes, int):
+        raise TypeError("episodes must be an int")
+    if isinstance(seed, bool) or not isinstance(seed, int):
+        raise TypeError("seed must be an int")
+    if isinstance(alpha, bool) or not isinstance(alpha, (int, float)):
+        raise TypeError("alpha must be an int or float")
+    if isinstance(gamma, bool) or not isinstance(gamma, (int, float)):
+        raise TypeError("gamma must be an int or float")
+    if isinstance(epsilon, bool) or not isinstance(epsilon, (int, float)):
+        raise TypeError("epsilon must be an int or float")
+    if isinstance(max_steps, bool) or not isinstance(max_steps, int):
+        raise TypeError("max_steps must be an int")
+    if episodes <= 0:
+        raise ValueError("episodes must be positive")
+    if not _is_finite_number(alpha) or alpha <= 0 or alpha > 1:
+        raise ValueError("alpha must be finite and in (0, 1]")
+    if not _is_finite_number(gamma) or gamma < 0 or gamma >= 1:
+        raise ValueError("gamma must be finite and in [0, 1)")
+    if not _is_finite_number(epsilon) or epsilon < 0 or epsilon > 1:
+        raise ValueError("epsilon must be finite and in [0, 1]")
+    if max_steps <= 0:
+        raise ValueError("max_steps must be positive")
+
+    actions = tuple(_ACTIONS)  # U, R, D, L
+    states = sorted(
+        state
+        for state in _reachable_cells(env)
+        if env._cell(state) != "G"
+    )
+    q1 = {(state, action): 0.0 for state in states for action in actions}
+    q2 = {(state, action): 0.0 for state in states for action in actions}
+    rng = random.Random(seed)
+
+    for _ in range(episodes):
+        state = env.reset()
+        for _ in range(max_steps):
+            if rng.random() < epsilon:
+                action = actions[rng.randrange(4)]
+            else:
+                action = max(
+                    actions, key=lambda a: q1[(state, a)] + q2[(state, a)]
+                )
+            next_state, reward, done = env.step(action)
+            key = (state, action)
+            if rng.randrange(2) == 0:
+                qi, qj = q1, q2
+            else:
+                qi, qj = q2, q1
+            if done:
+                target = reward
+            else:
+                g = max(actions, key=lambda a: qi[(next_state, a)])
+                target = reward + gamma * qj[(next_state, g)]
+            qi[key] += alpha * (target - qi[key])
+            if not math.isfinite(qi[key]):
+                raise ValueError("Q value must remain finite")
+            if done:
+                break
+            state = next_state
+
+    q = {key: (q1[key] + q2[key]) / 2.0 for key in q1}
+    return {"q1": q1, "q2": q2, "q": q}
+
+
 def reinforce(env, episodes=500, alpha=0.05, gamma=0.9, seed=0) -> dict:
     """REINFORCE（带平均回报基线），返回 {((row, col), action): float}。
 
