@@ -4748,6 +4748,108 @@ def ppo_train_until(
     }
 
 
+def ppo_trace_bytes(data) -> bytes:
+    """将一份 PPO 轨迹结构严格校验后序列化为单行 JSON 字节。
+
+    data 须为 dict，否则抛 TypeError；其余任何违约均抛 ValueError。
+    顶层键序须恰为 episodes、success_rate；episodes 为非空 list，
+    每项为键序恰为 trace、total_reward、success 的 dict；trace 为
+    非空 list，每步为恰七项的 list
+    [r, c, action, next_r, next_c, reward, done]。r、c、next_r、
+    next_c、reward 及 total_reward 均须为非 bool 的 int；action 须为
+    U、R、D、L 之一；done 与 success 须为 bool；success_rate 须为
+    [0, 1] 内的有限 float。任何结构、键序、类型、长度、取值或多余
+    字段违约均抛 ValueError；不重算也不改写任何汇总字段，不修改
+    输入。
+
+    返回 (json.dumps(data, ensure_ascii=True, allow_nan=False,
+    separators=(",", ":")) + "\\n").encode("utf-8")：无额外空白，
+    末尾恰一个 LF；相同输入逐字节一致。仅用标准库，不引入命令行
+    入口。
+    """
+    if not isinstance(data, dict):
+        raise TypeError("data must be a dict")
+    if list(data) != ["episodes", "success_rate"]:
+        raise ValueError(
+            "data must have exactly the keys episodes, success_rate"
+        )
+
+    episodes = data["episodes"]
+    if not isinstance(episodes, list) or not episodes:
+        raise ValueError("episodes must be a non-empty list")
+    for ep_index, episode in enumerate(episodes):
+        if not isinstance(episode, dict) or list(episode) != [
+            "trace",
+            "total_reward",
+            "success",
+        ]:
+            raise ValueError(
+                f"episodes[{ep_index}] must have exactly the keys trace,"
+                " total_reward, success"
+            )
+        trace = episode["trace"]
+        if not isinstance(trace, list) or not trace:
+            raise ValueError(
+                f"episodes[{ep_index}] trace must be a non-empty list"
+            )
+        for step_index, step in enumerate(trace):
+            if not isinstance(step, list) or len(step) != 7:
+                raise ValueError(
+                    f"episodes[{ep_index}] trace[{step_index}] must be a"
+                    " list of exactly 7 items"
+                )
+            r, c, action, next_r, next_c, reward, done = step
+            for field in (r, c, next_r, next_c, reward):
+                if isinstance(field, bool) or not isinstance(field, int):
+                    raise ValueError(
+                        f"episodes[{ep_index}] trace[{step_index}]"
+                        " numeric fields must be non-bool ints"
+                    )
+            if not isinstance(action, str) or action not in _ACTIONS:
+                raise ValueError(
+                    f"episodes[{ep_index}] trace[{step_index}] action"
+                    " must be one of U, R, D, L"
+                )
+            if not isinstance(done, bool):
+                raise ValueError(
+                    f"episodes[{ep_index}] trace[{step_index}] done"
+                    " must be a bool"
+                )
+        total_reward = episode["total_reward"]
+        if isinstance(total_reward, bool) or not isinstance(
+            total_reward, int
+        ):
+            raise ValueError(
+                f"episodes[{ep_index}] total_reward must be a non-bool"
+                " int"
+            )
+        if not isinstance(episode["success"], bool):
+            raise ValueError(
+                f"episodes[{ep_index}] success must be a bool"
+            )
+
+    success_rate = data["success_rate"]
+    if (
+        not isinstance(success_rate, float)
+        or not math.isfinite(success_rate)
+        or success_rate < 0
+        or success_rate > 1
+    ):
+        raise ValueError(
+            "success_rate must be a finite float in [0, 1]"
+        )
+
+    return (
+        json.dumps(
+            data,
+            ensure_ascii=True,
+            allow_nan=False,
+            separators=(",", ":"),
+        )
+        + "\n"
+    ).encode("utf-8")
+
+
 def _format_value(value):
     if abs(value) < 0.5e-12:
         value = 0.0
