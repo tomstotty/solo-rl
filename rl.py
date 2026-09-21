@@ -475,6 +475,104 @@ def watkins_q_lambda(
     return q
 
 
+def true_online_sarsa_lambda(
+    env,
+    episodes=500,
+    alpha=0.5,
+    gamma=0.9,
+    epsilon=0.1,
+    lambda_=0.9,
+    seed=0,
+    max_steps=1000,
+) -> dict:
+    """True Online SARSA(λ)，返回 {((row, col), action): float}。
+
+    Q 覆盖从 S 可达的非 G 格与 U/R/D/L 的全部组合，初始为 0.0。
+    每回合 reset，资格迹 E 按 Q 键序置 0.0，q_old=0.0，先选动作；
+    单回合最多 max_steps 步，末步未终止也照常选择下一动作、自举
+    并更新后截断。每步先记 q=Q[s,a] 再 step；done 时 q2=0.0 且不
+    再选下一动作，否则立即选 a2 并记更新前 q2=Q[s2,a2]。令
+    delta=r+gamma*q2-q；按键序先作 E[k]*=gamma*lambda_，再作
+    E[s,a]+=1-alpha*E[s,a]；随后按键序同步作
+    Q[k]+=alpha*(delta+q-q_old)*E[k]，再作 Q[s,a]-=alpha*(q-q_old)。
+    任一次写入所得 Q 值非有限即抛 ValueError。done 即停，否则令
+    s,a,q_old=s2,a2,q2。全部随机性来自一个 random.Random(seed)。
+    """
+    if not isinstance(env, GridWorld):
+        raise TypeError("env must be a GridWorld")
+    if isinstance(episodes, bool) or not isinstance(episodes, int):
+        raise TypeError("episodes must be an int")
+    if isinstance(seed, bool) or not isinstance(seed, int):
+        raise TypeError("seed must be an int")
+    if isinstance(alpha, bool) or not isinstance(alpha, (int, float)):
+        raise TypeError("alpha must be an int or float")
+    if isinstance(gamma, bool) or not isinstance(gamma, (int, float)):
+        raise TypeError("gamma must be an int or float")
+    if isinstance(epsilon, bool) or not isinstance(epsilon, (int, float)):
+        raise TypeError("epsilon must be an int or float")
+    if isinstance(lambda_, bool) or not isinstance(lambda_, (int, float)):
+        raise TypeError("lambda_ must be an int or float")
+    if isinstance(max_steps, bool) or not isinstance(max_steps, int):
+        raise TypeError("max_steps must be an int")
+    if episodes <= 0:
+        raise ValueError("episodes must be positive")
+    if not _is_finite_number(alpha) or alpha <= 0 or alpha > 1:
+        raise ValueError("alpha must be finite and in (0, 1]")
+    if not _is_finite_number(gamma) or gamma < 0 or gamma >= 1:
+        raise ValueError("gamma must be finite and in [0, 1)")
+    if not _is_finite_number(epsilon) or epsilon < 0 or epsilon > 1:
+        raise ValueError("epsilon must be finite and in [0, 1]")
+    if not _is_finite_number(lambda_) or lambda_ < 0 or lambda_ > 1:
+        raise ValueError("lambda_ must be finite and in [0, 1]")
+    if max_steps <= 0:
+        raise ValueError("max_steps must be positive")
+
+    actions = tuple(_ACTIONS)  # U, R, D, L
+    states = sorted(
+        state
+        for state in _reachable_cells(env)
+        if env._cell(state) != "G"
+    )
+    q = {(state, action): 0.0 for state in states for action in actions}
+    rng = random.Random(seed)
+
+    def choose_action(state):
+        if rng.random() < epsilon:
+            return actions[rng.randrange(4)]
+        return max(actions, key=lambda a: q[(state, a)])
+
+    for _ in range(episodes):
+        state = env.reset()
+        eligibility = {key: 0.0 for key in q}
+        q_old = 0.0
+        action = choose_action(state)
+        for _ in range(max_steps):
+            key = (state, action)
+            q_sa = q[key]
+            next_state, reward, done = env.step(action)
+            if done:
+                q_next = 0.0
+            else:
+                next_action = choose_action(next_state)
+                q_next = q[(next_state, next_action)]
+            delta = reward + gamma * q_next - q_sa
+            for k in eligibility:
+                eligibility[k] *= gamma * lambda_
+            eligibility[key] += 1 - alpha * eligibility[key]
+            coeff = alpha * (delta + q_sa - q_old)
+            for k in q:
+                q[k] += coeff * eligibility[k]
+                if not math.isfinite(q[k]):
+                    raise ValueError("Q value must remain finite")
+            q[key] -= alpha * (q_sa - q_old)
+            if not math.isfinite(q[key]):
+                raise ValueError("Q value must remain finite")
+            if done:
+                break
+            state, action, q_old = next_state, next_action, q_next
+    return q
+
+
 def nstep_sarsa(
     env,
     episodes=500,
