@@ -1462,6 +1462,155 @@ def actor_critic(
     return {"h": h_table, "v": v_table, "episodes": episode_results}
 
 
+def actor_critic_lambda(
+    env,
+    episodes=500,
+    alpha=0.05,
+    beta=0.1,
+    gamma=0.9,
+    lambda_=0.9,
+    seed=0,
+    max_steps=1000,
+) -> dict:
+    """在线资格迹 actor-critic(λ)，返回 h/v 表与逐回合统计。
+
+    H 覆盖从 S 可达的非 G 格与 U/R/D/L 的全部组合，V 覆盖同样的格子，
+    初始均为 0.0。每回合 reset，按 H/V 键序将策略迹 EH 与值迹 EV 清零，
+    至 done 或 max_steps 步；每步按 softmax(H[s,·]) 稳定采样动作，仅
+    调用一次 random()。采样后保留概率 p 与旧 V[s]，step 得
+    (s2, r, done)：done 时 δ=r-V[s]，否则 δ=r+gamma*V[s2]-V[s]，达到
+    步限且未 done 的末步同样按后式自举。先按键序使所有 EH、EV 乘
+    gamma*lambda_，再对 URDL 各 b 作 EH[s,b]+=I[b=a]-p[b]，并作
+    EV[s]+=1.0；随后按键序对所有项作 H+=alpha*δ*EH、
+    V+=beta*δ*EV。δ、迹或任一更新值非有限抛 ValueError。done 即停。
+    全部随机性来自一个 random.Random(seed)。
+
+    返回键依次为 h、v、episodes；h 项按坐标升序为
+    [r, c, hU, hR, hD, hL]，v 项为 [r, c, V]，其中数均为 float；
+    episodes 项为 [steps, reward, done]，类型依次为 int/int/bool，
+    reward 为未折扣回报和。
+    """
+    if not isinstance(env, GridWorld):
+        raise TypeError("env must be a GridWorld")
+    if isinstance(episodes, bool) or not isinstance(episodes, int):
+        raise TypeError("episodes must be an int")
+    if isinstance(seed, bool) or not isinstance(seed, int):
+        raise TypeError("seed must be an int")
+    if isinstance(max_steps, bool) or not isinstance(max_steps, int):
+        raise TypeError("max_steps must be an int")
+    if isinstance(alpha, bool) or not isinstance(alpha, (int, float)):
+        raise TypeError("alpha must be an int or float")
+    if isinstance(beta, bool) or not isinstance(beta, (int, float)):
+        raise TypeError("beta must be an int or float")
+    if isinstance(gamma, bool) or not isinstance(gamma, (int, float)):
+        raise TypeError("gamma must be an int or float")
+    if isinstance(lambda_, bool) or not isinstance(lambda_, (int, float)):
+        raise TypeError("lambda_ must be an int or float")
+    if episodes <= 0:
+        raise ValueError("episodes must be positive")
+    if max_steps <= 0:
+        raise ValueError("max_steps must be positive")
+    if not _is_finite_number(alpha) or alpha <= 0 or alpha > 1:
+        raise ValueError("alpha must be finite and in (0, 1]")
+    if not _is_finite_number(beta) or beta <= 0 or beta > 1:
+        raise ValueError("beta must be finite and in (0, 1]")
+    if not _is_finite_number(gamma) or gamma < 0 or gamma >= 1:
+        raise ValueError("gamma must be finite and in [0, 1)")
+    if not _is_finite_number(lambda_) or lambda_ < 0 or lambda_ > 1:
+        raise ValueError("lambda_ must be finite and in [0, 1]")
+
+    actions = tuple(_ACTIONS)  # U, R, D, L
+    states = sorted(
+        state
+        for state in _reachable_cells(env)
+        if env._cell(state) != "G"
+    )
+    h = {(state, action): 0.0 for state in states for action in actions}
+    v = {state: 0.0 for state in states}
+    rng = random.Random(seed)
+    episode_results = []
+
+    for _ in range(episodes):
+        state = env.reset()
+        eh = {key: 0.0 for key in h}
+        ev = {key: 0.0 for key in v}
+        steps = 0
+        total_reward = 0
+        done = False
+        for _ in range(max_steps):
+            m = max(h[(state, a)] for a in actions)
+            weights = [math.exp(h[(state, a)] - m) for a in actions]
+            total = sum(weights)
+            probs = [weight / total for weight in weights]
+            u = rng.random()
+            cumulative = 0.0
+            action = "L"
+            for a, p_a in zip(actions, probs):
+                cumulative += p_a
+                if cumulative > u:
+                    action = a
+                    break
+            prob = dict(zip(actions, probs))
+            value = v[state]
+            next_state, reward, done = env.step(action)
+            steps += 1
+            total_reward += reward
+            if done:
+                delta = reward - value
+            else:
+                delta = reward + gamma * v[next_state] - value
+            if not math.isfinite(delta):
+                raise ValueError("delta must remain finite")
+            trace_decay = gamma * lambda_
+            for key in eh:
+                eh[key] *= trace_decay
+                if not math.isfinite(eh[key]):
+                    raise ValueError("policy eligibility trace must be finite")
+            for key in ev:
+                ev[key] *= trace_decay
+                if not math.isfinite(ev[key]):
+                    raise ValueError("value eligibility trace must be finite")
+            for b in actions:
+                eh[(state, b)] += (
+                    1.0 if b == action else 0.0
+                ) - prob[b]
+                if not math.isfinite(eh[(state, b)]):
+                    raise ValueError("policy eligibility trace must be finite")
+            ev[state] += 1.0
+            if not math.isfinite(ev[state]):
+                raise ValueError("value eligibility trace must be finite")
+            for key in h:
+                new_value = h[key] + alpha * delta * eh[key]
+                if not math.isfinite(new_value):
+                    raise ValueError("H value must remain finite")
+                h[key] = new_value
+            for key in v:
+                new_value = v[key] + beta * delta * ev[key]
+                if not math.isfinite(new_value):
+                    raise ValueError("V value must remain finite")
+                v[key] = new_value
+            if done:
+                break
+            state = next_state
+        episode_results.append([steps, total_reward, done])
+
+    h_table = [
+        [
+            float(r),
+            float(c),
+            h[((r, c), "U")],
+            h[((r, c), "R")],
+            h[((r, c), "D")],
+            h[((r, c), "L")],
+        ]
+        for (r, c) in states
+    ]
+    v_table = [
+        [float(r), float(c), v[(r, c)]] for (r, c) in states
+    ]
+    return {"h": h_table, "v": v_table, "episodes": episode_results}
+
+
 def nstep_actor_critic(
     env,
     episodes=500,
