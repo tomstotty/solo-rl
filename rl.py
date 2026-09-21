@@ -1982,6 +1982,11 @@ def _validate_evaluate_many_payload(data, name):
                 " has windows"
             )
     else:
+        if last_window_mean is None:
+            raise ValueError(
+                f"{name} means.last_window must not be None when some"
+                " result has windows"
+            )
         expected_last = last_total / last_count
         if float.hex(expected_last) != float.hex(last_window_mean):
             raise ValueError(
@@ -2909,6 +2914,91 @@ def ppo_seed_regression(base, new, gap=0.0) -> dict:
         "means": [success_mean, last_window_mean],
         "improved": improved,
         "degraded": degraded,
+    }
+
+
+def ppo_seed_select(base, candidates, gap=0.0) -> dict:
+    """在多个候选 runs 中按 ppo_seed_regression 结果选出最优者。
+
+    base 及各候选的 runs 均须满足 ppo_seed_robustness 的 runs 输入
+    契约与异常（至少两项的 list，每项为恰含两元素的 list
+    [seed, payload]，seed 为互异的非 bool int，payload 完整符合
+    ppo_evaluate_many 的返回契约）。candidates 须为非空 list，每项
+    为恰含两元素的 list [name, runs]，name 为非空且互异的 str。
+    容器或字段类型错（candidates、项或 runs 非 list，name 非 str，
+    seed 为 bool 或非 int，payload 非 dict）抛 TypeError；空
+    candidates、项长度不为二、空 name、重名或 payload 契约违约抛
+    ValueError。gap 校验同 ppo_seed_regression：非 bool 的
+    int/float，类型错抛 TypeError，非有限或越出 [0, 1] 抛
+    ValueError。先全量校验全部参数再计算：各候选 runs 的 seed 集合
+    须与 base 相同（顺序可不同），否则抛 ValueError；任一失败都不
+    返回部分结果，且不修改输入。
+
+    校验通过后按候选顺序逐一调用 ppo_seed_regression(base, runs,
+    gap)。仅报告 passed 为 True 的候选参选，以报告 means[0] 最大者
+    胜出，同值取位置较前者，无合格候选时胜者为 None。返回键序为
+    selected、reports、rejected：selected 为胜者 name 或 None；
+    reports 按候选顺序为 [name, 完整回归报告] 列表；rejected 按候选
+    顺序收集 passed 为 False 的 name。相同输入逐值一致，仅用标准
+    库，不引入命令行入口。
+    """
+    base_validated = _validate_seed_runs(base, "base")
+    if not isinstance(candidates, list):
+        raise TypeError("candidates must be a list")
+    if not candidates:
+        raise ValueError("candidates must be non-empty")
+    validated = []
+    seen_names = set()
+    for index, item in enumerate(candidates):
+        if not isinstance(item, list):
+            raise TypeError(f"candidates[{index}] must be a list")
+        if len(item) != 2:
+            raise ValueError(
+                f"candidates[{index}] must have exactly two elements"
+            )
+        name, runs = item
+        if not isinstance(name, str):
+            raise TypeError(f"candidates[{index}] name must be a str")
+        if not name:
+            raise ValueError(f"candidates[{index}] name must be non-empty")
+        if name in seen_names:
+            raise ValueError(f"candidates[{index}] name must be distinct")
+        seen_names.add(name)
+        runs_validated = _validate_seed_runs(
+            runs, f"candidates[{index}] runs"
+        )
+        validated.append((name, runs, runs_validated))
+    if isinstance(gap, bool) or not isinstance(gap, (int, float)):
+        raise TypeError("gap must be an int or float")
+    if not _is_finite_number(gap) or gap < 0 or gap > 1:
+        raise ValueError("gap must be finite and in [0, 1]")
+
+    base_seeds = {seed for seed, _ in base_validated}
+    for name, _, runs_validated in validated:
+        if {seed for seed, _ in runs_validated} != base_seeds:
+            raise ValueError(
+                f"candidate {name} runs must have the same seed set"
+                " as base"
+            )
+
+    reports = []
+    rejected = []
+    selected = None
+    selected_mean = None
+    for name, runs, _ in validated:
+        report = ppo_seed_regression(base, runs, gap)
+        reports.append([name, report])
+        if report["passed"]:
+            mean = report["means"][0]
+            if selected is None or mean > selected_mean:
+                selected = name
+                selected_mean = mean
+        else:
+            rejected.append(name)
+    return {
+        "selected": selected,
+        "reports": reports,
+        "rejected": rejected,
     }
 
 
