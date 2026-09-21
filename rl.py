@@ -2504,6 +2504,118 @@ def convergence_report(
     }
 
 
+def ppo_seed_convergence_report(
+    runs, window=20, tolerance=0.01, patience=3
+) -> dict:
+    """按 seed 分组汇总多种子逐回合 reward 的收敛判定，返回汇总报告。
+
+    runs 须为至少两项的 list：非 list 抛 TypeError，少于两项抛
+    ValueError。每项须为键序恰为 seed、episode_results 的 dict：
+    seed 为非 bool 的 int，episode_results 须为 list；项本身或字段
+    类型错抛 TypeError，键序错抛 ValueError。各 episode_results 与
+    window、tolerance、patience 的校验、异常与算法完全沿用
+    convergence_report。先依输入序完整校验全部成员（含三个参数），
+    再按 seed 首次出现顺序分组、组内保持原序；任一 seed 少于两项
+    抛 ValueError，任一失败都不返回部分结果，且不修改输入。
+
+    对各组按组内原序的每个 episode_results 调用 convergence_report
+    （window、tolerance、patience 相同）。返回键序为 converged、
+    groups、inconsistent_seeds、unconverged_seeds：groups 按 seed
+    首次出现序排列，每项键序固定为 seed、indices、reports、
+    consistent、converged，indices 为该组各项在原 runs 中的零基
+    索引升序 list，reports 为按组内原序排列的完整 convergence_report
+    返回值 list，consistent 表示各报告 converged 是否全同，converged
+    表示各报告 converged 是否全真；inconsistent_seeds、
+    unconverged_seeds 分别按组序收集 consistent、converged 为 False
+    的 seed，顶层 converged 当且仅当 unconverged_seeds 为空。重复
+    调用及深拷贝逐值一致，仅用标准库，不引入命令行入口。
+    """
+    if not isinstance(runs, list):
+        raise TypeError("runs must be a list")
+    if len(runs) < 2:
+        raise ValueError("runs must contain at least two entries")
+
+    validated = []
+    for index, item in enumerate(runs):
+        if not isinstance(item, dict):
+            raise TypeError(f"runs[{index}] must be a dict")
+        if list(item) != ["seed", "episode_results"]:
+            raise ValueError(
+                f"runs[{index}] must have exactly the keys"
+                " seed, episode_results"
+            )
+        seed = item["seed"]
+        if isinstance(seed, bool) or not isinstance(seed, int):
+            raise TypeError(f"runs[{index}] seed must be a non-bool int")
+        episode_results = item["episode_results"]
+        if not isinstance(episode_results, list):
+            raise TypeError(
+                f"runs[{index}] episode_results must be a list"
+            )
+        # 完整沿用 convergence_report 的入参与成员契约，先全量校验。
+        convergence_report(
+            episode_results,
+            window=window,
+            tolerance=tolerance,
+            patience=patience,
+        )
+        validated.append((seed, episode_results))
+
+    seed_order = []
+    indices_by_seed = {}
+    results_by_seed = {}
+    for index, (seed, episode_results) in enumerate(validated):
+        if seed not in indices_by_seed:
+            seed_order.append(seed)
+            indices_by_seed[seed] = []
+            results_by_seed[seed] = []
+        indices_by_seed[seed].append(index)
+        results_by_seed[seed].append(episode_results)
+
+    for seed in seed_order:
+        if len(indices_by_seed[seed]) < 2:
+            raise ValueError(f"seed {seed} must have at least two runs")
+
+    groups = []
+    inconsistent_seeds = []
+    unconverged_seeds = []
+    for seed in seed_order:
+        reports = [
+            convergence_report(
+                episode_results,
+                window=window,
+                tolerance=tolerance,
+                patience=patience,
+            )
+            for episode_results in results_by_seed[seed]
+        ]
+        converged_flags = [report["converged"] for report in reports]
+        consistent = all(
+            flag == converged_flags[0] for flag in converged_flags
+        )
+        all_converged = all(converged_flags)
+        groups.append(
+            {
+                "seed": seed,
+                "indices": indices_by_seed[seed],
+                "reports": reports,
+                "consistent": consistent,
+                "converged": all_converged,
+            }
+        )
+        if not consistent:
+            inconsistent_seeds.append(seed)
+        if not all_converged:
+            unconverged_seeds.append(seed)
+
+    return {
+        "converged": not unconverged_seeds,
+        "groups": groups,
+        "inconsistent_seeds": inconsistent_seeds,
+        "unconverged_seeds": unconverged_seeds,
+    }
+
+
 def _format_value(value):
     if abs(value) < 0.5e-12:
         value = 0.0
