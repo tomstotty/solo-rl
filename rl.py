@@ -2266,6 +2266,65 @@ def ppo_reproducibility_fingerprint_compare(left, right) -> dict:
     }
 
 
+def ppo_reproducibility_fingerprint_consensus(items) -> dict:
+    """以第 0 份指纹为基准汇总多份结构指纹的一致性，返回共识字典。
+
+    items 须为至少两项的 list：非 list 抛 TypeError，少于两项抛
+    ValueError。各项须为 dict，且严格符合
+    ppo_reproducibility_fingerprint_compare 的完整单侧载荷契约
+    （键序依次为 algorithm、fingerprint、results；algorithm 须为
+    "sha256"，fingerprint 与 results 各成员须为 64 位小写十六进制
+    str，results 须为非空 list）；项或字段类型错抛 TypeError，键序、
+    算法值、空列表或摘要格式错抛 ValueError。先按索引完整校验全部项，
+    再以第 0 项为基准；任一项 results 长度与基准不同抛 ValueError，
+    不返回部分结果，也不修改输入。
+
+    comparisons 与 items 等长：comparisons[0] 为现有比较函数对基准
+    自身的完整返回，comparisons[i] 为其对基准与 items[i] 的完整返回。
+    divergent_runs 为 comparisons 中 identical 为 False 的非零索引
+    升序 int 列表。返回键序依次为 identical、comparisons、
+    divergent_runs，顶层 identical 当且仅当 divergent_runs 为空。
+    相同输入及深拷贝逐值一致，仅用标准库，不引入命令行入口。
+    """
+    if not isinstance(items, list):
+        raise TypeError("items must be a list")
+    if len(items) < 2:
+        raise ValueError("items must contain at least two items")
+
+    result_lengths = []
+    for index, item in enumerate(items):
+        if not isinstance(item, dict):
+            raise TypeError(f"items[{index}] must be a dict")
+        _fingerprint, results = _validate_fingerprint_payload(
+            item, f"items[{index}]"
+        )
+        result_lengths.append(len(results))
+
+    baseline_length = result_lengths[0]
+    for index in range(1, len(result_lengths)):
+        if result_lengths[index] != baseline_length:
+            raise ValueError(
+                f"items[{index}] results list must have the same length"
+                " as items[0]"
+            )
+
+    baseline = items[0]
+    comparisons = [
+        ppo_reproducibility_fingerprint_compare(baseline, item)
+        for item in items
+    ]
+    divergent_runs = [
+        index
+        for index in range(1, len(comparisons))
+        if not comparisons[index]["identical"]
+    ]
+    return {
+        "identical": not divergent_runs,
+        "comparisons": comparisons,
+        "divergent_runs": divergent_runs,
+    }
+
+
 def convergence_report(
     episode_results, window=20, tolerance=0.01, patience=3
 ) -> dict:
