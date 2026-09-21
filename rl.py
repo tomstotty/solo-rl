@@ -475,6 +475,92 @@ def watkins_q_lambda(
     return q
 
 
+def expected_sarsa(
+    env,
+    episodes=500,
+    alpha=0.5,
+    gamma=0.9,
+    epsilon=0.1,
+    seed=0,
+    max_steps=1000,
+) -> dict:
+    """Expected SARSA，返回 {((row, col), action): float}。
+
+    Q 覆盖从 S 可达的非 G 格与 U/R/D/L 的全部组合，初始为 0.0。
+    每回合 reset，先选动作；单回合最多 max_steps 步，末步未终止
+    也照常选择下一动作并自举。非终止步以 s2 上 URDL 首个最大 Q
+    动作 g 的概率为 1-epsilon+epsilon/4、其余各 epsilon/4，自
+    0.0 按 URDL 累加 v=Σp(a)*Q[s2,a]，目标为 r+gamma*v；done 时
+    目标为 r 且不再选下一动作。全部随机性来自一个
+    random.Random(seed)。
+    """
+    if not isinstance(env, GridWorld):
+        raise TypeError("env must be a GridWorld")
+    if isinstance(episodes, bool) or not isinstance(episodes, int):
+        raise TypeError("episodes must be an int")
+    if isinstance(seed, bool) or not isinstance(seed, int):
+        raise TypeError("seed must be an int")
+    if isinstance(alpha, bool) or not isinstance(alpha, (int, float)):
+        raise TypeError("alpha must be an int or float")
+    if isinstance(gamma, bool) or not isinstance(gamma, (int, float)):
+        raise TypeError("gamma must be an int or float")
+    if isinstance(epsilon, bool) or not isinstance(epsilon, (int, float)):
+        raise TypeError("epsilon must be an int or float")
+    if isinstance(max_steps, bool) or not isinstance(max_steps, int):
+        raise TypeError("max_steps must be an int")
+    if episodes <= 0:
+        raise ValueError("episodes must be positive")
+    if not _is_finite_number(alpha) or alpha <= 0 or alpha > 1:
+        raise ValueError("alpha must be finite and in (0, 1]")
+    if not _is_finite_number(gamma) or gamma < 0 or gamma >= 1:
+        raise ValueError("gamma must be finite and in [0, 1)")
+    if not _is_finite_number(epsilon) or epsilon < 0 or epsilon > 1:
+        raise ValueError("epsilon must be finite and in [0, 1]")
+    if max_steps <= 0:
+        raise ValueError("max_steps must be positive")
+
+    actions = tuple(_ACTIONS)  # U, R, D, L
+    states = sorted(
+        state
+        for state in _reachable_cells(env)
+        if env._cell(state) != "G"
+    )
+    q = {(state, action): 0.0 for state in states for action in actions}
+    rng = random.Random(seed)
+
+    def choose_action(state):
+        if rng.random() < epsilon:
+            return actions[rng.randrange(4)]
+        return max(actions, key=lambda a: q[(state, a)])
+
+    for _ in range(episodes):
+        state = env.reset()
+        action = choose_action(state)
+        for _ in range(max_steps):
+            next_state, reward, done = env.step(action)
+            if done:
+                target = reward
+            else:
+                next_action = choose_action(next_state)
+                greedy = max(actions, key=lambda a: q[(next_state, a)])
+                greedy_prob = 1 - epsilon + epsilon / 4
+                other_prob = epsilon / 4
+                v = 0.0
+                for a in actions:
+                    p = greedy_prob if a == greedy else other_prob
+                    v += p * q[(next_state, a)]
+                target = reward + gamma * v
+            key = (state, action)
+            new_value = q[key] + alpha * (target - q[key])
+            if not math.isfinite(new_value):
+                raise ValueError("Q value must remain finite")
+            q[key] = new_value
+            if done:
+                break
+            state, action = next_state, next_action
+    return q
+
+
 def double_q_learning(
     env,
     episodes=500,
