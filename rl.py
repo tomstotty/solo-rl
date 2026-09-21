@@ -3027,6 +3027,152 @@ def ppo_update(logits, batch, lr=0.05, c=0.2, epochs=4) -> dict:
     }
 
 
+def ppo_update_kl(
+    logits, batch, lr=0.05, c=0.2, epochs=4, target_kl=0.01
+) -> dict:
+    """带 KL 早停的 PPO 多轮 logits 更新，返回固定键序 logits、
+    objectives、probabilities、kls、stopped 的 dict。
+
+    logits、batch、lr、c、epochs 的校验与异常逐项沿用 ppo_update；
+    target_kl 须为非 bool 的 int/float，类型不符抛 TypeError，转 float
+    溢出、非有限或 <=0 抛 ValueError，校验后记为 t。复制 logits 为 L，
+    逐轮调用 ppo_update(L, batch, lr, c, 1)，用返回 logits 续训，并收集
+    每轮唯一 objective。每轮后按 ppo_update 的稳定 log-softmax 重算
+    batch 各样本所选动作的新 logp；按 batch 序从 0.0 累加
+    old_logp-new_logp，除批量长度得 float KL 并收集；任一新结果非有限
+    抛 ValueError。若 KL>t，保留本轮更新并立即结束（stopped=True），
+    否则最多执行 epochs 轮。返回最终 float 矩阵、已执行轮目标列表、
+    最终 softmax 矩阵、KL 列表与是否出现 KL>t 的 bool；返回新容器且
+    不修改输入，同输入逐值一致。
+    """
+    if not isinstance(logits, list):
+        raise TypeError("logits must be a list")
+    if not logits:
+        raise ValueError("logits must be non-empty")
+    width = None
+    for row in logits:
+        if not isinstance(row, list):
+            raise TypeError("every row of logits must be a list")
+        if not row:
+            raise ValueError("every row of logits must be non-empty")
+        if width is None:
+            width = len(row)
+        elif len(row) != width:
+            raise ValueError("logits must be rectangular")
+        for item in row:
+            if not isinstance(item, float):
+                raise TypeError("logits must contain only float")
+            if not math.isfinite(item):
+                raise ValueError("logits must contain only finite float")
+    n_rows = len(logits)
+    n_cols = width
+
+    if not isinstance(batch, list):
+        raise TypeError("batch must be a list")
+    if not batch:
+        raise ValueError("batch must be non-empty")
+    samples = []
+    for item in batch:
+        if not isinstance(item, list):
+            raise TypeError("every batch item must be a list")
+        if len(item) != 4:
+            raise ValueError("every batch item must have exactly four elements")
+        s, a, o, adv = item
+        if isinstance(s, bool) or not isinstance(s, int):
+            raise TypeError("state index must be a non-bool int")
+        if isinstance(a, bool) or not isinstance(a, int):
+            raise TypeError("action index must be a non-bool int")
+        if not 0 <= s < n_rows:
+            raise ValueError("state index out of range")
+        if not 0 <= a < n_cols:
+            raise ValueError("action index out of range")
+        if not isinstance(o, float):
+            raise TypeError("old log-prob must be a float")
+        if not math.isfinite(o):
+            raise ValueError("old log-prob must be finite")
+        if not isinstance(adv, float):
+            raise TypeError("advantage must be a float")
+        if not math.isfinite(adv):
+            raise ValueError("advantage must be finite")
+        samples.append((s, a, o, adv))
+
+    if not isinstance(lr, float):
+        raise TypeError("lr must be a float")
+    if not math.isfinite(lr):
+        raise ValueError("lr must be finite")
+    if lr <= 0.0 or lr > 1.0:
+        raise ValueError("lr must be in (0, 1]")
+    if not isinstance(c, float):
+        raise TypeError("c must be a float")
+    if not math.isfinite(c):
+        raise ValueError("c must be finite")
+    if c < 0.0 or c >= 1.0:
+        raise ValueError("c must be in [0, 1)")
+    if isinstance(epochs, bool) or not isinstance(epochs, int):
+        raise TypeError("epochs must be a non-bool int")
+    if epochs <= 0:
+        raise ValueError("epochs must be positive")
+    if isinstance(target_kl, bool) or not isinstance(
+        target_kl, (int, float)
+    ):
+        raise TypeError("target_kl must be an int or float")
+    try:
+        t = float(target_kl)
+    except OverflowError:
+        raise ValueError("target_kl must convert to a finite float")
+    if not math.isfinite(t) or t <= 0.0:
+        raise ValueError("target_kl must be finite and > 0")
+
+    def _selected_logp(row, action_index):
+        """与 ppo_update 相同的稳定 log-softmax，返回所选动作列的 logp。"""
+        m = max(row)
+        total = 0.0
+        for value in row:
+            total += math.exp(value - m)
+        if not math.isfinite(total):
+            raise ValueError("softmax normalizer must be finite")
+        log_total = math.log(total)
+        q_a = row[action_index] - m - log_total
+        if not math.isfinite(q_a):
+            raise ValueError("log-probabilities must be finite")
+        return q_a
+
+    L = [list(row) for row in logits]
+    objectives = []
+    kls = []
+    probabilities = []
+    stopped = False
+    for _ in range(epochs):
+        result = ppo_update(L, batch, lr, c, 1)
+        L = result["logits"]
+        probabilities = result["probabilities"]
+        objectives.append(result["objectives"][0])
+        kl_sum = 0.0
+        for s, a, o, _adv in samples:
+            new_logp = _selected_logp(L[s], a)
+            diff = o - new_logp
+            if not math.isfinite(diff):
+                raise ValueError("KL term must be finite")
+            kl_sum += diff
+            if not math.isfinite(kl_sum):
+                raise ValueError("KL sum must be finite")
+        kl = kl_sum / len(samples)
+        if not math.isfinite(kl):
+            raise ValueError("KL must be finite")
+        kls.append(kl)
+        if kl > t:
+            stopped = True
+            break
+
+    return {
+        "logits": L,
+        "objectives": objectives,
+        "probabilities": probabilities,
+        "kls": kls,
+        "stopped": stopped,
+    }
+
+
 def ppo_train(
     env,
     episodes=100,
