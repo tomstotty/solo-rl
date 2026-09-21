@@ -475,6 +475,115 @@ def watkins_q_lambda(
     return q
 
 
+def nstep_sarsa(
+    env,
+    episodes=500,
+    alpha=0.5,
+    gamma=0.9,
+    epsilon=0.1,
+    n_steps=5,
+    seed=0,
+    max_steps=1000,
+) -> dict:
+    """n 步 SARSA，返回 {((row, col), action): float}。
+
+    Q 覆盖从 S 可达的非 G 格与 U/R/D/L 的全部组合，初始为 0.0。
+    每回合 reset，FIFO 清空并先按 ε 贪心选动作；单回合最多
+    max_steps 步。step 得 (s2, r, done)：done 时 a2=None 且不再
+    采样，否则立即按 ε 贪心选 a2（到达步限的末步也照常选择），
+    并将 [s, a, r, done, s2, a2] 入 FIFO。队长达 n_steps 即取队头
+    起 m=n_steps 项更新队头并弹头；回合结束后冲刷 FIFO，每次 m
+    取当前队长。G=Σ(k=0..m-1) gamma^k*r[k]，若第 m 项未 done 再
+    加 gamma^m*Q[(s2,a2)]（Q 取更新当时值）：终止尾不自举，步限
+    截断尾以已选 a2 自举。作 Q[(s,a)]+=alpha*(G-Q[(s,a)])，
+    新值非有限抛 ValueError。全部随机性来自一个
+    random.Random(seed)。
+    """
+    if not isinstance(env, GridWorld):
+        raise TypeError("env must be a GridWorld")
+    if isinstance(episodes, bool) or not isinstance(episodes, int):
+        raise TypeError("episodes must be an int")
+    if isinstance(seed, bool) or not isinstance(seed, int):
+        raise TypeError("seed must be an int")
+    if isinstance(alpha, bool) or not isinstance(alpha, (int, float)):
+        raise TypeError("alpha must be an int or float")
+    if isinstance(gamma, bool) or not isinstance(gamma, (int, float)):
+        raise TypeError("gamma must be an int or float")
+    if isinstance(epsilon, bool) or not isinstance(epsilon, (int, float)):
+        raise TypeError("epsilon must be an int or float")
+    if isinstance(n_steps, bool) or not isinstance(n_steps, int):
+        raise TypeError("n_steps must be an int")
+    if isinstance(max_steps, bool) or not isinstance(max_steps, int):
+        raise TypeError("max_steps must be an int")
+    if episodes <= 0:
+        raise ValueError("episodes must be positive")
+    if not _is_finite_number(alpha) or alpha <= 0 or alpha > 1:
+        raise ValueError("alpha must be finite and in (0, 1]")
+    if not _is_finite_number(gamma) or gamma < 0 or gamma >= 1:
+        raise ValueError("gamma must be finite and in [0, 1)")
+    if not _is_finite_number(epsilon) or epsilon < 0 or epsilon > 1:
+        raise ValueError("epsilon must be finite and in [0, 1]")
+    if n_steps <= 0:
+        raise ValueError("n_steps must be positive")
+    if max_steps <= 0:
+        raise ValueError("max_steps must be positive")
+
+    actions = tuple(_ACTIONS)  # U, R, D, L
+    states = sorted(
+        state
+        for state in _reachable_cells(env)
+        if env._cell(state) != "G"
+    )
+    q = {(state, action): 0.0 for state in states for action in actions}
+    rng = random.Random(seed)
+
+    def choose_action(state):
+        if rng.random() < epsilon:
+            return actions[rng.randrange(4)]
+        return max(actions, key=lambda a: q[(state, a)])
+
+    def update(queue, m):
+        """以队头起 m 项计算 n 步回报，仅更新队头动作值。"""
+        g = 0.0
+        discount = 1.0
+        for k in range(m):
+            g += discount * queue[k][2]
+            discount *= gamma
+        _s, _a, _r, tail_done, tail_state, tail_action = queue[m - 1]
+        if not tail_done:
+            g += discount * q[(tail_state, tail_action)]
+        head_state, head_action = queue[0][0], queue[0][1]
+        key = (head_state, head_action)
+        new_value = q[key] + alpha * (g - q[key])
+        if not math.isfinite(new_value):
+            raise ValueError("Q value must remain finite")
+        q[key] = new_value
+
+    for _ in range(episodes):
+        state = env.reset()
+        queue = []
+        action = choose_action(state)
+        for _ in range(max_steps):
+            next_state, reward, done = env.step(action)
+            if done:
+                next_action = None
+            else:
+                next_action = choose_action(next_state)
+            queue.append(
+                [state, action, reward, done, next_state, next_action]
+            )
+            if len(queue) == n_steps:
+                update(queue, n_steps)
+                queue.pop(0)
+            if done:
+                break
+            state, action = next_state, next_action
+        while queue:
+            update(queue, len(queue))
+            queue.pop(0)
+    return q
+
+
 def expected_sarsa(
     env,
     episodes=500,
