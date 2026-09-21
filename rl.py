@@ -3318,6 +3318,83 @@ def ppo_seed_convergence_report(
     }
 
 
+def ppo_success_streak(
+    successes, window=20, threshold=.9, patience=3
+) -> dict:
+    """根据逐回合成功 bool 的滑窗成功率判定连续达标收敛。
+
+    successes 须为非空 list/tuple 且每项为 bool：容器类型错抛
+    TypeError，空序列抛 ValueError，元素非 bool 抛 TypeError。
+    window、patience 须为非 bool 的正 int；threshold 须为非 bool
+    int/float，类型错抛 TypeError，转 float 溢出、非有限或越出
+    [0, 1] 抛 ValueError。threshold 先转为 float 再参与比较。
+
+    对每个长度为 window 的完整连续窗，按零基起点 i 升序，令 x 为
+    窗内 True 个数、r = x / window，生成行
+    [i + 1, i + window, x, r]：前三项为 int，r 为 float。找最小
+    j >= patience - 1，使第 j - patience + 1 至第 j 行（含端点）的
+    r 均不小于阈值；命中时 episode 为第 j 行第二项，否则为 None。
+    返回键序为 converged、episode、windows：converged 当且仅当
+    episode 非 None，windows 为全部窗行。无完整窗或窗数少于
+    patience 均视为未收敛。输入不被修改，相同输入逐值一致。
+    """
+    if not isinstance(successes, (list, tuple)):
+        raise TypeError("successes must be a list or tuple")
+    if isinstance(window, bool) or not isinstance(window, int):
+        raise TypeError("window must be an int")
+    if isinstance(patience, bool) or not isinstance(patience, int):
+        raise TypeError("patience must be an int")
+    if isinstance(threshold, bool) or not isinstance(
+        threshold, (int, float)
+    ):
+        raise TypeError("threshold must be an int or float")
+    if window <= 0:
+        raise ValueError("window must be positive")
+    if patience <= 0:
+        raise ValueError("patience must be positive")
+    try:
+        threshold_float = float(threshold)
+    except OverflowError:
+        raise ValueError(
+            "threshold must be convertible to a finite float"
+        )
+    if (
+        not math.isfinite(threshold_float)
+        or threshold_float < 0
+        or threshold_float > 1
+    ):
+        raise ValueError("threshold must be finite and in [0, 1]")
+    if not successes:
+        raise ValueError("successes must be non-empty")
+    for value in successes:
+        if not isinstance(value, bool):
+            raise TypeError("every success must be a bool")
+
+    windows = []
+    for i in range(len(successes) - window + 1):
+        x = 0
+        for value in successes[i:i + window]:
+            if value:
+                x += 1
+        r = x / window
+        windows.append([i + 1, i + window, x, r])
+
+    episode = None
+    for j in range(patience - 1, len(windows)):
+        if all(
+            windows[k][3] >= threshold_float
+            for k in range(j - patience + 1, j + 1)
+        ):
+            episode = windows[j][1]
+            break
+
+    return {
+        "converged": episode is not None,
+        "episode": episode,
+        "windows": windows,
+    }
+
+
 def _format_value(value):
     if abs(value) < 0.5e-12:
         value = 0.0
