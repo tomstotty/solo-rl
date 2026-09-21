@@ -2532,6 +2532,194 @@ def ppo_seed_trajectory_report(runs) -> dict:
     }
 
 
+def ppo_seed_stability_report(runs) -> dict:
+    """按 seed 分组逐值比较多份 ppo_evaluate_many 返回值，输出稳定性报告。
+
+    runs 的全量校验、异常类型、按 seed 首次出现顺序分组及组约束完全沿用
+    ppo_seed_trajectory_report：runs 须为至少两项的 list，每项须为键序
+    恰为 seed、payload 的 dict，seed 为非 bool int，payload 须完整符合
+    ppo_evaluate_many 的返回契约；类型错抛 TypeError，其余违约抛
+    ValueError；任一 seed 少于两项、同 seed 各 payload 的 results 长度
+    不一或同位置 results 项的 seed 不同均抛 ValueError，任一失败都不
+    返回部分结果，且不修改输入。
+
+    对各组以组内首个 payload 为基准，按组内原序（含基准自身）逐一调用
+    ppo_reproducibility_report，保留同序的完整报告（其 [0] 为基准对
+    自身的报告）。逐值口径（标量类型相同、float 以 float.hex() 比较、
+    int 与 float 不同、序列先比长度再逐项、不修改输入）沿用该报告。
+    令 R 为某 payload 的 results 中与基准同序的 result 列表，将全部
+    字段独立划分为三个维度逐一比较：T 比较 R[*].episodes；C 比较
+    R[*].converged 与 payload 顶层 converged；M 比较
+    R[*].success_rate、R[*].windows 与 payload 的 means、passed。
+    三维互不遮蔽（同一 result 可同时计入多维）；基准对自身三维均为
+    True。
+
+    返回键序为 stable、groups、unstable_seeds：groups 按 seed 首次
+    出现序排列，每项为 [seed, indices, reports, [T, C, M]]，indices
+    为该组各项在原 runs 中的零基索引升序 list，reports 为与组内各项
+    同序的完整报告 list，T、C、M 为该维度在全组逐值一致时才为 True
+    的 bool；unstable_seeds 按组序收集任一维度为 False 的 seed；
+    stable 当且仅当 unstable_seeds 为空。重复调用及深拷贝逐值一致，
+    仅用标准库，不引入命令行入口。
+    """
+    if not isinstance(runs, list):
+        raise TypeError("runs must be a list")
+    if len(runs) < 2:
+        raise ValueError("runs must contain at least two entries")
+
+    validated = []
+    for index, item in enumerate(runs):
+        if not isinstance(item, dict):
+            raise TypeError(f"runs[{index}] must be a dict")
+        if list(item) != ["seed", "payload"]:
+            raise ValueError(
+                f"runs[{index}] must have exactly the keys seed, payload"
+            )
+        seed = item["seed"]
+        if isinstance(seed, bool) or not isinstance(seed, int):
+            raise TypeError(f"runs[{index}] seed must be a non-bool int")
+        payload = item["payload"]
+        if not isinstance(payload, dict):
+            raise TypeError(f"runs[{index}] payload must be a dict")
+        _validate_evaluate_many_payload(
+            payload, f"runs[{index}] payload"
+        )
+        validated.append((seed, payload))
+
+    seed_order = []
+    indices_by_seed = {}
+    payloads_by_seed = {}
+    for index, (seed, payload) in enumerate(validated):
+        if seed not in indices_by_seed:
+            seed_order.append(seed)
+            indices_by_seed[seed] = []
+            payloads_by_seed[seed] = []
+        indices_by_seed[seed].append(index)
+        payloads_by_seed[seed].append(payload)
+
+    for seed in seed_order:
+        group_payloads = payloads_by_seed[seed]
+        if len(indices_by_seed[seed]) < 2:
+            raise ValueError(f"seed {seed} must have at least two runs")
+        baseline_entries = group_payloads[0]["results"]
+        for payload in group_payloads[1:]:
+            entries = payload["results"]
+            if len(entries) != len(baseline_entries):
+                raise ValueError(
+                    f"all runs with seed {seed} must have results lists of"
+                    " equal length"
+                )
+            for position, (baseline_entry, entry) in enumerate(
+                zip(baseline_entries, entries)
+            ):
+                if baseline_entry["seed"] != entry["seed"]:
+                    raise ValueError(
+                        f"all runs with seed {seed} must have the same seed"
+                        f" at results position {position}"
+                    )
+
+    def _scalar_equal(a, b):
+        """与 ppo_reproducibility_report 相同的逐值标量口径。"""
+        if type(a) is not type(b):
+            return False
+        if isinstance(a, float):
+            return float.hex(a) == float.hex(b)
+        return a == b
+
+    def _episodes_equal(left_episodes, right_episodes):
+        if len(left_episodes) != len(right_episodes):
+            return False
+        for left_row, right_row in zip(
+            left_episodes, right_episodes
+        ):
+            for left_value, right_value in zip(left_row, right_row):
+                if not _scalar_equal(left_value, right_value):
+                    return False
+        return True
+
+    groups = []
+    unstable_seeds = []
+    for seed in seed_order:
+        group_payloads = payloads_by_seed[seed]
+        baseline_payload = group_payloads[0]
+        reports = [
+            ppo_reproducibility_report(baseline_payload, payload)
+            for payload in group_payloads
+        ]
+
+        t_stable = True
+        c_stable = True
+        m_stable = True
+        baseline_entries = baseline_payload["results"]
+        for payload in group_payloads:
+            entries = payload["results"]
+            for baseline_entry, entry in zip(
+                baseline_entries, entries
+            ):
+                baseline_result = baseline_entry["result"]
+                result = entry["result"]
+                # T：R[*].episodes
+                if not _episodes_equal(
+                    baseline_result["episodes"], result["episodes"]
+                ):
+                    t_stable = False
+                # C：R[*].converged
+                if not _scalar_equal(
+                    baseline_result["converged"], result["converged"]
+                ):
+                    c_stable = False
+                # M：R[*].success_rate、R[*].windows
+                if not _scalar_equal(
+                    baseline_result["success_rate"],
+                    result["success_rate"],
+                ):
+                    m_stable = False
+                if len(baseline_result["windows"]) != len(
+                    result["windows"]
+                ) or any(
+                    not _scalar_equal(left_value, right_value)
+                    for left_value, right_value in zip(
+                        baseline_result["windows"], result["windows"]
+                    )
+                ):
+                    m_stable = False
+            # C：payload.converged
+            if not _scalar_equal(
+                baseline_payload["converged"], payload["converged"]
+            ):
+                c_stable = False
+            # M：payload.means、payload.passed
+            baseline_means = baseline_payload["means"]
+            means = payload["means"]
+            if not _scalar_equal(
+                baseline_means["success"], means["success"]
+            ) or not _scalar_equal(
+                baseline_means["last_window"], means["last_window"]
+            ):
+                m_stable = False
+            if not _scalar_equal(
+                baseline_payload["passed"], payload["passed"]
+            ):
+                m_stable = False
+
+        groups.append(
+            [
+                seed,
+                indices_by_seed[seed],
+                reports,
+                [t_stable, c_stable, m_stable],
+            ]
+        )
+        if not (t_stable and c_stable and m_stable):
+            unstable_seeds.append(seed)
+
+    return {
+        "stable": not unstable_seeds,
+        "groups": groups,
+        "unstable_seeds": unstable_seeds,
+    }
+
+
 def convergence_report(
     episode_results, window=20, tolerance=0.01, patience=3
 ) -> dict:
