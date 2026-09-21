@@ -2532,6 +2532,181 @@ def ppo_seed_trajectory_report(runs) -> dict:
     }
 
 
+def ppo_seed_stability_report(runs) -> dict:
+    """按 seed 分组从轨迹、收敛、汇总三维度判定多种子稳定性，返回报告。
+
+    runs 的全量校验、异常、按 seed 首次出现顺序分组及组约束完全沿用
+    ppo_seed_trajectory_report：runs 须为至少两项的 list，非 list 抛
+    TypeError，少于两项抛 ValueError；每项须为键序恰为 seed、payload
+    的 dict，seed 为非 bool 的 int，payload 须完整符合
+    ppo_evaluate_many 的完整返回契约（即 ppo_reproducibility_report 的
+    单侧输入契约）；项本身或 payload 非 dict、seed 为 bool 或非 int
+    抛 TypeError；键序或 payload 契约违约抛 ValueError；任一 seed 少于
+    两项、同 seed 各 payload 的 results 长度不一或同位置 results 项的
+    seed 不同抛 ValueError。先按索引完整校验全部项再分组，任一失败都
+    不返回部分结果，且不修改输入。
+
+    各组以组内首个 payload 为基准，对组内各 payload（含基准自身）按
+    组内原序调用 ppo_reproducibility_report，保留同序完整 reports，其
+    [0] 为基准对自身的报告；逐值口径沿用该报告：标量要求类型与值均
+    相同，float 以 float.hex() 比较（0.0 与 -0.0 不同），int 与 float
+    即使数值相同也不同，序列先比长度再按位置比较。令 R 为各
+    payload.results 中同位置 result 跨组内各 payload 构成的同序列表，
+    在三个维度上以基准为参照逐位置逐值判定全组是否一致：T 比较 R 各项
+    的 episodes；C 比较 R 各项 result 的 converged 以及各 payload 顶层
+    的 converged；M 比较 R 各项 result 的 success_rate、windows 以及各
+    payload 的 means、passed。
+
+    返回键序为 stable、groups、unstable_seeds：groups 按 seed 首次出现
+    序排列，每项为 [seed, indices, reports, [T, C, M]]，indices 为该组
+    各项在原 runs 中的零基索引升序 list，reports 为与组内各项同序的
+    完整报告 list，T、C、M 为该维全组一致的 bool；unstable_seeds 按组
+    序收集任一维为 False 的 seed；stable 当且仅当 unstable_seeds 为空。
+    重复调用及深拷贝逐值一致，仅用标准库，不引入命令行入口。
+    """
+    if not isinstance(runs, list):
+        raise TypeError("runs must be a list")
+    if len(runs) < 2:
+        raise ValueError("runs must contain at least two entries")
+
+    validated = []
+    for index, item in enumerate(runs):
+        if not isinstance(item, dict):
+            raise TypeError(f"runs[{index}] must be a dict")
+        if list(item) != ["seed", "payload"]:
+            raise ValueError(
+                f"runs[{index}] must have exactly the keys seed, payload"
+            )
+        seed = item["seed"]
+        if isinstance(seed, bool) or not isinstance(seed, int):
+            raise TypeError(f"runs[{index}] seed must be a non-bool int")
+        payload = item["payload"]
+        if not isinstance(payload, dict):
+            raise TypeError(f"runs[{index}] payload must be a dict")
+        _validate_evaluate_many_payload(
+            payload, f"runs[{index}] payload"
+        )
+        validated.append((seed, payload))
+
+    seed_order = []
+    indices_by_seed = {}
+    payloads_by_seed = {}
+    for index, (seed, payload) in enumerate(validated):
+        if seed not in indices_by_seed:
+            seed_order.append(seed)
+            indices_by_seed[seed] = []
+            payloads_by_seed[seed] = []
+        indices_by_seed[seed].append(index)
+        payloads_by_seed[seed].append(payload)
+
+    for seed in seed_order:
+        group_payloads = payloads_by_seed[seed]
+        if len(indices_by_seed[seed]) < 2:
+            raise ValueError(f"seed {seed} must have at least two runs")
+        baseline_entries = group_payloads[0]["results"]
+        for payload in group_payloads[1:]:
+            entries = payload["results"]
+            if len(entries) != len(baseline_entries):
+                raise ValueError(
+                    f"all runs with seed {seed} must have results lists of"
+                    " equal length"
+                )
+            for position, (baseline_entry, entry) in enumerate(
+                zip(baseline_entries, entries)
+            ):
+                if baseline_entry["seed"] != entry["seed"]:
+                    raise ValueError(
+                        f"all runs with seed {seed} must have the same seed"
+                        f" at results position {position}"
+                    )
+
+    def _values_equal(left, right):
+        """沿用 ppo_reproducibility_report 的逐值口径递归比较。"""
+        if type(left) is not type(right):
+            return False
+        if isinstance(left, float):
+            return float.hex(left) == float.hex(right)
+        if isinstance(left, list):
+            if len(left) != len(right):
+                return False
+            return all(
+                _values_equal(item_a, item_b)
+                for item_a, item_b in zip(left, right)
+            )
+        if isinstance(left, dict):
+            if list(left) != list(right):
+                return False
+            return all(
+                _values_equal(left[key], right[key]) for key in left
+            )
+        return left == right
+
+    groups = []
+    unstable_seeds = []
+    for seed in seed_order:
+        group_payloads = payloads_by_seed[seed]
+        baseline_payload = group_payloads[0]
+        reports = [
+            ppo_reproducibility_report(baseline_payload, payload)
+            for payload in group_payloads
+        ]
+
+        trajectory_stable = True
+        convergence_stable = True
+        metrics_stable = True
+        baseline_results = baseline_payload["results"]
+        for payload in group_payloads[1:]:
+            for baseline_entry, entry in zip(
+                baseline_results, payload["results"]
+            ):
+                baseline_result = baseline_entry["result"]
+                result = entry["result"]
+                if not _values_equal(
+                    baseline_result["episodes"], result["episodes"]
+                ):
+                    trajectory_stable = False
+                if baseline_result["converged"] != result["converged"]:
+                    convergence_stable = False
+                if not _values_equal(
+                    baseline_result["success_rate"],
+                    result["success_rate"],
+                ):
+                    metrics_stable = False
+                if not _values_equal(
+                    baseline_result["windows"], result["windows"]
+                ):
+                    metrics_stable = False
+            if baseline_payload["converged"] != payload["converged"]:
+                convergence_stable = False
+            if not _values_equal(
+                baseline_payload["means"], payload["means"]
+            ):
+                metrics_stable = False
+            if baseline_payload["passed"] != payload["passed"]:
+                metrics_stable = False
+
+        groups.append(
+            [
+                seed,
+                indices_by_seed[seed],
+                reports,
+                [trajectory_stable, convergence_stable, metrics_stable],
+            ]
+        )
+        if not (
+            trajectory_stable
+            and convergence_stable
+            and metrics_stable
+        ):
+            unstable_seeds.append(seed)
+
+    return {
+        "stable": not unstable_seeds,
+        "groups": groups,
+        "unstable_seeds": unstable_seeds,
+    }
+
+
 def convergence_report(
     episode_results, window=20, tolerance=0.01, patience=3
 ) -> dict:
