@@ -1500,6 +1500,142 @@ def generalized_advantage_estimate(
     return {"advantages": A, "returns": returns}
 
 
+def vtrace(
+    rewards,
+    values,
+    behavior,
+    target,
+    gamma=0.9,
+    rho_clip=1.0,
+    c_clip=1.0,
+    bootstrap=0.0,
+) -> dict:
+    """V-trace 离线策略价值目标，返回固定键序 values、advantages 的 dict。
+
+    rewards、values、behavior（行为策略对数概率）、target（目标策略
+    对数概率）须为等长非空的 list/tuple，各元素为非 bool 的
+    int/float；gamma、rho_clip、c_clip、bootstrap 为非 bool 的
+    int/float 标量，其中 gamma 须在 [0, 1]，rho_clip、c_clip 须
+    > 0。所有输入先复制并转换为 float（R、V、B、P、g、u、c、b；
+    转换溢出或结果非有限均抛 ValueError），不修改原序列。逐项令
+    z[t]=exp(P[t]-B[t])（上溢抛 ValueError，下溢为 0.0 合法）、
+    rho[t]=min(z[t],u)、C[t]=min(z[t],c)。令 T 为长度并设
+    V[T]=vs[T]=b；t 逆序计算
+    d=rho[t]*(R[t]+g*V[t+1]-V[t])、
+    vs[t]=V[t]+d+g*C[t]*(vs[t+1]-V[t+1])，再原序计算
+    advantages[t]=rho[t]*(R[t]+g*vs[t+1]-V[t])。对数差、中间量或
+    输出非有限均抛 ValueError。values 为 vs[0..T-1]，两个列表均按
+    原时序排列为 float 新 list。
+    """
+    if not isinstance(rewards, (list, tuple)):
+        raise TypeError("rewards must be a list or tuple")
+    if not isinstance(values, (list, tuple)):
+        raise TypeError("values must be a list or tuple")
+    if not isinstance(behavior, (list, tuple)):
+        raise TypeError("behavior must be a list or tuple")
+    if not isinstance(target, (list, tuple)):
+        raise TypeError("target must be a list or tuple")
+    if len(rewards) == 0 or len(values) == 0 or len(behavior) == 0 or len(
+        target
+    ) == 0:
+        raise ValueError(
+            "rewards, values, behavior and target must be non-empty"
+        )
+    if not (
+        len(rewards)
+        == len(values)
+        == len(behavior)
+        == len(target)
+    ):
+        raise ValueError(
+            "rewards, values, behavior and target must have equal length"
+        )
+
+    def _to_float(item, name):
+        if isinstance(item, bool) or not isinstance(item, (int, float)):
+            raise TypeError(f"{name} must contain only int or float")
+        try:
+            result = float(item)
+        except OverflowError:
+            raise ValueError(f"{name} must convert to a finite float")
+        if not math.isfinite(result):
+            raise ValueError(f"{name} must contain only finite numbers")
+        return result
+
+    R = [_to_float(item, "rewards") for item in rewards]
+    V = [_to_float(item, "values") for item in values]
+    B = [_to_float(item, "behavior") for item in behavior]
+    P = [_to_float(item, "target") for item in target]
+
+    def _to_scalar(item, name):
+        if isinstance(item, bool) or not isinstance(item, (int, float)):
+            raise TypeError(f"{name} must be an int or float")
+        try:
+            result = float(item)
+        except OverflowError:
+            raise ValueError(f"{name} must convert to a finite float")
+        if not math.isfinite(result):
+            raise ValueError(f"{name} must be finite")
+        return result
+
+    g = _to_scalar(gamma, "gamma")
+    u = _to_scalar(rho_clip, "rho_clip")
+    c = _to_scalar(c_clip, "c_clip")
+    b = _to_scalar(bootstrap, "bootstrap")
+    if g < 0.0 or g > 1.0:
+        raise ValueError("gamma must be in [0, 1]")
+    if u <= 0.0:
+        raise ValueError("rho_clip must be > 0")
+    if c <= 0.0:
+        raise ValueError("c_clip must be > 0")
+
+    T = len(R)
+    rho = [0.0] * T
+    clipped_c = [0.0] * T
+    for t in range(T):
+        diff = P[t] - B[t]
+        if not math.isfinite(diff):
+            raise ValueError("log-prob difference must be finite")
+        try:
+            z = math.exp(diff)
+        except OverflowError:
+            raise ValueError("importance ratio exp overflow")
+        rho[t] = min(z, u)
+        clipped_c[t] = min(z, c)
+
+    vs = [0.0] * T
+    vs_next = b
+    v_next = b
+    for t in range(T - 1, -1, -1):
+        delta = R[t] + g * v_next - V[t]
+        if not math.isfinite(delta):
+            raise ValueError("vtrace delta must be finite")
+        d = rho[t] * delta
+        if not math.isfinite(d):
+            raise ValueError("clipped delta term must be finite")
+        gap = vs_next - v_next
+        if not math.isfinite(gap):
+            raise ValueError("value gap must be finite")
+        vs_t = V[t] + d + g * clipped_c[t] * gap
+        if not math.isfinite(vs_t):
+            raise ValueError("vtrace target must be finite")
+        vs[t] = vs_t
+        vs_next = vs_t
+        v_next = V[t]
+
+    advantages = [0.0] * T
+    for t in range(T):
+        vs_next = b if t == T - 1 else vs[t + 1]
+        delta = R[t] + g * vs_next - V[t]
+        if not math.isfinite(delta):
+            raise ValueError("vtrace advantage delta must be finite")
+        advantage = rho[t] * delta
+        if not math.isfinite(advantage):
+            raise ValueError("advantage must be finite")
+        advantages[t] = advantage
+    return {"values": vs, "advantages": advantages}
+
+
 def ppo_clipped_surrogate(
     old_log_probs, new_log_probs, advantages, clip_epsilon=0.2
 ) -> dict:
