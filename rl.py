@@ -3388,6 +3388,195 @@ def ppo_success_streak(successes, window=20, threshold=0.9, patience=3) -> dict:
     }
 
 
+def ppo_train_until(
+    env,
+    max_episodes=100,
+    seed=0,
+    max_steps=1000,
+    window=20,
+    threshold=0.9,
+    patience=3,
+) -> dict:
+    """PPO 训练至成功序列收敛或达回合上限，返回 h 表、逐回合步表、目标值与收敛报告。
+
+    env、seed、max_steps 的校验与异常沿用 ppo_train；max_episodes 按
+    ppo_train 的 episodes 契约（非 bool 正 int）；window、threshold、
+    patience 的校验与异常沿用 ppo_success_streak 同名参数，且在采样前
+    全量校验。以 ppo_train 默认训练超参（alpha=0.05、gamma=0.9、
+    lambda_=0.95、c=0.2、epochs=4）及给定 seed、max_steps 连续训练，
+    全部随机性来自一个 random.Random(seed)。
+
+    每次完成整回合采样和更新后，将该回合步列表末项的 done 加入成功
+    序列并调用 ppo_success_streak(successes, window, threshold,
+    patience)；首次 converged 为真即停止，否则训练 max_episodes 回合。
+
+    返回键依次为 h、episodes、objectives、convergence；实际完成 k
+    回合时，前三项逐值等于 ppo_train(env, episodes=k, seed=seed,
+    max_steps=max_steps) 的对应返回，convergence 为成功序列的完整
+    ppo_success_streak 结果。不额外消费随机数，同参同 seed 逐值一致。
+    """
+    if not isinstance(env, GridWorld):
+        raise TypeError("env must be a GridWorld")
+    if isinstance(max_episodes, bool) or not isinstance(max_episodes, int):
+        raise TypeError("max_episodes must be an int")
+    if isinstance(seed, bool) or not isinstance(seed, int):
+        raise TypeError("seed must be an int")
+    if isinstance(max_steps, bool) or not isinstance(max_steps, int):
+        raise TypeError("max_steps must be an int")
+    if isinstance(window, bool) or not isinstance(window, int):
+        raise TypeError("window must be a non-bool int")
+    if isinstance(patience, bool) or not isinstance(patience, int):
+        raise TypeError("patience must be a non-bool int")
+    if isinstance(threshold, bool) or not isinstance(
+        threshold, (int, float)
+    ):
+        raise TypeError("threshold must be an int or float")
+    if max_episodes <= 0:
+        raise ValueError("max_episodes must be positive")
+    if max_steps <= 0:
+        raise ValueError("max_steps must be positive")
+    if window <= 0:
+        raise ValueError("window must be positive")
+    if patience <= 0:
+        raise ValueError("patience must be positive")
+    try:
+        float(threshold)
+    except OverflowError:
+        raise ValueError("threshold must convert to a finite float")
+    if not math.isfinite(float(threshold)):
+        raise ValueError("threshold must be finite")
+    if float(threshold) < 0.0 or float(threshold) > 1.0:
+        raise ValueError("threshold must be in [0, 1]")
+
+    alpha = 0.05
+    gamma = 0.9
+    lambda_ = 0.95
+    c = 0.2
+    epochs = 4
+
+    actions = tuple(_ACTIONS)  # U, R, D, L
+    states = sorted(
+        state
+        for state in _reachable_cells(env)
+        if env._cell(state) != "G"
+    )
+    state_index = {state: i for i, state in enumerate(states)}
+    h = [[0.0 for _ in actions] for _ in states]
+    values = [0.0 for _ in states]
+    rng = random.Random(seed)
+    all_episodes = []
+    all_objectives = []
+    successes = []
+    convergence = None
+
+    for _ in range(max_episodes):
+        state = env.reset()
+        trajectory = []
+        step_records = []
+        for _ in range(max_steps):
+            s = state_index[state]
+            row = h[s]
+            m = max(row)
+            weights = [math.exp(logit - m) for logit in row]
+            total = sum(weights)
+            if not math.isfinite(total) or total <= 0.0:
+                raise ValueError(
+                    "softmax normalizer must be finite and positive"
+                )
+            probs = [weight / total for weight in weights]
+            log_total = math.log(total)
+            u = rng.random()
+            cumulative = 0.0
+            a = 3
+            for k, p_k in enumerate(probs):
+                cumulative += p_k
+                if cumulative > u:
+                    a = k
+                    break
+            action = actions[a]
+            old_logp = row[a] - m - log_total
+            if not math.isfinite(old_logp):
+                raise ValueError("log-probabilities must be finite")
+            value = values[s]
+            next_state, reward, done = env.step(action)
+            value_next = 0.0 if done else values[state_index[next_state]]
+            trajectory.append(
+                (s, a, reward, old_logp, value, value_next, done)
+            )
+            step_records.append(
+                [state[0], state[1], action, reward, done]
+            )
+            if done:
+                break
+            state = next_state
+
+        advantages = [0.0] * len(trajectory)
+        a_t = 0.0
+        for t in range(len(trajectory) - 1, -1, -1):
+            (
+                _s,
+                _a,
+                reward,
+                _old_logp,
+                value,
+                value_next,
+                _done,
+            ) = trajectory[t]
+            delta = reward + gamma * value_next - value
+            if not math.isfinite(delta):
+                raise ValueError("GAE delta must be finite")
+            a_t = delta + gamma * lambda_ * a_t
+            if not math.isfinite(a_t):
+                raise ValueError("GAE advantage must be finite")
+            advantages[t] = a_t
+
+        batch = [
+            [s, a, old_logp, adv]
+            for (s, a, _r, old_logp, _v, _v2, _done), adv in zip(
+                trajectory, advantages
+            )
+        ]
+        result = ppo_update(h, batch, float(alpha), c, epochs)
+        h = result["logits"]
+        all_objectives.append(result["objectives"])
+
+        for (s, _a, _r, _old_logp, value, _v2, _done), adv in zip(
+            trajectory, advantages
+        ):
+            new_value = values[s] + alpha * (
+                adv + value - values[s]
+            )
+            if not math.isfinite(new_value):
+                raise ValueError("updated value must be finite")
+            values[s] = new_value
+        all_episodes.append(step_records)
+
+        successes.append(step_records[-1][4])
+        convergence = ppo_success_streak(
+            successes, window, threshold, patience
+        )
+        if convergence["converged"]:
+            break
+
+    h_table = [
+        [
+            float(r),
+            float(c),
+            h[i][0],
+            h[i][1],
+            h[i][2],
+            h[i][3],
+        ]
+        for i, (r, c) in enumerate(states)
+    ]
+    return {
+        "h": h_table,
+        "episodes": all_episodes,
+        "objectives": all_objectives,
+        "convergence": convergence,
+    }
+
+
 def _format_value(value):
     if abs(value) < 0.5e-12:
         value = 0.0
