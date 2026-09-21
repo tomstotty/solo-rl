@@ -1896,6 +1896,161 @@ def actor_critic(
     return {"h": h_table, "v": v_table, "episodes": episode_results}
 
 
+def entropy_actor_critic(
+    env,
+    episodes=500,
+    alpha=0.05,
+    beta=0.1,
+    gamma=0.9,
+    entropy_coef=0.01,
+    seed=0,
+    max_steps=1000,
+) -> dict:
+    """在线一步 actor-critic（带熵正则项），返回 h/v 表与逐回合统计。
+
+    H/V 域及初值、回合边界、softmax 采样（每步仅一次 random()）均与
+    actor_critic 相同。每步先以旧 H 算 p 与熵
+    E=-Σp[b]log(p[b])（URDL 顺序，p[b]=0 项计 0），再采样动作、
+    保留旧 V[s] 并 step。done 时 δ=r-V[s]，否则
+    δ=r+gamma*V[s2]-V[s]；达到步限且未 done 的末步同样按后式自举。
+    以旧 p、E 对各 b 同步作
+    H[s,b]+=alpha*(δ*(I[b=a]-p[b])+entropy_coef*p[b]*(-log p[b]-E))，
+    p[b]=0 时熵梯度项计 0；再作 V[s]+=beta*δ。δ、E、梯度或新 H/V
+    非有限时抛 ValueError。entropy_coef=0 时与 actor_critic 逐值等同。
+    全部随机性来自一个 random.Random(seed)。
+
+    返回键依次为 h、v、episodes，格式同 actor_critic。
+    """
+    if not isinstance(env, GridWorld):
+        raise TypeError("env must be a GridWorld")
+    if isinstance(episodes, bool) or not isinstance(episodes, int):
+        raise TypeError("episodes must be an int")
+    if isinstance(seed, bool) or not isinstance(seed, int):
+        raise TypeError("seed must be an int")
+    if isinstance(max_steps, bool) or not isinstance(max_steps, int):
+        raise TypeError("max_steps must be an int")
+    if isinstance(alpha, bool) or not isinstance(alpha, (int, float)):
+        raise TypeError("alpha must be an int or float")
+    if isinstance(beta, bool) or not isinstance(beta, (int, float)):
+        raise TypeError("beta must be an int or float")
+    if isinstance(gamma, bool) or not isinstance(gamma, (int, float)):
+        raise TypeError("gamma must be an int or float")
+    if isinstance(entropy_coef, bool) or not isinstance(
+        entropy_coef, (int, float)
+    ):
+        raise TypeError("entropy_coef must be an int or float")
+    if episodes <= 0:
+        raise ValueError("episodes must be positive")
+    if max_steps <= 0:
+        raise ValueError("max_steps must be positive")
+    if not _is_finite_number(alpha) or alpha <= 0 or alpha > 1:
+        raise ValueError("alpha must be finite and in (0, 1]")
+    if not _is_finite_number(beta) or beta <= 0 or beta > 1:
+        raise ValueError("beta must be finite and in (0, 1]")
+    if not _is_finite_number(gamma) or gamma < 0 or gamma >= 1:
+        raise ValueError("gamma must be finite and in [0, 1)")
+    if (
+        not _is_finite_number(entropy_coef)
+        or entropy_coef < 0
+        or entropy_coef > 1
+    ):
+        raise ValueError("entropy_coef must be finite and in [0, 1]")
+
+    actions = tuple(_ACTIONS)  # U, R, D, L
+    states = sorted(
+        state
+        for state in _reachable_cells(env)
+        if env._cell(state) != "G"
+    )
+    h = {(state, action): 0.0 for state in states for action in actions}
+    v = {state: 0.0 for state in states}
+    rng = random.Random(seed)
+    episode_results = []
+
+    for _ in range(episodes):
+        state = env.reset()
+        steps = 0
+        total_reward = 0
+        done = False
+        for _ in range(max_steps):
+            m = max(h[(state, a)] for a in actions)
+            weights = [math.exp(h[(state, a)] - m) for a in actions]
+            total = sum(weights)
+            probs = [weight / total for weight in weights]
+            entropy = -sum(
+                p_b * math.log(p_b) for p_b in probs if p_b > 0.0
+            )
+            if not math.isfinite(entropy):
+                raise ValueError("entropy must be finite")
+            u = rng.random()
+            cumulative = 0.0
+            action = "L"
+            for a, p_a in zip(actions, probs):
+                cumulative += p_a
+                if cumulative > u:
+                    action = a
+                    break
+            prob = dict(zip(actions, probs))
+            value = v[state]
+            next_state, reward, done = env.step(action)
+            steps += 1
+            total_reward += reward
+            if done:
+                delta = reward - value
+            else:
+                delta = reward + gamma * v[next_state] - value
+            if not math.isfinite(delta):
+                raise ValueError("delta must be finite")
+            gradients = []
+            updates = []
+            for b in actions:
+                indicator = 1.0 if b == action else 0.0
+                gradient = delta * (indicator - prob[b])
+                update = alpha * delta * (indicator - prob[b])
+                if entropy_coef != 0.0 and prob[b] > 0.0:
+                    entropy_term = prob[b] * (
+                        -math.log(prob[b]) - entropy
+                    )
+                    gradient += entropy_coef * entropy_term
+                    update += alpha * entropy_coef * entropy_term
+                if not math.isfinite(gradient):
+                    raise ValueError("policy gradient must be finite")
+                gradients.append(gradient)
+                updates.append(update)
+            new_h_values = [
+                h[(state, b)] + update
+                for b, update in zip(actions, updates)
+            ]
+            new_value = value + beta * delta
+            if any(not math.isfinite(item) for item in new_h_values):
+                raise ValueError("h values must be finite")
+            if not math.isfinite(new_value):
+                raise ValueError("v values must be finite")
+            for b, new_h_value in zip(actions, new_h_values):
+                h[(state, b)] = new_h_value
+            v[state] = new_value
+            if done:
+                break
+            state = next_state
+        episode_results.append([steps, total_reward, done])
+
+    h_table = [
+        [
+            float(r),
+            float(c),
+            h[((r, c), "U")],
+            h[((r, c), "R")],
+            h[((r, c), "D")],
+            h[((r, c), "L")],
+        ]
+        for (r, c) in states
+    ]
+    v_table = [
+        [float(r), float(c), v[(r, c)]] for (r, c) in states
+    ]
+    return {"h": h_table, "v": v_table, "episodes": episode_results}
+
+
 def actor_critic_lambda(
     env,
     episodes=500,
