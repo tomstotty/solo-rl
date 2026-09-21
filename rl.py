@@ -2931,6 +2931,90 @@ def ppo_evaluate_trace(env, h, episodes=100, max_steps=1000, seed=0) -> dict:
     }
 
 
+def ppo_trace_bytes(data) -> bytes:
+    """严格校验 ppo_evaluate_trace 返回值并序列化为确定性字节。
+
+    data 非 dict 抛 TypeError；否则须严格符合结构契约：顶层键序恰为
+    episodes、success_rate；episodes 为非空 list；每个回合须为键序
+    trace、total_reward、success 的 dict，trace 为非空 list；每个
+    步项须为恰七项的 list
+    [r, c, action, next_r, next_c, reward, done]，其中 r、c、
+    next_r、next_c、reward 及 total_reward 均为非 bool 的 int，
+    action 须为 U、R、D、L 之一，done 与 success 须为 bool；
+    success_rate 须为 [0, 1] 内的有限 float。任何结构、键序、类型、
+    长度、取值或多余字段违约均抛 ValueError；不重算或改写任何汇总
+    字段，亦不修改 data。
+
+    返回紧凑 JSON（ensure_ascii、allow_nan=False、无额外空白）加
+    恰好一个 LF 后编码的 UTF-8 字节；相同输入逐字节一致，仅用标准库。
+    """
+    if not isinstance(data, dict):
+        raise TypeError("data must be a dict")
+    if list(data) != ["episodes", "success_rate"]:
+        raise ValueError(
+            "data must have exactly the keys episodes, success_rate"
+        )
+    episodes = data["episodes"]
+    if not isinstance(episodes, list) or not episodes:
+        raise ValueError("data['episodes'] must be a non-empty list")
+
+    for episode in episodes:
+        if not isinstance(episode, dict) or list(episode) != [
+            "trace",
+            "total_reward",
+            "success",
+        ]:
+            raise ValueError(
+                "every episode must be a dict with keys trace,"
+                " total_reward, success"
+            )
+        total_reward = episode["total_reward"]
+        if isinstance(total_reward, bool) or not isinstance(
+            total_reward, int
+        ):
+            raise ValueError("total_reward must be a non-bool int")
+        if not isinstance(episode["success"], bool):
+            raise ValueError("success must be a bool")
+        trace = episode["trace"]
+        if not isinstance(trace, list) or not trace:
+            raise ValueError("every trace must be a non-empty list")
+        for step in trace:
+            if not isinstance(step, list) or len(step) != 7:
+                raise ValueError(
+                    "every trace step must be a list of seven fields"
+                )
+            r, c, action, next_r, next_c, reward, done = step
+            for name, value in (
+                ("r", r),
+                ("c", c),
+                ("next_r", next_r),
+                ("next_c", next_c),
+                ("reward", reward),
+            ):
+                if isinstance(value, bool) or not isinstance(value, int):
+                    raise ValueError(f"step {name} must be a non-bool int")
+            if not isinstance(action, str) or action not in _ACTIONS:
+                raise ValueError("action must be one of U, R, D, L")
+            if not isinstance(done, bool):
+                raise ValueError("done must be a bool")
+
+    rate = data["success_rate"]
+    if not isinstance(rate, float):
+        raise ValueError("success_rate must be a float")
+    if not math.isfinite(rate) or rate < 0.0 or rate > 1.0:
+        raise ValueError("success_rate must be finite and in [0, 1]")
+
+    return (
+        json.dumps(
+            data,
+            ensure_ascii=True,
+            allow_nan=False,
+            separators=(",", ":"),
+        )
+        + "\n"
+    ).encode("utf-8")
+
+
 def ppo_evaluate_many(
     env, h, seeds, episodes=100, max_steps=1000, window=20, threshold=0.9
 ) -> dict:
