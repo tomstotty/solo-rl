@@ -475,6 +475,102 @@ def watkins_q_lambda(
     return q
 
 
+def replacing_sarsa_lambda(
+    env,
+    episodes=500,
+    alpha=0.5,
+    gamma=0.9,
+    epsilon=0.1,
+    lambda_=0.9,
+    seed=0,
+    max_steps=1000,
+) -> dict:
+    """替换迹 SARSA(λ)，返回 {((row, col), action): float}。
+
+    Q 覆盖从 S 可达的非 G 格与 U/R/D/L 的全部组合，初始为 0.0。
+    每回合 reset，资格迹 E 按 Q 键序置 0.0，先选动作；单回合最多
+    max_steps 步，末步未终止也照常选择下一动作、自举并处理迹后截断。
+    每步 step 后 done 时令 delta=r-Q[s,a] 且不再选动作，否则立即按
+    ε 贪心选 a2（URDL 首个最大 Q 为贪心动作）并令
+    delta=r+gamma*Q[s2,a2]-Q[s,a]。采用替换迹：先按 URDL 令当前状态
+    其他动作 E[s,b]=0.0，再令 E[s,a]=1.0；随后按 Q 键序作
+    Q[k]+=alpha*delta*E[k]，任一新值非有限抛 ValueError；再按 E 键序
+    作 E[k]*=gamma*lambda_。全部随机性来自一个 random.Random(seed)。
+    """
+    if not isinstance(env, GridWorld):
+        raise TypeError("env must be a GridWorld")
+    if isinstance(episodes, bool) or not isinstance(episodes, int):
+        raise TypeError("episodes must be an int")
+    if isinstance(seed, bool) or not isinstance(seed, int):
+        raise TypeError("seed must be an int")
+    if isinstance(alpha, bool) or not isinstance(alpha, (int, float)):
+        raise TypeError("alpha must be an int or float")
+    if isinstance(gamma, bool) or not isinstance(gamma, (int, float)):
+        raise TypeError("gamma must be an int or float")
+    if isinstance(epsilon, bool) or not isinstance(epsilon, (int, float)):
+        raise TypeError("epsilon must be an int or float")
+    if isinstance(lambda_, bool) or not isinstance(lambda_, (int, float)):
+        raise TypeError("lambda_ must be an int or float")
+    if isinstance(max_steps, bool) or not isinstance(max_steps, int):
+        raise TypeError("max_steps must be an int")
+    if episodes <= 0:
+        raise ValueError("episodes must be positive")
+    if not _is_finite_number(alpha) or alpha <= 0 or alpha > 1:
+        raise ValueError("alpha must be finite and in (0, 1]")
+    if not _is_finite_number(gamma) or gamma < 0 or gamma >= 1:
+        raise ValueError("gamma must be finite and in [0, 1)")
+    if not _is_finite_number(epsilon) or epsilon < 0 or epsilon > 1:
+        raise ValueError("epsilon must be finite and in [0, 1]")
+    if not _is_finite_number(lambda_) or lambda_ < 0 or lambda_ > 1:
+        raise ValueError("lambda_ must be finite and in [0, 1]")
+    if max_steps <= 0:
+        raise ValueError("max_steps must be positive")
+
+    actions = tuple(_ACTIONS)  # U, R, D, L
+    states = sorted(
+        state
+        for state in _reachable_cells(env)
+        if env._cell(state) != "G"
+    )
+    q = {(state, action): 0.0 for state in states for action in actions}
+    rng = random.Random(seed)
+
+    def choose_action(state):
+        if rng.random() < epsilon:
+            return actions[rng.randrange(4)]
+        return max(actions, key=lambda a: q[(state, a)])
+
+    for _ in range(episodes):
+        state = env.reset()
+        eligibility = {key: 0.0 for key in q}
+        action = choose_action(state)
+        for _ in range(max_steps):
+            next_state, reward, done = env.step(action)
+            if done:
+                delta = reward - q[(state, action)]
+            else:
+                next_action = choose_action(next_state)
+                delta = (
+                    reward
+                    + gamma * q[(next_state, next_action)]
+                    - q[(state, action)]
+                )
+            for b in actions:
+                if b != action:
+                    eligibility[(state, b)] = 0.0
+            eligibility[(state, action)] = 1.0
+            for key in q:
+                q[key] += alpha * delta * eligibility[key]
+                if not math.isfinite(q[key]):
+                    raise ValueError("Q value must remain finite")
+            for key in eligibility:
+                eligibility[key] *= gamma * lambda_
+            if done:
+                break
+            state, action = next_state, next_action
+    return q
+
+
 def boltzmann_q(
     env,
     episodes=500,
