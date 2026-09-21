@@ -2707,6 +2707,105 @@ def ppo_seed_stability_report(runs) -> dict:
     }
 
 
+def ppo_seed_robustness(runs, minimum=0.8, gap=0.1) -> dict:
+    """汇总多种子 ppo_evaluate_many 结果的鲁棒性，返回判定报告。
+
+    runs 须为至少两项的 list：非 list 抛 TypeError，少于两项抛
+    ValueError。每项须为恰含两元素的 list [seed, payload]：seed 为
+    互异的非 bool int；payload 须完整符合 ppo_evaluate_many 的完整
+    返回契约（即 ppo_reproducibility_report 的单侧输入契约：顶层键序
+    为 results、means、passed、converged，各层结构、类型、范围及
+    means、passed、converged 汇总等式均成立）。runs、项或 payload
+    容器类型错、seed 为 bool 或非 int 抛 TypeError；项长度不为二、
+    seed 重复或 payload 契约违约抛 ValueError。minimum、gap 须为非
+    bool 的 int/float，类型错抛 TypeError，非有限或越出 [0, 1] 抛
+    ValueError。先全量校验全部参数再计算，任一失败都不返回部分结果，
+    且不修改输入。
+
+    设 n 为项数。S 为各 payload.means.success 按输入序从 0.0 累加后
+    除以 n 所得 float；L 仅对非 None 的 means.last_window 同算，无项
+    时 L 为 None，否则为 float；R 为 payload.converged 为 True 的项数
+    除以 n 所得 float。若某项 abs(means.success - S) > gap，其 seed
+    为离群。返回键序为 robust、rate、means、failed、outliers：rate
+    为 R；means 为 [S, L]；failed 按输入序收集 converged 为 False 的
+    seed；outliers 按输入序收集离群 seed；robust 当且仅当
+    R >= minimum 且 outliers 为空。相同输入逐值一致，仅用标准库，不
+    引入命令行入口。
+    """
+    if not isinstance(runs, list):
+        raise TypeError("runs must be a list")
+    if len(runs) < 2:
+        raise ValueError("runs must contain at least two entries")
+    if isinstance(minimum, bool) or not isinstance(minimum, (int, float)):
+        raise TypeError("minimum must be an int or float")
+    if isinstance(gap, bool) or not isinstance(gap, (int, float)):
+        raise TypeError("gap must be an int or float")
+    if not _is_finite_number(minimum) or minimum < 0 or minimum > 1:
+        raise ValueError("minimum must be finite and in [0, 1]")
+    if not _is_finite_number(gap) or gap < 0 or gap > 1:
+        raise ValueError("gap must be finite and in [0, 1]")
+
+    validated = []
+    seen_seeds = set()
+    for index, item in enumerate(runs):
+        if not isinstance(item, list):
+            raise TypeError(f"runs[{index}] must be a list")
+        if len(item) != 2:
+            raise ValueError(
+                f"runs[{index}] must have exactly two elements"
+            )
+        seed, payload = item
+        if isinstance(seed, bool) or not isinstance(seed, int):
+            raise TypeError(f"runs[{index}] seed must be a non-bool int")
+        if seed in seen_seeds:
+            raise ValueError(f"runs[{index}] seed must be distinct")
+        seen_seeds.add(seed)
+        if not isinstance(payload, dict):
+            raise TypeError(f"runs[{index}] payload must be a dict")
+        _validate_evaluate_many_payload(
+            payload, f"runs[{index}] payload"
+        )
+        validated.append((seed, payload))
+
+    n = len(validated)
+    success_total = 0.0
+    for _, payload in validated:
+        success_total += payload["means"]["success"]
+    success_mean = success_total / n
+
+    last_window_total = 0.0
+    last_window_count = 0
+    for _, payload in validated:
+        last_window = payload["means"]["last_window"]
+        if last_window is not None:
+            last_window_total += last_window
+            last_window_count += 1
+    last_window_mean = (
+        last_window_total / last_window_count if last_window_count else None
+    )
+
+    converged_count = sum(
+        1 for _, payload in validated if payload["converged"]
+    )
+    rate = converged_count / n
+
+    failed = [
+        seed for seed, payload in validated if not payload["converged"]
+    ]
+    outliers = [
+        seed
+        for seed, payload in validated
+        if abs(payload["means"]["success"] - success_mean) > gap
+    ]
+    return {
+        "robust": rate >= minimum and not outliers,
+        "rate": rate,
+        "means": [success_mean, last_window_mean],
+        "failed": failed,
+        "outliers": outliers,
+    }
+
+
 def convergence_report(
     episode_results, window=20, tolerance=0.01, patience=3
 ) -> dict:
