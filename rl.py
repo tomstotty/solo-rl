@@ -2806,6 +2806,112 @@ def ppo_seed_robustness(runs, minimum=0.8, gap=0.1) -> dict:
     }
 
 
+def _validate_seed_runs(runs, name):
+    """按 ppo_seed_robustness 的 runs 契约校验并返回 [(seed, payload)]。"""
+    if not isinstance(runs, list):
+        raise TypeError(f"{name} must be a list")
+    if len(runs) < 2:
+        raise ValueError(f"{name} must contain at least two entries")
+    validated = []
+    seen_seeds = set()
+    for index, item in enumerate(runs):
+        if not isinstance(item, list):
+            raise TypeError(f"{name}[{index}] must be a list")
+        if len(item) != 2:
+            raise ValueError(
+                f"{name}[{index}] must have exactly two elements"
+            )
+        seed, payload = item
+        if isinstance(seed, bool) or not isinstance(seed, int):
+            raise TypeError(f"{name}[{index}] seed must be a non-bool int")
+        if seed in seen_seeds:
+            raise ValueError(f"{name}[{index}] seed must be distinct")
+        seen_seeds.add(seed)
+        if not isinstance(payload, dict):
+            raise TypeError(f"{name}[{index}] payload must be a dict")
+        _validate_evaluate_many_payload(
+            payload, f"{name}[{index}] payload"
+        )
+        validated.append((seed, payload))
+    return validated
+
+
+def ppo_seed_regression(base, new, gap=0.0) -> dict:
+    """逐种子对比两组 ppo_evaluate_many 结果，返回回归判定报告。
+
+    base、new 均须满足 ppo_seed_robustness 的 runs 输入契约与异常：
+    至少两项的 list，每项为恰含两元素的 list [seed, payload]，seed
+    为互异的非 bool int，payload 完整符合 ppo_evaluate_many 的返回
+    契约；容器类型错、seed 为 bool 或非 int 抛 TypeError，项长度不
+    为二、seed 重复或 payload 契约违约抛 ValueError。base 与 new 的
+    seed 集合必须相同（顺序可不同），否则抛 ValueError。gap 须为非
+    bool 的 int/float，类型错抛 TypeError，非有限或越出 [0, 1] 抛
+    ValueError。先全量校验全部参数再计算，任一失败都不返回部分结
+    果，且不修改输入。
+
+    校验通过后按 base 顺序逐种子配对。每对取
+    ds = new.means.success - base.means.success；当两侧
+    means.last_window 均非 None 时同法取 dl，否则 dl 为 None。返回
+    键序为 passed、rows、means、improved、degraded：rows 各项为
+    [seed, ds, dl]；means 为 [S, L]，S 为全部 ds 按 rows 序从 0.0
+    累加后除以项数所得 float 均值，L 为非 None 的 dl 同法所得均
+    值、无项时为 None；improved、degraded 按 rows 序分别收集
+    ds > gap 与 ds < -gap 的 seed；passed 当且仅当 S >= gap 且
+    degraded 为空。ds、S 及非 None 的 dl、L 均为 float。相同输入逐
+    值一致，仅用标准库，不引入命令行入口。
+    """
+    base_validated = _validate_seed_runs(base, "base")
+    new_validated = _validate_seed_runs(new, "new")
+    if isinstance(gap, bool) or not isinstance(gap, (int, float)):
+        raise TypeError("gap must be an int or float")
+    if not _is_finite_number(gap) or gap < 0 or gap > 1:
+        raise ValueError("gap must be finite and in [0, 1]")
+
+    new_by_seed = dict(new_validated)
+    if {seed for seed, _ in base_validated} != set(new_by_seed):
+        raise ValueError("base and new must have the same seed set")
+
+    rows = []
+    improved = []
+    degraded = []
+    success_total = 0.0
+    last_window_total = 0.0
+    last_window_count = 0
+    for seed, base_payload in base_validated:
+        new_payload = new_by_seed[seed]
+        ds = float(
+            new_payload["means"]["success"]
+            - base_payload["means"]["success"]
+        )
+        base_last_window = base_payload["means"]["last_window"]
+        new_last_window = new_payload["means"]["last_window"]
+        if base_last_window is not None and new_last_window is not None:
+            dl = float(new_last_window - base_last_window)
+            last_window_total += dl
+            last_window_count += 1
+        else:
+            dl = None
+        rows.append([seed, ds, dl])
+        success_total += ds
+        if ds > gap:
+            improved.append(seed)
+        if ds < -gap:
+            degraded.append(seed)
+
+    n = len(rows)
+    success_mean = success_total / n
+    last_window_mean = (
+        last_window_total / last_window_count if last_window_count else None
+    )
+    return {
+        "passed": success_mean >= gap and not degraded,
+        "rows": rows,
+        "means": [success_mean, last_window_mean],
+        "improved": improved,
+        "degraded": degraded,
+    }
+
+
 def convergence_report(
     episode_results, window=20, tolerance=0.01, patience=3
 ) -> dict:
