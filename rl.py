@@ -2175,6 +2175,97 @@ def ppo_reproducibility_fingerprint(data) -> dict:
     }
 
 
+_HEX_DIGITS = frozenset("0123456789abcdef")
+
+
+def _validate_fingerprint_payload(data, name):
+    """校验一份指纹结构，返回 (总体摘要, 逐项摘要 list)，不修改输入。"""
+    if list(data) != ["algorithm", "fingerprint", "results"]:
+        raise ValueError(
+            f"{name} must have exactly the keys algorithm, fingerprint,"
+            " results"
+        )
+    algorithm = data["algorithm"]
+    if not isinstance(algorithm, str):
+        raise TypeError(f"{name} algorithm must be a str")
+    if algorithm != "sha256":
+        raise ValueError(f"{name} algorithm must be 'sha256'")
+
+    fingerprint = data["fingerprint"]
+    if not isinstance(fingerprint, str):
+        raise TypeError(f"{name} fingerprint must be a str")
+    if len(fingerprint) != 64 or any(
+        char not in _HEX_DIGITS for char in fingerprint
+    ):
+        raise ValueError(
+            f"{name} fingerprint must be a 64-character lowercase hex"
+            " string"
+        )
+
+    results = data["results"]
+    if not isinstance(results, list):
+        raise TypeError(f"{name} results must be a list")
+    if not results:
+        raise ValueError(f"{name} results must be non-empty")
+    for index, digest in enumerate(results):
+        if not isinstance(digest, str):
+            raise TypeError(f"{name} results[{index}] must be a str")
+        if len(digest) != 64 or any(
+            char not in _HEX_DIGITS for char in digest
+        ):
+            raise ValueError(
+                f"{name} results[{index}] must be a 64-character"
+                " lowercase hex string"
+            )
+    return fingerprint, results
+
+
+def ppo_reproducibility_fingerprint_compare(left, right) -> dict:
+    """逐位置比较两份 ppo_reproducibility_fingerprint 返回值。
+
+    left、right 须为 dict，否则抛 TypeError；各自键序须恰为
+    algorithm、fingerprint、results：algorithm 须为 "sha256"，
+    fingerprint 须为 64 位小写十六进制 str，results 须为非空 list，
+    成员为同格式 str（重复摘要允许，按位置处理）。字段类型错抛
+    TypeError；键序、空列表、算法值或摘要格式错抛 ValueError。两侧
+    均完整校验通过后才比较，不修改输入，也不返回部分结果。
+
+    两侧 results 长度不同抛 ValueError。返回键序为 identical、results、
+    mismatches：results 为与输入摘要列表等长的 bool 列表，依次表示同
+    位置摘要是否相等；mismatches 为所有不等位置的升序零基 int 列表；
+    identical 仅当总体 fingerprint 相等且 results 全为 True。相同输入
+    及深拷贝逐值一致，仅用标准库，不引入命令行入口。
+    """
+    if not isinstance(left, dict):
+        raise TypeError("left must be a dict")
+    if not isinstance(right, dict):
+        raise TypeError("right must be a dict")
+    left_fingerprint, left_results = _validate_fingerprint_payload(
+        left, "left"
+    )
+    right_fingerprint, right_results = _validate_fingerprint_payload(
+        right, "right"
+    )
+    if len(left_results) != len(right_results):
+        raise ValueError(
+            "left and right results lists must have equal length"
+        )
+
+    equal_flags = [
+        left_digest == right_digest
+        for left_digest, right_digest in zip(left_results, right_results)
+    ]
+    mismatches = [
+        index for index, equal in enumerate(equal_flags) if not equal
+    ]
+    return {
+        "identical": left_fingerprint == right_fingerprint
+        and all(equal_flags),
+        "results": equal_flags,
+        "mismatches": mismatches,
+    }
+
+
 def convergence_report(
     episode_results, window=20, tolerance=0.01, patience=3
 ) -> dict:
