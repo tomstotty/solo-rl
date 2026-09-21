@@ -1636,6 +1636,110 @@ def vtrace(
     return {"values": vs, "advantages": advantages}
 
 
+def retrace(transitions, gamma=0.9, lambda_=0.9) -> dict:
+    """Retrace(λ) 离轨优势递推，返回固定键序 targets、advantages 的 dict。
+
+    transitions 须为非空 list/tuple，每项为六项 list
+    [r, v, n, b, p, d]：奖励 r、当前值 v、下一值 n、行为动作对数
+    概率 b、目标动作对数概率 p、终止标记 d。前五项为非 bool 的
+    int/float，d 为 bool；gamma、lambda_ 为非 bool 的 int/float
+    标量且均须在 [0, 1]。前五项先复制并转换为 float（转换溢出或
+    结果非有限均抛 ValueError），不修改输入。逐项令
+    z=exp(p-b)（上溢抛 ValueError，下溢为 0.0 合法）、
+    c=lambda_*min(1.0, z)。自 a=0.0、nc=0.0 逆序递推
+    delta=r+gamma*(0.0 if d else n)-v、
+    a=delta+gamma*(0.0 if d else nc*a)，保存优势 a 与目标 v+a，
+    再令 nc=c。对数差、中间量或输出非有限均抛 ValueError。两个
+    列表均按原时序排列为 float 新 list。
+    """
+    if not isinstance(transitions, (list, tuple)):
+        raise TypeError("transitions must be a list or tuple")
+    if len(transitions) == 0:
+        raise ValueError("transitions must be non-empty")
+
+    def _to_float(item, name):
+        if isinstance(item, bool) or not isinstance(item, (int, float)):
+            raise TypeError(f"{name} must contain only int or float")
+        try:
+            result = float(item)
+        except OverflowError:
+            raise ValueError(f"{name} must convert to a finite float")
+        if not math.isfinite(result):
+            raise ValueError(f"{name} must contain only finite numbers")
+        return result
+
+    rows = []
+    for row in transitions:
+        if not isinstance(row, list):
+            raise TypeError("every transition must be a list")
+        if len(row) != 6:
+            raise ValueError(
+                "every transition must have exactly six elements"
+            )
+        r = _to_float(row[0], "reward")
+        v = _to_float(row[1], "value")
+        n = _to_float(row[2], "next_value")
+        b = _to_float(row[3], "behavior")
+        p = _to_float(row[4], "target")
+        d = row[5]
+        if not isinstance(d, bool):
+            raise TypeError("done flag must be a bool")
+        rows.append((r, v, n, b, p, d))
+
+    def _to_scalar(item, name):
+        if isinstance(item, bool) or not isinstance(item, (int, float)):
+            raise TypeError(f"{name} must be an int or float")
+        try:
+            result = float(item)
+        except OverflowError:
+            raise ValueError(f"{name} must convert to a finite float")
+        if not math.isfinite(result):
+            raise ValueError(f"{name} must be finite")
+        return result
+
+    g = _to_scalar(gamma, "gamma")
+    l = _to_scalar(lambda_, "lambda_")
+    if g < 0.0 or g > 1.0:
+        raise ValueError("gamma must be in [0, 1]")
+    if l < 0.0 or l > 1.0:
+        raise ValueError("lambda_ must be in [0, 1]")
+
+    T = len(rows)
+    c_values = [0.0] * T
+    for t in range(T):
+        _r, _v, _n, b, p, _d = rows[t]
+        diff = p - b
+        if not math.isfinite(diff):
+            raise ValueError("log-prob difference must be finite")
+        try:
+            z = math.exp(diff)
+        except OverflowError:
+            raise ValueError("importance ratio exp overflow")
+        c_values[t] = l * min(1.0, z)
+        if not math.isfinite(c_values[t]):
+            raise ValueError("retrace trace-cutting coefficient must be finite")
+
+    targets = [0.0] * T
+    advantages = [0.0] * T
+    a = 0.0
+    nc = 0.0
+    for t in range(T - 1, -1, -1):
+        r, v, n, _b, _p, d = rows[t]
+        delta = r + g * (0.0 if d else n) - v
+        if not math.isfinite(delta):
+            raise ValueError("retrace delta must be finite")
+        a = delta + g * (0.0 if d else nc * a)
+        if not math.isfinite(a):
+            raise ValueError("advantage must be finite")
+        target = v + a
+        if not math.isfinite(target):
+            raise ValueError("target must be finite")
+        advantages[t] = a
+        targets[t] = target
+        nc = c_values[t]
+    return {"targets": targets, "advantages": advantages}
+
+
 def ppo_clipped_surrogate(
     old_log_probs, new_log_probs, advantages, clip_epsilon=0.2
 ) -> dict:
