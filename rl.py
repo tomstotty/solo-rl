@@ -3145,6 +3145,179 @@ def ppo_minibatch(
     }
 
 
+def ppo_minibatch_kl(
+    logits,
+    batch,
+    batch_size=32,
+    lr=0.05,
+    c=0.2,
+    epochs=4,
+    target_kl=0.01,
+    seed=0,
+) -> dict:
+    """带 KL 早停的小批量 PPO 多轮 logits 更新，返回固定键序 logits、
+    objectives、probabilities、kls、stopped 的 dict。
+
+    logits、batch、batch_size、lr、c、epochs、seed 的校验、洗牌、切批
+    及随机消费逐项沿用 ppo_minibatch；target_kl 须为非 bool 的
+    int/float，类型不符抛 TypeError，转 float 溢出、非有限或 <=0 抛
+    ValueError，校验后记为 t。全部参数先校验完毕且不修改输入，随后
+    仅建一个 random.Random(seed)，复制 logits 为 L。
+
+    每轮 Fisher–Yates 洗牌后连续切批（尾批保留），依序对每个小批调用
+    ppo_update(L, sub, lr, c, 1)，以返回的 logits 续训，并顺序收集各
+    小批 objectives[0]。轮末按 batch 原序，以当前 L 的稳定
+    log-softmax 重算各样本所选动作的 new_logp，从 0.0 顺序累加
+    old_logp-new_logp，除以样本数得 float KL 并收集；任一新量非有限
+    抛 ValueError。若 KL>t，保留本轮更新并立即结束（stopped=True），
+    否则最多执行 epochs 轮。返回最终 L、展平的各小批目标 float 列表、
+    最终稳定 softmax 二维 float 表、逐轮 KL float 列表与是否出现
+    KL>t 的 bool；均为新容器，同输入同 seed 逐值一致。
+    """
+    if not isinstance(logits, list):
+        raise TypeError("logits must be a list")
+    if not logits:
+        raise ValueError("logits must be non-empty")
+    width = None
+    for row in logits:
+        if not isinstance(row, list):
+            raise TypeError("every row of logits must be a list")
+        if not row:
+            raise ValueError("every row of logits must be non-empty")
+        if width is None:
+            width = len(row)
+        elif len(row) != width:
+            raise ValueError("logits must be rectangular")
+        for item in row:
+            if not isinstance(item, float):
+                raise TypeError("logits must contain only float")
+            if not math.isfinite(item):
+                raise ValueError("logits must contain only finite float")
+    n_rows = len(logits)
+    n_cols = width
+
+    if not isinstance(batch, list):
+        raise TypeError("batch must be a list")
+    if not batch:
+        raise ValueError("batch must be non-empty")
+    samples = []
+    for item in batch:
+        if not isinstance(item, list):
+            raise TypeError("every batch item must be a list")
+        if len(item) != 4:
+            raise ValueError("every batch item must have exactly four elements")
+        s, a, o, adv = item
+        if isinstance(s, bool) or not isinstance(s, int):
+            raise TypeError("state index must be a non-bool int")
+        if isinstance(a, bool) or not isinstance(a, int):
+            raise TypeError("action index must be a non-bool int")
+        if not 0 <= s < n_rows:
+            raise ValueError("state index out of range")
+        if not 0 <= a < n_cols:
+            raise ValueError("action index out of range")
+        if not isinstance(o, float):
+            raise TypeError("old log-prob must be a float")
+        if not math.isfinite(o):
+            raise ValueError("old log-prob must be finite")
+        if not isinstance(adv, float):
+            raise TypeError("advantage must be a float")
+        if not math.isfinite(adv):
+            raise ValueError("advantage must be finite")
+        samples.append((s, a, o, adv))
+
+    if not isinstance(lr, float):
+        raise TypeError("lr must be a float")
+    if not math.isfinite(lr):
+        raise ValueError("lr must be finite")
+    if lr <= 0.0 or lr > 1.0:
+        raise ValueError("lr must be in (0, 1]")
+    if not isinstance(c, float):
+        raise TypeError("c must be a float")
+    if not math.isfinite(c):
+        raise ValueError("c must be finite")
+    if c < 0.0 or c >= 1.0:
+        raise ValueError("c must be in [0, 1)")
+    if isinstance(batch_size, bool) or not isinstance(batch_size, int):
+        raise TypeError("batch_size must be a non-bool int")
+    if isinstance(epochs, bool) or not isinstance(epochs, int):
+        raise TypeError("epochs must be a non-bool int")
+    if isinstance(seed, bool) or not isinstance(seed, int):
+        raise TypeError("seed must be a non-bool int")
+    if batch_size <= 0:
+        raise ValueError("batch_size must be positive")
+    if epochs <= 0:
+        raise ValueError("epochs must be positive")
+    if isinstance(target_kl, bool) or not isinstance(
+        target_kl, (int, float)
+    ):
+        raise TypeError("target_kl must be an int or float")
+    try:
+        t = float(target_kl)
+    except OverflowError:
+        raise ValueError("target_kl must convert to a finite float")
+    if not math.isfinite(t) or t <= 0.0:
+        raise ValueError("target_kl must be finite and > 0")
+
+    def _selected_logp(row, action_index):
+        """与 ppo_update 相同的稳定 log-softmax，返回所选动作列的 logp。"""
+        m = max(row)
+        total = 0.0
+        for value in row:
+            total += math.exp(value - m)
+        if not math.isfinite(total):
+            raise ValueError("softmax normalizer must be finite")
+        log_total = math.log(total)
+        q_a = row[action_index] - m - log_total
+        if not math.isfinite(q_a):
+            raise ValueError("log-probabilities must be finite")
+        return q_a
+
+    rng = random.Random(seed)
+    L = [list(row) for row in logits]
+    n_batch = len(batch)
+    objectives = []
+    kls = []
+    probabilities = []
+    stopped = False
+    for _ in range(epochs):
+        order = list(range(n_batch))
+        for i in range(n_batch - 1, 0, -1):
+            j = rng.randrange(i + 1)
+            order[i], order[j] = order[j], order[i]
+        for start in range(0, n_batch, batch_size):
+            sub = [batch[order[k]] for k in range(
+                start, min(start + batch_size, n_batch)
+            )]
+            result = ppo_update(L, sub, lr, c, 1)
+            L = result["logits"]
+            probabilities = result["probabilities"]
+            objectives.append(result["objectives"][0])
+        kl_sum = 0.0
+        for s, a, o, _adv in samples:
+            new_logp = _selected_logp(L[s], a)
+            diff = o - new_logp
+            if not math.isfinite(diff):
+                raise ValueError("KL term must be finite")
+            kl_sum += diff
+            if not math.isfinite(kl_sum):
+                raise ValueError("KL sum must be finite")
+        kl = kl_sum / len(samples)
+        if not math.isfinite(kl):
+            raise ValueError("KL must be finite")
+        kls.append(kl)
+        if kl > t:
+            stopped = True
+            break
+
+    return {
+        "logits": L,
+        "objectives": objectives,
+        "probabilities": probabilities,
+        "kls": kls,
+        "stopped": stopped,
+    }
+
+
 def ppo_update_kl(
     logits, batch, lr=0.05, c=0.2, epochs=4, target_kl=0.01
 ) -> dict:
