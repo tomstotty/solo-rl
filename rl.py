@@ -1642,6 +1642,124 @@ def ppo_evaluate(
     }
 
 
+def ppo_evaluate_trace(env, h, episodes=100, max_steps=1000, seed=0) -> dict:
+    """按 softmax 策略评估 PPO 风格 logits 表，返回可逐步复现的轨迹。
+
+    参数合法域及 TypeError/ValueError 分类与 ppo_evaluate 同名参数
+    一致（无 window、threshold）；评估前同样将每行 r、c 转为 int，
+    按 U/R/D/L 映射为偏好表，且不修改 h。每回合 reset，单回合最多
+    max_steps 步；URDL 稳定 softmax 及单个 random.Random(seed)
+    每步恰取一次 random 的消费顺序均沿用 ppo_evaluate。
+
+    每步追加 [r, c, action, next_r, next_c, reward, done]：r、c 为
+    调用 step 前状态，next_r、next_c 为返回状态，坐标与 reward 为
+    int，action 为 str，done 为 bool。到达 G 立即结束；到达步限
+    截断时保留末步且末步 done=False。
+
+    返回键依次为 episodes、success_rate；episodes 为回合 dict 列表，
+    各项键序 trace、total_reward、success，trace 为步记录列表，
+    total_reward 为未折扣 int 和，success 仅表示是否到达 G；
+    success_rate 为成功数除以回合数的 float。相同输入与 seed
+    逐值一致。
+    """
+    if not isinstance(env, GridWorld):
+        raise TypeError("env must be a GridWorld")
+    if not isinstance(h, list):
+        raise TypeError("h must be a list")
+    if isinstance(episodes, bool) or not isinstance(episodes, int):
+        raise TypeError("episodes must be an int")
+    if isinstance(max_steps, bool) or not isinstance(max_steps, int):
+        raise TypeError("max_steps must be an int")
+    if isinstance(seed, bool) or not isinstance(seed, int):
+        raise TypeError("seed must be an int")
+    if episodes <= 0:
+        raise ValueError("episodes must be positive")
+    if max_steps <= 0:
+        raise ValueError("max_steps must be positive")
+
+    actions = tuple(_ACTIONS)  # U, R, D, L
+    states = sorted(
+        state
+        for state in _reachable_cells(env)
+        if env._cell(state) != "G"
+    )
+    if not h:
+        raise ValueError("h must be non-empty")
+    if len(h) != len(states):
+        raise ValueError(
+            "h must have exactly one row per reachable non-G cell"
+        )
+    preferences = {}
+    for row, (er, ec) in zip(h, states):
+        if not isinstance(row, list):
+            raise TypeError("every row of h must be a list")
+        if len(row) != 6:
+            raise ValueError(
+                "every row of h must have exactly six elements"
+            )
+        for item in row:
+            if not isinstance(item, float):
+                raise TypeError("h rows must contain only float")
+            if not math.isfinite(item):
+                raise ValueError("h rows must contain only finite float")
+        if row[0] != float(er) or row[1] != float(ec):
+            raise ValueError(
+                "h rows must match the reachable non-G coordinates"
+                " in ascending order"
+            )
+        state = (int(row[0]), int(row[1]))
+        for action, logit in zip(actions, row[2:]):
+            preferences[(state, action)] = logit
+
+    rng = random.Random(seed)
+    episode_records = []
+    successes = 0
+    for _ in range(episodes):
+        state = env.reset()
+        trace = []
+        total_reward = 0
+        success = False
+        for _ in range(max_steps):
+            r, c = state
+            m = max(preferences[(state, a)] for a in actions)
+            weights = [
+                math.exp(preferences[(state, a)] - m) for a in actions
+            ]
+            total = sum(weights)
+            probs = [weight / total for weight in weights]
+            u = rng.random()
+            cumulative = 0.0
+            action = "L"
+            for a, p_a in zip(actions, probs):
+                cumulative += p_a
+                if cumulative > u:
+                    action = a
+                    break
+            next_state, reward, done = env.step(action)
+            next_r, next_c = next_state
+            trace.append(
+                [r, c, action, next_r, next_c, reward, done]
+            )
+            total_reward += reward
+            state = next_state
+            if done:
+                success = True
+                break
+        if success:
+            successes += 1
+        episode_records.append(
+            {
+                "trace": trace,
+                "total_reward": total_reward,
+                "success": success,
+            }
+        )
+    return {
+        "episodes": episode_records,
+        "success_rate": successes / episodes,
+    }
+
+
 def ppo_evaluate_many(
     env, h, seeds, episodes=100, max_steps=1000, window=20, threshold=0.9
 ) -> dict:
