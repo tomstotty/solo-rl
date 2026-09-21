@@ -4850,6 +4850,212 @@ def ppo_trace_bytes(data) -> bytes:
     ).encode("utf-8")
 
 
+def _parse_json(text, index):
+    """严格解析规范紧凑 JSON（无任何空白），返回 (value, next_index)。
+
+    保留对象键序；重复键抛 ValueError；不接受 NaN/Infinity；
+    非 ASCII 原始字符一律拒绝（只能以 \\u 转义出现）；数值按拼写
+    区分 int 与 float。
+    """
+
+    def fail(pos, message):
+        raise ValueError(f"invalid JSON at position {pos}: {message}")
+
+    ch = text[index]
+    if ch == '"':
+        chars = []
+        pos = index + 1
+        while True:
+            if pos >= len(text):
+                fail(pos, "unterminated string")
+            cur = text[pos]
+            if cur == '"':
+                return "".join(chars), pos + 1
+            if cur == "\\":
+                pos += 1
+                if pos >= len(text):
+                    fail(pos, "unterminated escape")
+                esc = text[pos]
+                simple = {
+                    '"': '"',
+                    "\\": "\\",
+                    "/": "/",
+                    "b": "\b",
+                    "f": "\f",
+                    "n": "\n",
+                    "r": "\r",
+                    "t": "\t",
+                }
+                if esc in simple:
+                    chars.append(simple[esc])
+                elif esc == "u":
+                    digits = text[pos + 1 : pos + 5]
+                    if len(digits) != 4 or any(
+                        d not in "0123456789abcdefABCDEF" for d in digits
+                    ):
+                        fail(pos, "invalid \\u escape")
+                    code = int(digits, 16)
+                    if 0xD800 <= code <= 0xDBFF:
+                        pair = text[pos + 5 : pos + 11]
+                        if (
+                            len(pair) == 6
+                            and pair[0] == "\\"
+                            and pair[1] == "u"
+                            and all(
+                                d in "0123456789abcdefABCDEF"
+                                for d in pair[2:]
+                            )
+                        ):
+                            low = int(pair[2:], 16)
+                            if 0xDC00 <= low <= 0xDFFF:
+                                code = (
+                                    0x10000
+                                    + ((code - 0xD800) << 10)
+                                    + (low - 0xDC00)
+                                )
+                                pos += 6
+                    chars.append(chr(code))
+                    pos += 4
+                else:
+                    fail(pos, "invalid escape")
+                pos += 1
+            else:
+                if ord(cur) < 0x20:
+                    fail(pos, "unescaped control character in string")
+                chars.append(cur)
+                pos += 1
+    if ch == "{":
+        obj = {}
+        pos = index + 1
+        if pos < len(text) and text[pos] == "}":
+            return obj, pos + 1
+        while True:
+            if pos >= len(text) or text[pos] != '"':
+                fail(pos, "expected string key")
+            key, pos = _parse_json(text, pos)
+            if pos >= len(text) or text[pos] != ":":
+                fail(pos, "expected ':'")
+            value, pos = _parse_json(text, pos + 1)
+            if key in obj:
+                fail(index, f"duplicate object key {key!r}")
+            obj[key] = value
+            if pos >= len(text):
+                fail(pos, "unterminated object")
+            if text[pos] == "}":
+                return obj, pos + 1
+            if text[pos] != ",":
+                fail(pos, "expected ',' or '}'")
+            pos += 1
+    if ch == "[":
+        arr = []
+        pos = index + 1
+        if pos < len(text) and text[pos] == "]":
+            return arr, pos + 1
+        while True:
+            value, pos = _parse_json(text, pos)
+            arr.append(value)
+            if pos >= len(text):
+                fail(pos, "unterminated array")
+            if text[pos] == "]":
+                return arr, pos + 1
+            if text[pos] != ",":
+                fail(pos, "expected ',' or ']'")
+            pos += 1
+    if text.startswith("true", index):
+        return True, index + 4
+    if text.startswith("false", index):
+        return False, index + 5
+    if text.startswith("null", index):
+        return None, index + 4
+    if ch == "-" or "0" <= ch <= "9":
+        start = index
+        pos = index
+        if text[pos] == "-":
+            pos += 1
+            if pos >= len(text):
+                fail(pos, "invalid number")
+        if text[pos] == "0":
+            pos += 1
+        elif "1" <= text[pos] <= "9":
+            pos += 1
+            while pos < len(text) and "0" <= text[pos] <= "9":
+                pos += 1
+        else:
+            fail(pos, "invalid number")
+        is_float = False
+        if pos < len(text) and text[pos] == ".":
+            is_float = True
+            frac_start = pos + 1
+            pos += 1
+            if (
+                pos >= len(text)
+                or not "0" <= text[pos] <= "9"
+            ):
+                fail(pos, "invalid fraction")
+            while pos < len(text) and "0" <= text[pos] <= "9":
+                pos += 1
+        if pos < len(text) and text[pos] in "eE":
+            is_float = True
+            pos += 1
+            if pos < len(text) and text[pos] in "+-":
+                pos += 1
+            if pos >= len(text) or not "0" <= text[pos] <= "9":
+                fail(pos, "invalid exponent")
+            while pos < len(text) and "0" <= text[pos] <= "9":
+                pos += 1
+        token = text[start:pos]
+        if is_float:
+            value = float(token)
+            if not math.isfinite(value):
+                fail(start, "number out of finite range")
+            return value, pos
+        return int(token), pos
+    fail(index, "unexpected character")
+
+
+def ppo_trace_from_bytes(payload) -> dict:
+    """将 ppo_trace_bytes 的字节产物严格解析回 PPO 轨迹结构。
+
+    payload 须恰为 bytes（bytearray、memoryview 等均不接受），否则
+    抛 TypeError；空字节、非严格 UTF-8、BOM、JSON 语法错误或根值
+    后存在尾随内容、重复对象键、NaN/Infinity/-Infinity、根值非
+    dict，或结果在任一层违反 ppo_trace_bytes 的输入契约，均抛
+    ValueError。仅接受规范单行紧凑 ASCII JSON：无任何多余空白，
+    末尾恰一个 LF。
+
+    解析保留对象键序；数值按 JSON 拼写区分 int/float（带小数点或
+    指数者为 float），-0.0 等拼写以重编码字节核对。得到 data 后
+    计算 canonical = ppo_trace_bytes(data)，仅当 canonical 与
+    payload 逐字节相等时返回 data，否则抛 ValueError；不重算任何
+    汇总字段。返回独立新容器，同一 payload 多次解析逐值一致。仅
+    用标准库，不引入命令行入口。
+    """
+    if not isinstance(payload, bytes):
+        raise TypeError("payload must be bytes")
+    if not payload:
+        raise ValueError("payload must not be empty")
+    if payload.startswith(b"\xef\xbb\xbf"):
+        raise ValueError("payload must not contain a BOM")
+    try:
+        text = payload.decode("utf-8")
+    except UnicodeDecodeError as exc:
+        raise ValueError("payload must be valid UTF-8") from exc
+    if len(text) < 2 or not text.endswith("\n") or text[-2] == "\n":
+        raise ValueError("payload must end with exactly one LF")
+    body = text[:-1]
+
+    data, end = _parse_json(body, 0)
+    if end != len(body):
+        raise ValueError("payload has trailing content after JSON")
+    if not isinstance(data, dict):
+        raise ValueError("payload root value must be an object")
+
+    canonical = ppo_trace_bytes(data)
+    if canonical != payload:
+        raise ValueError("payload is not canonical ppo_trace_bytes output")
+    return data
+
+
 def _format_value(value):
     if abs(value) < 0.5e-12:
         value = 0.0
