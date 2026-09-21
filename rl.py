@@ -15,6 +15,8 @@ _ACTIONS = {
 
 _VALID_CELLS = frozenset("S.G#")
 
+_LOWER_HEX_DIGITS = frozenset("0123456789abcdef")
+
 
 def _is_finite_number(value):
     """有限性判定，且不对大整数做 float 转换（避免 OverflowError）。"""
@@ -2172,6 +2174,97 @@ def ppo_reproducibility_fingerprint(data) -> dict:
         "algorithm": "sha256",
         "fingerprint": _fingerprint_hex(data),
         "results": result_fingerprints,
+    }
+
+
+def _validate_fingerprint_payload(data, name):
+    """校验一份 ppo_reproducibility_fingerprint 返回值的结构。"""
+    if not isinstance(data, dict):
+        raise TypeError(f"{name} must be a dict")
+    if list(data) != ["algorithm", "fingerprint", "results"]:
+        raise ValueError(
+            f"{name} must have exactly the keys algorithm, fingerprint,"
+            " results"
+        )
+    algorithm = data["algorithm"]
+    if not isinstance(algorithm, str):
+        raise TypeError(f"{name} algorithm must be a str")
+    if algorithm != "sha256":
+        raise ValueError(f"{name} algorithm must be 'sha256'")
+    fingerprint = data["fingerprint"]
+    if not isinstance(fingerprint, str):
+        raise TypeError(f"{name} fingerprint must be a str")
+    if len(fingerprint) != 64 or any(
+        char not in _LOWER_HEX_DIGITS for char in fingerprint
+    ):
+        raise ValueError(
+            f"{name} fingerprint must be a 64-character lowercase"
+            " hexadecimal str"
+        )
+    results = data["results"]
+    if not isinstance(results, list):
+        raise TypeError(f"{name} results must be a list")
+    if not results:
+        raise ValueError(f"{name} results must be non-empty")
+    for index, digest in enumerate(results):
+        if not isinstance(digest, str):
+            raise TypeError(
+                f"{name} results[{index}] must be a str"
+            )
+        if len(digest) != 64 or any(
+            char not in _LOWER_HEX_DIGITS for char in digest
+        ):
+            raise ValueError(
+                f"{name} results[{index}] must be a 64-character"
+                " lowercase hexadecimal str"
+            )
+
+
+def ppo_reproducibility_fingerprint_compare(left, right) -> dict:
+    """比较两份 ppo_reproducibility_fingerprint 返回值，返回比对结果。
+
+    left、right 须为 dict，否则抛 TypeError；各自键序须恰为
+    algorithm、fingerprint、results：algorithm 须为 "sha256"，
+    fingerprint 须为 64 位小写十六进制 str，results 须为非空 list 且
+    成员为同格式 str。字段类型错抛 TypeError，键序、空列表、算法值或
+    摘要格式错抛 ValueError；不修改输入。
+
+    两侧均完整校验后再比较：results 长度不同抛 ValueError，重复摘要
+    按位置处理。返回键序 identical、results、mismatches：results 为与
+    输入摘要列表等长的 bool 列表，依次表示同位置摘要是否相等；
+    mismatches 为所有不等位置的升序零基 int 列表；identical 仅当总体
+    fingerprint 相等且 results 全为 True 时为 True。相同输入及深拷贝
+    逐值一致，仅用标准库，不引入命令行入口。
+    """
+    if not isinstance(left, dict):
+        raise TypeError("left must be a dict")
+    if not isinstance(right, dict):
+        raise TypeError("right must be a dict")
+    _validate_fingerprint_payload(left, "left")
+    _validate_fingerprint_payload(right, "right")
+
+    left_results = left["results"]
+    right_results = right["results"]
+    if len(left_results) != len(right_results):
+        raise ValueError(
+            "left and right results lists must have equal length"
+        )
+
+    equalities = [
+        left_digest == right_digest
+        for left_digest, right_digest in zip(left_results, right_results)
+    ]
+    mismatches = [
+        index for index, equal in enumerate(equalities) if not equal
+    ]
+    identical = (
+        left["fingerprint"] == right["fingerprint"]
+        and all(equalities)
+    )
+    return {
+        "identical": identical,
+        "results": equalities,
+        "mismatches": mismatches,
     }
 
 
