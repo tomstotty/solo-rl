@@ -3173,6 +3173,96 @@ def ppo_update_kl(
     }
 
 
+def ppo_policy_kl(old_logits, new_logits) -> dict:
+    """新旧策略逐行 KL 散度，返回固定键序 rows、mean、max 的 dict。
+
+    old_logits、new_logits 均须为非空矩形 list，每行为非空 list 且
+    元素恰为有限 float；参数、行或元素类型不符抛 TypeError，空表、
+    空行、非矩形、两侧形状不同或元素非有限抛 ValueError。先对两侧
+    全量校验，不修改输入。逐行按原列序作稳定 log-softmax：
+    m=max(row)、z=sum(exp(x-m),0.0)、q[j]=row[j]-m-log(z)；旧策略
+    另取 p[j]=exp(q_old[j])，再从 0.0 按列序累加
+    KL=Σp[j]*(q_old[j]-q_new[j])，不夹断负零或舍入产生的微小负值。
+    m、z、q、p、乘积、累加或汇总非有限，或 z<=0，均抛 ValueError。
+    rows 为按行序的 float KL 列表，mean 为 sum(rows,0.0)/len(rows)，
+    max 为内置 max 所得 float；计算顺序固定，同输入逐值一致。
+    """
+
+    def _validate(logits, name):
+        if not isinstance(logits, list):
+            raise TypeError(f"{name} must be a list")
+        if not logits:
+            raise ValueError(f"{name} must be non-empty")
+        width = None
+        for row in logits:
+            if not isinstance(row, list):
+                raise TypeError(f"every row of {name} must be a list")
+            if not row:
+                raise ValueError(f"every row of {name} must be non-empty")
+            if width is None:
+                width = len(row)
+            elif len(row) != width:
+                raise ValueError(f"{name} must be rectangular")
+            for item in row:
+                if not isinstance(item, float):
+                    raise TypeError(f"{name} must contain only float")
+                if not math.isfinite(item):
+                    raise ValueError(
+                        f"{name} must contain only finite float"
+                    )
+        return len(logits), width
+
+    old_shape = _validate(old_logits, "old_logits")
+    new_shape = _validate(new_logits, "new_logits")
+    if old_shape != new_shape:
+        raise ValueError(
+            "old_logits and new_logits must have the same shape"
+        )
+
+    def _log_softmax(row):
+        m = max(row)
+        if not math.isfinite(m):
+            raise ValueError("row maximum must be finite")
+        z = sum((math.exp(x - m) for x in row), 0.0)
+        if not math.isfinite(z) or z <= 0.0:
+            raise ValueError("softmax normalizer must be finite and > 0")
+        log_z = math.log(z)
+        q = []
+        for x in row:
+            q_j = x - m - log_z
+            if not math.isfinite(q_j):
+                raise ValueError("log-probabilities must be finite")
+            q.append(q_j)
+        return q
+
+    rows = []
+    for old_row, new_row in zip(old_logits, new_logits):
+        q_old = _log_softmax(old_row)
+        q_new = _log_softmax(new_row)
+        kl = 0.0
+        for j in range(len(q_old)):
+            p_j = math.exp(q_old[j])
+            if not math.isfinite(p_j):
+                raise ValueError("probabilities must be finite")
+            term = p_j * (q_old[j] - q_new[j])
+            if not math.isfinite(term):
+                raise ValueError("KL term must be finite")
+            kl += term
+            if not math.isfinite(kl):
+                raise ValueError("KL sum must be finite")
+        rows.append(kl)
+    total = sum(rows, 0.0)
+    if not math.isfinite(total):
+        raise ValueError("KL total must be finite")
+    mean = total / len(rows)
+    if not math.isfinite(mean):
+        raise ValueError("mean KL must be finite")
+    maximum = max(rows)
+    if not math.isfinite(maximum):
+        raise ValueError("max KL must be finite")
+    return {"rows": rows, "mean": mean, "max": maximum}
+
+
 def ppo_train(
     env,
     episodes=100,
