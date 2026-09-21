@@ -1,5 +1,6 @@
 """GridWorld 环境与命令行入口，仅用标准库。"""
 
+import hashlib
 import json
 import math
 import random
@@ -2103,6 +2104,74 @@ def ppo_reproducibility_report(left, right) -> dict:
         "identical": overall is None,
         "results": items,
         "first_difference": overall,
+    }
+
+
+def _fingerprint_encode(value):
+    """将 None/bool/int/float/str/list/dict 递归编码为确定性文本。"""
+    if value is None:
+        return "N;"
+    if isinstance(value, bool):
+        return "B1;" if value else "B0;"
+    if isinstance(value, int):
+        return "I" + str(value) + ";"
+    if isinstance(value, float):
+        return "F" + float.hex(value) + ";"
+    if isinstance(value, str):
+        return "S" + str(len(value.encode("utf-8"))) + ":" + value
+    if isinstance(value, list):
+        parts = [
+            "L" + str(len(value)) + ":"
+        ]
+        for item in value:
+            parts.append(_fingerprint_encode(item))
+        return "".join(parts)
+    if isinstance(value, dict):
+        parts = [
+            "D" + str(len(value)) + ":"
+        ]
+        for key, item_value in value.items():
+            parts.append(_fingerprint_encode(key))
+            parts.append(_fingerprint_encode(item_value))
+        return "".join(parts)
+    raise TypeError("fingerprint values must be JSON-like data")
+
+
+def _fingerprint_hex(value):
+    return hashlib.sha256(
+        _fingerprint_encode(value).encode("utf-8")
+    ).hexdigest()
+
+
+def ppo_reproducibility_fingerprint(data) -> dict:
+    """为一份 ppo_evaluate_many 返回值计算结构指纹。
+
+    data 须为 dict，否则抛 TypeError；且须严格符合
+    ppo_reproducibility_report 单侧输入的完整契约（结构、键序、
+    类型、非 bool、有限性、范围及汇总等式），任一违约抛 ValueError；
+    不修改输入。
+
+    依次判型并递归编码：None=`N;`；bool=`B0;`/`B1;`；
+    int=`I`+十进制+`;`；float=`F`+float.hex()+`;`；
+    str=`S`+UTF-8 字节数+`:`+原文；list=`L`+元素数+`:`+各元素；
+    dict=`D`+键数+`:`+按插入（公开）键序拼接键、值编码。编码文本取
+    UTF-8 字节后做 sha256。对完整 data 及 results 各完整项（含
+    seed、result）分别摘要。返回键序 algorithm、fingerprint、
+    results，依次为 "sha256"、总体摘要、与 results 同序的逐项摘要
+    list；摘要均为小写 64 位十六进制 str。深拷贝同摘要；0.0 与
+    -0.0、int 与 float 摘要不同。仅用标准库，不引入命令行入口。
+    """
+    if not isinstance(data, dict):
+        raise TypeError("data must be a dict")
+    entries = _validate_evaluate_many_payload(data, "data")
+
+    result_fingerprints = [
+        _fingerprint_hex(entry) for entry in entries
+    ]
+    return {
+        "algorithm": "sha256",
+        "fingerprint": _fingerprint_hex(data),
+        "results": result_fingerprints,
     }
 
 
