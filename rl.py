@@ -2504,6 +2504,117 @@ def convergence_report(
     }
 
 
+def ppo_seed_convergence_report(
+    runs, window=20, tolerance=0.01, patience=3
+) -> dict:
+    """按 seed 分组汇总多种子收敛结论，返回收敛一致性报告。
+
+    runs 须为至少两项的 list：非 list 抛 TypeError，少于两项抛
+    ValueError。每项须为键序恰为 seed、episode_results 的 dict：
+    seed 为非 bool 的 int；项本身或 seed 类型错抛 TypeError，键序错抛
+    ValueError。episode_results 及 window、tolerance、patience 完整沿用
+    convergence_report 的参数契约。先完整校验全部输入（含每个 seed 至少
+    两次），再按 seed 首次出现顺序分组、组内保持原序并计算；任一失败都
+    不返回部分结果，且不修改输入。
+
+    对各组按组内原序的 episode_results 调用 convergence_report。返回键
+    序为 converged、groups、inconsistent_seeds、unconverged_seeds：
+    groups 按 seed 首次出现序排列，每项键序为 seed、indices、reports、
+    consistent、converged，indices 为该组各项在原 runs 中的零基索引升序
+    list，reports 为同序的 convergence_report 完整返回值，consistent
+    当且仅当组内各报告 converged 结论全同，组 converged 当且仅当各结论
+    全为 True；inconsistent_seeds、unconverged_seeds 按组序分别收集
+    consistent 为 False、converged 为 False 的 seed；顶层 converged
+    当且仅当 unconverged_seeds 为空。重复调用及深拷贝逐值一致，仅用标准
+    库，不引入命令行入口。
+    """
+    if not isinstance(runs, list):
+        raise TypeError("runs must be a list")
+    if len(runs) < 2:
+        raise ValueError("runs must contain at least two entries")
+    if isinstance(window, bool) or not isinstance(window, int):
+        raise TypeError("window must be an int")
+    if isinstance(patience, bool) or not isinstance(patience, int):
+        raise TypeError("patience must be an int")
+    if isinstance(tolerance, bool) or not isinstance(
+        tolerance, (int, float)
+    ):
+        raise TypeError("tolerance must be an int or float")
+    if window <= 0:
+        raise ValueError("window must be positive")
+    if patience <= 0:
+        raise ValueError("patience must be positive")
+    if not _is_finite_number(tolerance) or tolerance < 0:
+        raise ValueError("tolerance must be finite and >= 0")
+
+    validated = []
+    for index, item in enumerate(runs):
+        if not isinstance(item, dict):
+            raise TypeError(f"runs[{index}] must be a dict")
+        if list(item) != ["seed", "episode_results"]:
+            raise ValueError(
+                f"runs[{index}] must have exactly the keys"
+                " seed, episode_results"
+            )
+        seed = item["seed"]
+        if isinstance(seed, bool) or not isinstance(seed, int):
+            raise TypeError(f"runs[{index}] seed must be a non-bool int")
+        episode_results = item["episode_results"]
+        if not isinstance(episode_results, list):
+            raise TypeError(
+                f"runs[{index}] episode_results must be a list"
+            )
+        validated.append((seed, episode_results))
+
+    seed_order = []
+    indices_by_seed = {}
+    for index, (seed, _episode_results) in enumerate(validated):
+        if seed not in indices_by_seed:
+            seed_order.append(seed)
+            indices_by_seed[seed] = []
+        indices_by_seed[seed].append(index)
+
+    for seed in seed_order:
+        if len(indices_by_seed[seed]) < 2:
+            raise ValueError(f"seed {seed} must have at least two runs")
+
+    all_reports = [
+        convergence_report(episode_results, window, tolerance, patience)
+        for _, episode_results in validated
+    ]
+
+    groups = []
+    inconsistent_seeds = []
+    unconverged_seeds = []
+    for seed in seed_order:
+        reports = [all_reports[index] for index in indices_by_seed[seed]]
+        conclusions = [report["converged"] for report in reports]
+        consistent = all(
+            conclusion == conclusions[0] for conclusion in conclusions
+        )
+        group_converged = all(conclusions)
+        groups.append(
+            {
+                "seed": seed,
+                "indices": indices_by_seed[seed],
+                "reports": reports,
+                "consistent": consistent,
+                "converged": group_converged,
+            }
+        )
+        if not consistent:
+            inconsistent_seeds.append(seed)
+        if not group_converged:
+            unconverged_seeds.append(seed)
+
+    return {
+        "converged": not unconverged_seeds,
+        "groups": groups,
+        "inconsistent_seeds": inconsistent_seeds,
+        "unconverged_seeds": unconverged_seeds,
+    }
+
+
 def _format_value(value):
     if abs(value) < 0.5e-12:
         value = 0.0
