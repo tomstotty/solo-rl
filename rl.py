@@ -8729,6 +8729,121 @@ def ppo_evaluate(
     }
 
 
+def ppo_eval_stats(
+    env,
+    h,
+    episodes=100,
+    max_steps=1000,
+    seed=0,
+    window=20,
+    success=0.9,
+    reward=-20.0,
+    patience=3,
+) -> dict:
+    """按 softmax 策略评估 PPO 风格 logits 表，返回双阈值滑窗收敛统计。
+
+    env、h、episodes、max_steps、seed 的校验与异常、稳定 softmax
+    采样、random.Random(seed) 消费顺序、终止/截断边界及 h 不修改均
+    沿用 ppo_evaluate（window 同样沿用其校验）。window、patience
+    须为非 bool 的正 int，类型不符抛 TypeError，非正抛 ValueError；
+    success、reward 须为非 bool 的 int/float，类型不符抛 TypeError，
+    转 float 溢出或非有限抛 ValueError，此外 success 须落在 [0, 1]，
+    越界抛 ValueError。
+
+    回合项为 [steps, total_reward, success]，与 ppo_evaluate 逐值
+    一致。每个完整窗生成 [start, end, success_rate, reward_mean,
+    passed]：start、end 为从 1 起的回合序号；success_rate 为窗内
+    success 按序从 0.0 累加（成功记 1.0）后除以 window 的 float，
+    reward_mean 为窗内 total_reward 按序从 0.0 累加后除以 window 的
+    float；passed 仅当 success_rate >= success 且
+    reward_mean >= reward 时为 True。episode 为首个由连续 patience
+    个 passed 窗构成的序列末窗的 end，不存在则为 None。
+
+    返回键依次为 episodes、windows、success_rate、reward_mean、
+    converged、episode；success_rate、reward_mean 为全部回合按同法
+    从 0.0 累加后除以回合数的 float，converged 等价于
+    episode is not None。相同输入与 seed 逐值一致。
+    """
+    # 前五参与 window 的校验及回合仿真完全沿用 ppo_evaluate（threshold
+    # 不影响 episodes 项）；新参数的校验紧随其后，保持签名参数顺序。
+    result = ppo_evaluate(
+        env, h, episodes, max_steps, seed, window, 0.0
+    )
+    episode_records = result["episodes"]
+
+    if isinstance(success, bool) or not isinstance(success, (int, float)):
+        raise TypeError("success must be an int or float")
+    try:
+        success_threshold = float(success)
+    except OverflowError:
+        raise ValueError("success threshold must be finite")
+    if not math.isfinite(success_threshold):
+        raise ValueError("success threshold must be finite and in [0, 1]")
+    if success_threshold < 0.0 or success_threshold > 1.0:
+        raise ValueError("success threshold must be finite and in [0, 1]")
+    if isinstance(reward, bool) or not isinstance(reward, (int, float)):
+        raise TypeError("reward must be an int or float")
+    try:
+        reward_threshold = float(reward)
+    except OverflowError:
+        raise ValueError("reward threshold must be finite")
+    if not math.isfinite(reward_threshold):
+        raise ValueError("reward threshold must be finite")
+    if isinstance(patience, bool) or not isinstance(patience, int):
+        raise TypeError("patience must be an int")
+    if patience <= 0:
+        raise ValueError("patience must be positive")
+
+    windows = []
+    for start in range(len(episode_records) - window + 1):
+        block = episode_records[start:start + window]
+        success_total = 0.0
+        reward_total = 0.0
+        for item in block:
+            success_total += 1.0 if item[2] else 0.0
+            reward_total += item[1]
+        window_success_rate = success_total / window
+        window_reward_mean = reward_total / window
+        passed = (
+            window_success_rate >= success_threshold
+            and window_reward_mean >= reward_threshold
+        )
+        windows.append(
+            [
+                start + 1,
+                start + window,
+                window_success_rate,
+                window_reward_mean,
+                passed,
+            ]
+        )
+
+    consecutive = 0
+    converged_episode = None
+    for entry in windows:
+        if entry[4]:
+            consecutive += 1
+            if consecutive >= patience:
+                converged_episode = entry[1]
+                break
+        else:
+            consecutive = 0
+
+    all_success = 0.0
+    all_reward = 0.0
+    for item in episode_records:
+        all_success += 1.0 if item[2] else 0.0
+        all_reward += item[1]
+    return {
+        "episodes": episode_records,
+        "windows": windows,
+        "success_rate": all_success / episodes,
+        "reward_mean": all_reward / episodes,
+        "converged": converged_episode is not None,
+        "episode": converged_episode,
+    }
+
+
 def ppo_evaluate_trace(env, h, episodes=100, max_steps=1000, seed=0) -> dict:
     """按 softmax 策略评估 PPO 风格 logits 表，返回可逐步复现的轨迹。
 
