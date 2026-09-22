@@ -261,6 +261,7 @@ def q_learning(
     epsilon=0.1,
     seed=0,
     epsilon_end=None,
+    epsilon_mode="linear",
 ) -> dict:
     """Q-learning，返回 {((row, col), action): float}。
 
@@ -268,9 +269,12 @@ def q_learning(
     每回合 reset，单回合最多 1000 步；全部随机性来自一个
     random.Random(seed)。
 
-    epsilon_end 为 None 时各回合探索率恒为 epsilon；否则第 e 回合
-    （0 起）的探索率在 epsilon 与 epsilon_end 间线性变化，
-    episodes 为 1 时恒为 epsilon。
+    epsilon_end 为 None 时各回合探索率恒为 epsilon；否则 episodes 为 1
+    时恒为 epsilon，第 e 回合（0 起）令 t=e/(episodes-1)（截断到
+    [0, 1]），按 epsilon_mode 在 epsilon 与 epsilon_end 间变化：
+    linear 为 epsilon+(epsilon_end-epsilon)*t；cosine 为
+    epsilon_end+(epsilon-epsilon_end)*(1+cos(pi*t))/2；
+    exponential 为 epsilon*(epsilon_end/epsilon)**t。
     """
     if not isinstance(env, GridWorld):
         raise TypeError("env must be a GridWorld")
@@ -289,6 +293,12 @@ def q_learning(
         or not isinstance(epsilon_end, (int, float))
     ):
         raise TypeError("epsilon_end must be None, an int or float")
+    if not isinstance(epsilon_mode, str):
+        raise TypeError("epsilon_mode must be a str")
+    if epsilon_mode not in ("linear", "cosine", "exponential"):
+        raise ValueError(
+            "epsilon_mode must be one of linear, cosine, exponential"
+        )
     if episodes <= 0:
         raise ValueError("episodes must be positive")
     if not _is_finite_number(alpha) or alpha <= 0 or alpha > 1:
@@ -303,6 +313,11 @@ def q_learning(
         or epsilon_end > 1
     ):
         raise ValueError("epsilon_end must be finite and in [0, 1]")
+    if epsilon_mode == "exponential" and epsilon_end is not None:
+        if epsilon <= 0 or epsilon_end <= 0:
+            raise ValueError(
+                "exponential epsilon schedule endpoints must be in (0, 1]"
+            )
 
     actions = tuple(_ACTIONS)  # U, R, D, L
     q = {
@@ -317,9 +332,19 @@ def q_learning(
         if epsilon_end is None or episodes == 1:
             rate = epsilon
         else:
-            rate = epsilon + (epsilon_end - epsilon) * episode / (
-                episodes - 1
-            )
+            t = episode / (episodes - 1)
+            if t < 0.0:
+                t = 0.0
+            elif t > 1.0:
+                t = 1.0
+            if epsilon_mode == "linear":
+                rate = epsilon + (epsilon_end - epsilon) * t
+            elif epsilon_mode == "cosine":
+                rate = epsilon_end + (
+                    epsilon - epsilon_end
+                ) * (1.0 + math.cos(math.pi * t)) / 2.0
+            else:
+                rate = epsilon * (epsilon_end / epsilon) ** t
         state = env.reset()
         for _ in range(1000):
             if rng.random() < rate:
@@ -334,7 +359,10 @@ def q_learning(
                     q[(next_state, a)] for a in actions
                 )
             key = (state, action)
-            q[key] += alpha * (target - q[key])
+            new_value = q[key] + alpha * (target - q[key])
+            if not math.isfinite(new_value):
+                raise ValueError("Q value must remain finite")
+            q[key] = new_value
             if done:
                 break
             state = next_state
