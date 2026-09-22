@@ -2870,6 +2870,90 @@ def ppo_clipped_surrogate(
     }
 
 
+def ppo_value_loss(old, new, returns, clip=0.2) -> dict:
+    """PPO 截断价值损失，返回固定键序 clipped、losses、mean 的 dict。
+
+    old、new、returns 须为等长非空的 list/tuple，各元素为非 bool 的
+    int/float；容器或元素类型错误抛 TypeError，为空或长度不等抛
+    ValueError，转 float 溢出或结果非有限抛 ValueError。clip 为非
+    bool 的 int/float 标量，类型错误抛 TypeError；转 float 溢出、
+    非有限或不属 [0, 1) 抛 ValueError。全量校验后复制为 float 列表
+    o、n、r 及标量 e，不修改输入。按 i 升序计算 d=n[i]-o[i]、
+    q=o[i]+min(max(d,-e),e)、u=(n[i]-r[i])**2、v=(q-r[i])**2、
+    z=.5*max(u,v)；任一运算溢出或 d、q、u、v、z 非有限均抛
+    ValueError。令 total=0.0 并按 i 升序累加 z；total 或
+    total/len(z) 非有限抛 ValueError。clipped、losses 依次为 q、z
+    的 float 新列表，mean 为 float 均值；不改写负零。
+    """
+    if not isinstance(old, (list, tuple)):
+        raise TypeError("old must be a list or tuple")
+    if not isinstance(new, (list, tuple)):
+        raise TypeError("new must be a list or tuple")
+    if not isinstance(returns, (list, tuple)):
+        raise TypeError("returns must be a list or tuple")
+    if len(old) == 0 or len(new) == 0 or len(returns) == 0:
+        raise ValueError("old, new and returns must be non-empty")
+    if not (len(old) == len(new) == len(returns)):
+        raise ValueError("old, new and returns must have equal length")
+
+    def _to_float(item, name):
+        if isinstance(item, bool) or not isinstance(item, (int, float)):
+            raise TypeError(f"{name} must contain only int or float")
+        try:
+            result = float(item)
+        except OverflowError:
+            raise ValueError(f"{name} must convert to a finite float")
+        if not math.isfinite(result):
+            raise ValueError(f"{name} must contain only finite numbers")
+        return result
+
+    o = [_to_float(item, "old") for item in old]
+    n = [_to_float(item, "new") for item in new]
+    r = [_to_float(item, "returns") for item in returns]
+
+    if isinstance(clip, bool) or not isinstance(clip, (int, float)):
+        raise TypeError("clip must be an int or float")
+    try:
+        e = float(clip)
+    except OverflowError:
+        raise ValueError("clip must convert to a finite float")
+    if not math.isfinite(e):
+        raise ValueError("clip must be finite")
+    if e < 0.0 or e >= 1.0:
+        raise ValueError("clip must be in [0, 1)")
+
+    clipped = []
+    losses = []
+    for i in range(len(o)):
+        d = n[i] - o[i]
+        if not math.isfinite(d):
+            raise ValueError("value difference must be finite")
+        q = o[i] + min(max(d, -e), e)
+        if not math.isfinite(q):
+            raise ValueError("clipped value must be finite")
+        try:
+            u = (n[i] - r[i]) ** 2
+            v = (q - r[i]) ** 2
+        except OverflowError:
+            raise ValueError("squared error must be finite")
+        if not math.isfinite(u) or not math.isfinite(v):
+            raise ValueError("squared errors must be finite")
+        z = 0.5 * max(u, v)
+        if not math.isfinite(z):
+            raise ValueError("loss must be finite")
+        clipped.append(q)
+        losses.append(z)
+    total = 0.0
+    for z in losses:
+        total += z
+        if not math.isfinite(total):
+            raise ValueError("loss sum must be finite")
+    mean = total / len(losses)
+    if not math.isfinite(mean):
+        raise ValueError("mean must be finite")
+    return {"clipped": clipped, "losses": losses, "mean": mean}
+
+
 def ppo_update(logits, batch, lr=0.05, c=0.2, epochs=4) -> dict:
     """PPO 多轮 logits 更新，返回固定键序 logits、objectives、probabilities 的 dict。
 
