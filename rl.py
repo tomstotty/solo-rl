@@ -341,6 +341,106 @@ def q_learning(
     return q
 
 
+def dueling_q_learning(
+    env,
+    episodes=500,
+    alpha=0.5,
+    gamma=0.9,
+    epsilon=0.1,
+    seed=0,
+    max_steps=1000,
+) -> dict:
+    """Dueling Q-learning，返回 {((row, col), action): float}。
+
+    Q 覆盖从 S 可达的非 G 格与 U/R/D/L 的全部组合，按状态坐标升序、
+    URDL 排列；Q 不单独存储，而由 V(s) 与 A(s,a) 聚合：
+    Q(s,a) = V(s) + A(s,a) - sum_a A(s,a)/4，V、A 初值均为 0.0。
+    每回合 reset，done 即停；单回合最多 max_steps 步（末步照常执行）。
+    每步先且仅调用一次 rng.random() 决定是否探索，探索时再按 URDL 调用
+    rng.randrange(4)，否则取 URDL 中首个最大 Q 动作。目标为 done 时取
+    r，否则取 r + gamma*max_a Q(s2,a)；td = 目标 - Q(s,a)，V(s) 与
+    A(s,a) 各加 alpha*td，出现非有限值抛 ValueError。
+    全部随机性来自一个 random.Random(seed)。
+    """
+    if not isinstance(env, GridWorld):
+        raise TypeError("env must be a GridWorld")
+    if isinstance(episodes, bool) or not isinstance(episodes, int):
+        raise TypeError("episodes must be an int")
+    if isinstance(seed, bool) or not isinstance(seed, int):
+        raise TypeError("seed must be an int")
+    if isinstance(max_steps, bool) or not isinstance(max_steps, int):
+        raise TypeError("max_steps must be an int")
+    if isinstance(alpha, bool) or not isinstance(alpha, (int, float)):
+        raise TypeError("alpha must be an int or float")
+    if isinstance(gamma, bool) or not isinstance(gamma, (int, float)):
+        raise TypeError("gamma must be an int or float")
+    if isinstance(epsilon, bool) or not isinstance(epsilon, (int, float)):
+        raise TypeError("epsilon must be an int or float")
+    if episodes <= 0:
+        raise ValueError("episodes must be positive")
+    if seed <= 0:
+        raise ValueError("seed must be positive")
+    if max_steps <= 0:
+        raise ValueError("max_steps must be positive")
+    if not _is_finite_number(alpha) or alpha <= 0 or alpha > 1:
+        raise ValueError("alpha must be finite and in (0, 1]")
+    if not _is_finite_number(gamma) or gamma < 0 or gamma >= 1:
+        raise ValueError("gamma must be finite and in [0, 1)")
+    if not _is_finite_number(epsilon) or epsilon < 0 or epsilon > 1:
+        raise ValueError("epsilon must be finite and in [0, 1]")
+
+    actions = tuple(_ACTIONS)  # U, R, D, L
+    states = sorted(
+        state
+        for state in _reachable_cells(env)
+        if env._cell(state) != "G"
+    )
+    v = {state: 0.0 for state in states}
+    advantage = {
+        (state, action): 0.0 for state in states for action in actions
+    }
+
+    def q_value(state, action):
+        mean_a = sum(advantage[(state, a)] for a in actions) / 4
+        return v[state] + advantage[(state, action)] - mean_a
+
+    rng = random.Random(seed)
+
+    for _ in range(episodes):
+        state = env.reset()
+        for _ in range(max_steps):
+            if rng.random() < epsilon:
+                action = actions[rng.randrange(4)]
+            else:
+                action = max(actions, key=lambda a: q_value(state, a))
+            next_state, reward, done = env.step(action)
+            if done:
+                target = reward
+            else:
+                target = reward + gamma * max(
+                    q_value(next_state, a) for a in actions
+                )
+            td = target - q_value(state, action)
+            v[state] += alpha * td
+            advantage[(state, action)] += alpha * td
+            if not math.isfinite(v[state]) or not math.isfinite(
+                advantage[(state, action)]
+            ):
+                raise ValueError("V or A value must remain finite")
+            if done:
+                break
+            state = next_state
+
+    q = {}
+    for state in states:
+        for action in actions:
+            value = float(q_value(state, action))
+            if not math.isfinite(value):
+                raise ValueError("Q value must remain finite")
+            q[(state, action)] = value
+    return q
+
+
 def dyna_q(
     env,
     episodes=500,
