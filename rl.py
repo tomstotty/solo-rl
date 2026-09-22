@@ -5068,6 +5068,194 @@ def ppo_update_kl(
     }
 
 
+def ppo_kl_penalty_update(logits, batch, lr=0.05, beta=1.0, epochs=4) -> dict:
+    """带 KL 惩罚项的 PPO 多轮 logits 更新，返回固定键序 logits、
+    objectives、kls 的 dict。
+
+    logits、batch、lr、epochs 的校验与异常逐项沿用 ppo_update；
+    beta 须为非 bool 的 int/float，类型不符抛 TypeError，转 float
+    溢出、非有限或 <=0 抛 ValueError，校验后记为 b。先全量校验再
+    复制 logits 为 L，不修改输入。每轮冻结 L，各行取 m=max(L)，
+    按行列序算 q_j=L_j-m-log(Σexp(L_k-m))、p_j=exp(q_j)；按 batch
+    序对 [s, a, o, A] 算 d=q[s][a]-o、r=exp(d)、k=o-q[s][a]、
+    z=r*A-b*k，objective、KL 分别为 z、k 从 0.0 累加后除批量长度。
+    梯度从全 0.0 矩阵开始，按样本、列序累加
+    (r*A+b)*(I[j==a]-p[s][j])，除批量长度后同步
+    L[i][j]+=lr*g[i][j]。任一新量溢出或非有限均抛 ValueError，
+    不返回部分结果。返回最终 float 矩阵、逐轮 objective 与 KL 的
+    float 列表；均为新容器，同输入逐值一致。
+    """
+    if not isinstance(logits, list):
+        raise TypeError("logits must be a list")
+    if not logits:
+        raise ValueError("logits must be non-empty")
+    width = None
+    for row in logits:
+        if not isinstance(row, list):
+            raise TypeError("every row of logits must be a list")
+        if not row:
+            raise ValueError("every row of logits must be non-empty")
+        if width is None:
+            width = len(row)
+        elif len(row) != width:
+            raise ValueError("logits must be rectangular")
+        for item in row:
+            if not isinstance(item, float):
+                raise TypeError("logits must contain only float")
+            if not math.isfinite(item):
+                raise ValueError("logits must contain only finite float")
+    n_rows = len(logits)
+    n_cols = width
+
+    if not isinstance(batch, list):
+        raise TypeError("batch must be a list")
+    if not batch:
+        raise ValueError("batch must be non-empty")
+    samples = []
+    for item in batch:
+        if not isinstance(item, list):
+            raise TypeError("every batch item must be a list")
+        if len(item) != 4:
+            raise ValueError("every batch item must have exactly four elements")
+        s, a, o, adv = item
+        if isinstance(s, bool) or not isinstance(s, int):
+            raise TypeError("state index must be a non-bool int")
+        if isinstance(a, bool) or not isinstance(a, int):
+            raise TypeError("action index must be a non-bool int")
+        if not 0 <= s < n_rows:
+            raise ValueError("state index out of range")
+        if not 0 <= a < n_cols:
+            raise ValueError("action index out of range")
+        if not isinstance(o, float):
+            raise TypeError("old log-prob must be a float")
+        if not math.isfinite(o):
+            raise ValueError("old log-prob must be finite")
+        if not isinstance(adv, float):
+            raise TypeError("advantage must be a float")
+        if not math.isfinite(adv):
+            raise ValueError("advantage must be finite")
+        samples.append((s, a, o, adv))
+
+    if not isinstance(lr, float):
+        raise TypeError("lr must be a float")
+    if not math.isfinite(lr):
+        raise ValueError("lr must be finite")
+    if lr <= 0.0 or lr > 1.0:
+        raise ValueError("lr must be in (0, 1]")
+    if isinstance(epochs, bool) or not isinstance(epochs, int):
+        raise TypeError("epochs must be a non-bool int")
+    if epochs <= 0:
+        raise ValueError("epochs must be positive")
+    if isinstance(beta, bool) or not isinstance(beta, (int, float)):
+        raise TypeError("beta must be an int or float")
+    try:
+        b = float(beta)
+    except OverflowError:
+        raise ValueError("beta must convert to a finite float")
+    if not math.isfinite(b) or b <= 0.0:
+        raise ValueError("beta must be finite and > 0")
+
+    def _log_softmax(row):
+        m = max(row)
+        total = 0.0
+        for value in row:
+            total += math.exp(value - m)
+        if not math.isfinite(total):
+            raise ValueError("softmax normalizer must be finite")
+        log_total = math.log(total)
+        q = []
+        p = []
+        for value in row:
+            q_j = value - m - log_total
+            if not math.isfinite(q_j):
+                raise ValueError("log-probabilities must be finite")
+            p_j = math.exp(q_j)
+            if not math.isfinite(p_j):
+                raise ValueError("probabilities must be finite")
+            q.append(q_j)
+            p.append(p_j)
+        return q, p
+
+    L = [list(row) for row in logits]
+    n_batch = len(samples)
+    objectives = []
+    kls = []
+    for _ in range(epochs):
+        frozen = [list(row) for row in L]
+        qs = []
+        ps = []
+        for row in frozen:
+            q, p = _log_softmax(row)
+            qs.append(q)
+            ps.append(p)
+        g = [[0.0] * n_cols for _ in range(n_rows)]
+        objective_sum = 0.0
+        kl_sum = 0.0
+        for s, a, o, adv in samples:
+            d = qs[s][a] - o
+            if not math.isfinite(d):
+                raise ValueError("log-prob ratio log-term must be finite")
+            try:
+                r = math.exp(d)
+            except OverflowError:
+                raise ValueError("ratio exp overflow")
+            if not math.isfinite(r):
+                raise ValueError("ratio must be finite")
+            k = o - qs[s][a]
+            if not math.isfinite(k):
+                raise ValueError("KL term must be finite")
+            weighted = r * adv
+            if not math.isfinite(weighted):
+                raise ValueError("weighted advantage must be finite")
+            penalty = b * k
+            if not math.isfinite(penalty):
+                raise ValueError("KL penalty term must be finite")
+            z = weighted - penalty
+            if not math.isfinite(z):
+                raise ValueError("per-sample objective must be finite")
+            objective_sum += z
+            if not math.isfinite(objective_sum):
+                raise ValueError("objective sum must be finite")
+            kl_sum += k
+            if not math.isfinite(kl_sum):
+                raise ValueError("KL sum must be finite")
+            coeff = weighted + b
+            if not math.isfinite(coeff):
+                raise ValueError("gradient coefficient must be finite")
+            row_g = g[s]
+            p_row = ps[s]
+            for j in range(n_cols):
+                grad = coeff * ((1.0 if j == a else 0.0) - p_row[j])
+                row_g[j] += grad
+                if not math.isfinite(row_g[j]):
+                    raise ValueError("gradient must be finite")
+        objective = objective_sum / n_batch
+        if not math.isfinite(objective):
+            raise ValueError("epoch mean objective must be finite")
+        kl = kl_sum / n_batch
+        if not math.isfinite(kl):
+            raise ValueError("epoch mean KL must be finite")
+        objectives.append(objective)
+        kls.append(kl)
+        new_rows = [[0.0] * n_cols for _ in range(n_rows)]
+        for i in range(n_rows):
+            for j in range(n_cols):
+                g_ij = g[i][j] / n_batch
+                if not math.isfinite(g_ij):
+                    raise ValueError("mean gradient must be finite")
+                new_value = L[i][j] + lr * g_ij
+                if not math.isfinite(new_value):
+                    raise ValueError("updated logits must be finite")
+                new_rows[i][j] = new_value
+        L = new_rows
+
+    return {
+        "logits": L,
+        "objectives": objectives,
+        "kls": kls,
+    }
+
+
 def ppo_normalized_update(
     logits, batch, lr=0.05, c=0.2, epochs=4, epsilon=1e-8
 ) -> dict:
