@@ -4303,6 +4303,196 @@ def ppo_train(
     }
 
 
+def ppo_train_grad_clip(
+    env,
+    episodes=100,
+    alpha=0.05,
+    gamma=0.9,
+    lambda_=0.95,
+    c=0.2,
+    epochs=4,
+    max_norm=1.0,
+    seed=0,
+    max_steps=1000,
+) -> dict:
+    """带梯度范数裁剪的 PPO 训练，返回 h 表、逐回合步表与各回合更新统计。
+
+    除 max_norm 外，参数校验、状态编号、采样、GAE、V 更新、终止/截断
+    及返回中的 h、episodes 逐项沿用 ppo_train，且全部校验在采样前完成；
+    max_norm 须为非 bool 的 int/float，类型不符抛 TypeError，转 float
+    溢出、非有限或 <=0 抛 ValueError。每回合按步序构造
+    [s, a, old_logp, A] 批次，调用
+    ppo_grad_clip(H, batch, float(alpha), c, epochs, max_norm)，以其
+    返回 logits 续训 H；该调用不消费随机数，全部随机性仍来自一个
+    random.Random(seed)。
+
+    返回键依次为 h、episodes、objectives、norms、scales；前两项沿用
+    ppo_train，后三项与回合数等长，第 e 项为该回合 ppo_grad_clip 返回
+    的同名完整 float 列表。新运算结果非有限均抛 ValueError 且无部分
+    结果；同参同 seed 逐值一致。
+    """
+    if not isinstance(env, GridWorld):
+        raise TypeError("env must be a GridWorld")
+    if isinstance(episodes, bool) or not isinstance(episodes, int):
+        raise TypeError("episodes must be an int")
+    if isinstance(seed, bool) or not isinstance(seed, int):
+        raise TypeError("seed must be an int")
+    if isinstance(max_steps, bool) or not isinstance(max_steps, int):
+        raise TypeError("max_steps must be an int")
+    if isinstance(alpha, bool) or not isinstance(alpha, (int, float)):
+        raise TypeError("alpha must be an int or float")
+    if isinstance(gamma, bool) or not isinstance(gamma, (int, float)):
+        raise TypeError("gamma must be an int or float")
+    if isinstance(lambda_, bool) or not isinstance(lambda_, (int, float)):
+        raise TypeError("lambda_ must be an int or float")
+    if episodes <= 0:
+        raise ValueError("episodes must be positive")
+    if max_steps <= 0:
+        raise ValueError("max_steps must be positive")
+    if not _is_finite_number(alpha) or alpha <= 0 or alpha > 1:
+        raise ValueError("alpha must be finite and in (0, 1]")
+    if not _is_finite_number(gamma) or gamma < 0 or gamma > 1:
+        raise ValueError("gamma must be finite and in [0, 1]")
+    if not _is_finite_number(lambda_) or lambda_ < 0 or lambda_ > 1:
+        raise ValueError("lambda_ must be finite and in [0, 1]")
+    if not isinstance(c, float):
+        raise TypeError("c must be a float")
+    if not math.isfinite(c):
+        raise ValueError("c must be finite")
+    if c < 0.0 or c >= 1.0:
+        raise ValueError("c must be in [0, 1)")
+    if isinstance(epochs, bool) or not isinstance(epochs, int):
+        raise TypeError("epochs must be a non-bool int")
+    if epochs <= 0:
+        raise ValueError("epochs must be positive")
+    if isinstance(max_norm, bool) or not isinstance(max_norm, (int, float)):
+        raise TypeError("max_norm must be an int or float")
+    try:
+        checked_max_norm = float(max_norm)
+    except OverflowError:
+        raise ValueError("max_norm must convert to a finite float")
+    if not math.isfinite(checked_max_norm) or checked_max_norm <= 0.0:
+        raise ValueError("max_norm must be finite and > 0")
+
+    actions = tuple(_ACTIONS)  # U, R, D, L
+    states = sorted(
+        state
+        for state in _reachable_cells(env)
+        if env._cell(state) != "G"
+    )
+    state_index = {state: i for i, state in enumerate(states)}
+    h = [[0.0 for _ in actions] for _ in states]
+    values = [0.0 for _ in states]
+    rng = random.Random(seed)
+    all_episodes = []
+    all_objectives = []
+    all_norms = []
+    all_scales = []
+
+    for _ in range(episodes):
+        state = env.reset()
+        trajectory = []
+        step_records = []
+        for _ in range(max_steps):
+            s = state_index[state]
+            row = h[s]
+            m = max(row)
+            weights = [math.exp(logit - m) for logit in row]
+            total = sum(weights)
+            if not math.isfinite(total) or total <= 0.0:
+                raise ValueError(
+                    "softmax normalizer must be finite and positive"
+                )
+            probs = [weight / total for weight in weights]
+            log_total = math.log(total)
+            u = rng.random()
+            cumulative = 0.0
+            a = 3
+            for k, p_k in enumerate(probs):
+                cumulative += p_k
+                if cumulative > u:
+                    a = k
+                    break
+            action = actions[a]
+            old_logp = row[a] - m - log_total
+            if not math.isfinite(old_logp):
+                raise ValueError("log-probabilities must be finite")
+            value = values[s]
+            next_state, reward, done = env.step(action)
+            value_next = 0.0 if done else values[state_index[next_state]]
+            trajectory.append(
+                (s, a, reward, old_logp, value, value_next, done)
+            )
+            step_records.append(
+                [state[0], state[1], action, reward, done]
+            )
+            if done:
+                break
+            state = next_state
+
+        advantages = [0.0] * len(trajectory)
+        a_t = 0.0
+        for t in range(len(trajectory) - 1, -1, -1):
+            (
+                _s,
+                _a,
+                reward,
+                _old_logp,
+                value,
+                value_next,
+                _done,
+            ) = trajectory[t]
+            delta = reward + gamma * value_next - value
+            if not math.isfinite(delta):
+                raise ValueError("GAE delta must be finite")
+            a_t = delta + gamma * lambda_ * a_t
+            if not math.isfinite(a_t):
+                raise ValueError("GAE advantage must be finite")
+            advantages[t] = a_t
+
+        batch = [
+            [s, a, old_logp, adv]
+            for (s, a, _r, old_logp, _v, _v2, _done), adv in zip(
+                trajectory, advantages
+            )
+        ]
+        result = ppo_grad_clip(h, batch, float(alpha), c, epochs, max_norm)
+        h = result["logits"]
+        all_objectives.append(result["objectives"])
+        all_norms.append(result["norms"])
+        all_scales.append(result["scales"])
+
+        for (s, _a, _r, _old_logp, value, _v2, _done), adv in zip(
+            trajectory, advantages
+        ):
+            new_value = values[s] + alpha * (
+                adv + value - values[s]
+            )
+            if not math.isfinite(new_value):
+                raise ValueError("updated value must be finite")
+            values[s] = new_value
+        all_episodes.append(step_records)
+
+    h_table = [
+        [
+            float(r),
+            float(c),
+            h[i][0],
+            h[i][1],
+            h[i][2],
+            h[i][3],
+        ]
+        for i, (r, c) in enumerate(states)
+    ]
+    return {
+        "h": h_table,
+        "episodes": all_episodes,
+        "objectives": all_objectives,
+        "norms": all_norms,
+        "scales": all_scales,
+    }
+
+
 def ppo_train_normalized(
     env,
     episodes=100,
