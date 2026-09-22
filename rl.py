@@ -174,6 +174,84 @@ def value_iteration(env, gamma=0.9, tolerance=1e-9, max_iterations=10000):
     raise RuntimeError("value iteration did not converge")
 
 
+def policy_iteration(env, gamma=0.9, tolerance=1e-9, max_iterations=1000):
+    """同步策略迭代，返回 (policy, values, iterations)。
+
+    policy 为 {(row, col): "U"/"R"/"D"/"L"}，values 为
+    {(row, col): float}，键均为从 S 四向避墙可达的非 G 格，按坐标升序；
+    iterations 为实际迭代轮数。每轮先以上轮 values 为初值做固定策略的
+    同步策略评估，至最大变化不超过 tolerance，再按 U/R/D/L 顺序贪心改进，
+    策略不再变化时返回。
+    """
+    if not isinstance(env, GridWorld):
+        raise TypeError("env must be a GridWorld")
+    if isinstance(gamma, bool) or not isinstance(gamma, (int, float)):
+        raise TypeError("gamma must be an int or float")
+    if not _is_finite_number(gamma) or gamma < 0 or gamma >= 1:
+        raise ValueError("gamma must be finite and in [0, 1)")
+    if isinstance(tolerance, bool) or not isinstance(tolerance, (int, float)):
+        raise TypeError("tolerance must be an int or float")
+    if not _is_finite_number(tolerance) or tolerance <= 0:
+        raise ValueError("tolerance must be finite and in (0, +inf)")
+    if isinstance(max_iterations, bool) or not isinstance(max_iterations, int):
+        raise TypeError("max_iterations must be an int")
+    if max_iterations <= 0:
+        raise ValueError("max_iterations must be positive")
+
+    states = sorted(
+        state
+        for state in _reachable_cells(env)
+        if env._cell(state) != "G"
+    )
+    policy = {state: "U" for state in states}
+    values = {state: 0.0 for state in states}
+
+    def backup(state, action):
+        nxt, reward, _done = env.transition(state, action)
+        next_value = 0.0 if env._cell(nxt) == "G" else values[nxt]
+        candidate = reward + gamma * next_value
+        if not math.isfinite(candidate):
+            raise ValueError("value must be finite")
+        return candidate
+
+    iterations = 0
+    while iterations < max_iterations:
+        while True:
+            new_values = {}
+            for state in states:
+                new_values[state] = backup(state, policy[state])
+            delta = max(
+                abs(new_values[state] - values[state]) for state in states
+            )
+            values = new_values
+            if delta <= tolerance:
+                break
+
+        new_policy = {}
+        stable = True
+        for state in states:
+            best_action = "U"
+            best_value = None
+            for action in _ACTIONS:  # U, R, D, L
+                candidate = backup(state, action)
+                if best_value is None or candidate > best_value:
+                    best_value = candidate
+                    best_action = action
+            new_policy[state] = best_action
+            if best_action != policy[state]:
+                stable = False
+
+        iterations += 1
+        policy = new_policy
+        if stable:
+            return (
+                {state: policy[state] for state in states},
+                {state: float(values[state]) for state in states},
+                iterations,
+            )
+    raise RuntimeError("policy iteration did not converge")
+
+
 def q_learning(
     env,
     episodes=500,
