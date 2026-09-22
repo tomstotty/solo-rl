@@ -3055,6 +3055,162 @@ def retrace(transitions, gamma=0.9, lambda_=0.9) -> dict:
     return {"targets": targets, "advantages": advantages}
 
 
+def categorical_projection(
+    rewards, dones, next_probs, gamma=0.99, v_min=-10.0, v_max=10.0, atoms=51
+) -> dict:
+    """C51 分类分布投影，返回固定键序 support、probabilities 的 dict。
+
+    rewards、dones、next_probs 须为等长非空的 list/tuple：rewards 各
+    元素为非 bool 的有限 int/float；dones 各元素为 bool；next_probs
+    每行须为 list/tuple 且恰有 atoms 项，各项为非 bool 的有限
+    int/float 且非负，每行按 sum(row, 0.0) 计算的行和须恰为 1.0。
+    gamma、v_min、v_max 为非 bool 的 int/float 标量：gamma 须在
+    [0, 1]，v_min < v_max；atoms 为非 bool 的 int 且 >= 2。类型不
+    符抛 TypeError，空表、长度/形状不符、非有限、越界或行和不符抛
+    ValueError。所有数值先复制并转换为 float（转换溢出或结果非有限
+    均抛 ValueError），不修改原序列。令
+    delta=(v_max-v_min)/(atoms-1)、support[i]=v_min+i*delta。逐 t、
+    逐 j 令 z=clip(reward+(0.0 if dones[t] else gamma*support[j]))、
+    b=(z-v_min)/delta、l=floor(b)、u=ceil(b)；l==u 时向该格累加 p，
+    否则先后累加 p*(u-b)、p*(b-l)，各行从 0.0 开始累加。任何中间
+    运算或输出非有限均抛 ValueError。support 为按 i 序的 float
+    列表，probabilities 为按 t 序的 float 行列表，计算顺序固定。
+    """
+    if not isinstance(rewards, (list, tuple)):
+        raise TypeError("rewards must be a list or tuple")
+    if not isinstance(dones, (list, tuple)):
+        raise TypeError("dones must be a list or tuple")
+    if not isinstance(next_probs, (list, tuple)):
+        raise TypeError("next_probs must be a list or tuple")
+    if len(rewards) == 0 or len(dones) == 0 or len(next_probs) == 0:
+        raise ValueError("rewards, dones and next_probs must be non-empty")
+    if not (len(rewards) == len(dones) == len(next_probs)):
+        raise ValueError(
+            "rewards, dones and next_probs must have equal length"
+        )
+
+    def _to_float(item, name):
+        if isinstance(item, bool) or not isinstance(item, (int, float)):
+            raise TypeError(f"{name} must contain only int or float")
+        try:
+            result = float(item)
+        except OverflowError:
+            raise ValueError(f"{name} must convert to a finite float")
+        if not math.isfinite(result):
+            raise ValueError(f"{name} must contain only finite numbers")
+        return result
+
+    def _to_scalar(item, name):
+        if isinstance(item, bool) or not isinstance(item, (int, float)):
+            raise TypeError(f"{name} must be an int or float")
+        try:
+            result = float(item)
+        except OverflowError:
+            raise ValueError(f"{name} must convert to a finite float")
+        if not math.isfinite(result):
+            raise ValueError(f"{name} must be finite")
+        return result
+
+    if isinstance(atoms, bool) or not isinstance(atoms, int):
+        raise TypeError("atoms must be an int")
+    if atoms < 2:
+        raise ValueError("atoms must be >= 2")
+
+    g = _to_scalar(gamma, "gamma")
+    lo = _to_scalar(v_min, "v_min")
+    hi = _to_scalar(v_max, "v_max")
+    if g < 0.0 or g > 1.0:
+        raise ValueError("gamma must be in [0, 1]")
+    if not lo < hi:
+        raise ValueError("v_min must be less than v_max")
+
+    r = [_to_float(item, "rewards") for item in rewards]
+
+    d_flags = []
+    for item in dones:
+        if not isinstance(item, bool):
+            raise TypeError("dones must contain only bool")
+        d_flags.append(item)
+
+    probs = []
+    for row in next_probs:
+        if not isinstance(row, (list, tuple)):
+            raise TypeError(
+                "every row of next_probs must be a list or tuple"
+            )
+        if len(row) != atoms:
+            raise ValueError(
+                "every row of next_probs must have exactly atoms items"
+            )
+        values = [_to_float(item, "next_probs") for item in row]
+        for value in values:
+            if value < 0.0:
+                raise ValueError("next_probs must be non-negative")
+        total = sum(values, 0.0)
+        if not math.isfinite(total) or total != 1.0:
+            raise ValueError("each row of next_probs must sum to 1.0")
+        probs.append(values)
+
+    delta = (hi - lo) / (atoms - 1)
+    if not math.isfinite(delta):
+        raise ValueError("support spacing must be finite")
+    support = []
+    for i in range(atoms):
+        node = lo + i * delta
+        if not math.isfinite(node):
+            raise ValueError("support must be finite")
+        support.append(node)
+
+    T = len(r)
+    projected = []
+    for t in range(T):
+        row = [0.0] * atoms
+        reward = r[t]
+        done = d_flags[t]
+        for j in range(atoms):
+            p = probs[t][j]
+            if done:
+                z = reward
+            else:
+                z = reward + g * support[j]
+            if not math.isfinite(z):
+                raise ValueError("projected Bellman value must be finite")
+            if z < lo:
+                z = lo
+            elif z > hi:
+                z = hi
+            b = (z - lo) / delta
+            if not math.isfinite(b):
+                raise ValueError("projection position must be finite")
+            l = math.floor(b)
+            u = math.ceil(b)
+            if l == u:
+                k = min(max(l, 0), atoms - 1)
+                row[k] += p
+                if not math.isfinite(row[k]):
+                    raise ValueError("projected probability must be finite")
+            else:
+                kl = min(max(l, 0), atoms - 1)
+                ku = min(max(u, 0), atoms - 1)
+                lower = p * (u - b)
+                if not math.isfinite(lower):
+                    raise ValueError("projection weight must be finite")
+                row[kl] += lower
+                if not math.isfinite(row[kl]):
+                    raise ValueError("projected probability must be finite")
+                upper = p * (b - l)
+                if not math.isfinite(upper):
+                    raise ValueError("projection weight must be finite")
+                row[ku] += upper
+                if not math.isfinite(row[ku]):
+                    raise ValueError("projected probability must be finite")
+        for value in row:
+            if not math.isfinite(value):
+                raise ValueError("projected probabilities must be finite")
+        projected.append(row)
+    return {"support": support, "probabilities": projected}
+
+
 def ppo_clipped_surrogate(
     old_log_probs, new_log_probs, advantages, clip_epsilon=0.2
 ) -> dict:
