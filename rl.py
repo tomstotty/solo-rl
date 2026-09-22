@@ -8729,6 +8729,144 @@ def ppo_evaluate(
     }
 
 
+def ppo_eval_stats(
+    env, h, episodes=100, max_steps=1000, seed=0,
+    window=20, success=0.9, reward=-20.0, patience=3,
+) -> dict:
+    """按 softmax 策略评估 PPO 风格 logits 表，返回滑窗统计与收敛点。
+
+    前五参（env、h、episodes、max_steps、seed）的校验与异常、稳定
+    softmax 采样、random.Random(seed) 消费顺序、终止/截断语义及
+    h 不变均沿用 ppo_evaluate。window、patience 须为非 bool 的
+    int，否则抛 TypeError，非正抛 ValueError；success、reward 须为
+    非 bool 的 int/float，否则抛 TypeError，转 float 溢出或非有限、
+    success 越出 [0, 1] 抛 ValueError。
+
+    episodes 元素为 [steps, total_reward, success]，与 ppo_evaluate
+    一致。windows 按起点升序，每个完整长度为 window 的滑窗生成
+    [start, end, success_rate, reward_mean, passed]：start、end
+    为从 1 起的回合编号；success_rate、reward_mean 按窗内回合序从
+    0.0 累加后除以 window；passed 仅当 success_rate >= success 且
+    reward_mean >= reward 时为 True。episode 为首个连续 patience
+    个 passed 窗的 end，无则 None。
+
+    返回键依次为 episodes、windows、success_rate、reward_mean、
+    converged、episode；success_rate、reward_mean 为全部回合按序
+    从 0.0 累加后除以 episodes 的 float，converged 等价于
+    episode 非 None。相同输入与 seed 逐值一致。
+    """
+    if not isinstance(env, GridWorld):
+        raise TypeError("env must be a GridWorld")
+    if not isinstance(h, list):
+        raise TypeError("h must be a list")
+    if isinstance(episodes, bool) or not isinstance(episodes, int):
+        raise TypeError("episodes must be an int")
+    if isinstance(max_steps, bool) or not isinstance(max_steps, int):
+        raise TypeError("max_steps must be an int")
+    if isinstance(seed, bool) or not isinstance(seed, int):
+        raise TypeError("seed must be an int")
+    if isinstance(window, bool) or not isinstance(window, int):
+        raise TypeError("window must be an int")
+    if isinstance(patience, bool) or not isinstance(patience, int):
+        raise TypeError("patience must be an int")
+    if isinstance(success, bool) or not isinstance(success, (int, float)):
+        raise TypeError("success must be an int or float")
+    if isinstance(reward, bool) or not isinstance(reward, (int, float)):
+        raise TypeError("reward must be an int or float")
+    if episodes <= 0:
+        raise ValueError("episodes must be positive")
+    if max_steps <= 0:
+        raise ValueError("max_steps must be positive")
+    if window <= 0:
+        raise ValueError("window must be positive")
+    if patience <= 0:
+        raise ValueError("patience must be positive")
+    try:
+        success = float(success)
+    except OverflowError:
+        raise ValueError("success must convert to a finite float")
+    if not math.isfinite(success) or success < 0 or success > 1:
+        raise ValueError("success must be finite and in [0, 1]")
+    try:
+        reward = float(reward)
+    except OverflowError:
+        raise ValueError("reward must convert to a finite float")
+    if not math.isfinite(reward):
+        raise ValueError("reward must be finite")
+
+    actions = tuple(_ACTIONS)  # U, R, D, L
+    states = sorted(
+        state
+        for state in _reachable_cells(env)
+        if env._cell(state) != "G"
+    )
+    if not h:
+        raise ValueError("h must be non-empty")
+    if len(h) != len(states):
+        raise ValueError(
+            "h must have exactly one row per reachable non-G cell"
+        )
+    preferences = {}
+    for row, (er, ec) in zip(h, states):
+        if not isinstance(row, list):
+            raise TypeError("every row of h must be a list")
+        if len(row) != 6:
+            raise ValueError(
+                "every row of h must have exactly six elements"
+            )
+        for item in row:
+            if not isinstance(item, float):
+                raise TypeError("h rows must contain only float")
+            if not math.isfinite(item):
+                raise ValueError("h rows must contain only finite float")
+        if row[0] != float(er) or row[1] != float(ec):
+            raise ValueError(
+                "h rows must match the reachable non-G coordinates"
+                " in ascending order"
+            )
+        state = (int(row[0]), int(row[1]))
+        for action, logit in zip(actions, row[2:]):
+            preferences[(state, action)] = logit
+
+    result = evaluate(env, preferences, episodes, max_steps, seed, 1, 0.0)
+    results = result["episodes"]
+
+    windows = []
+    run = 0
+    episode = None
+    for start in range(len(results) - window + 1):
+        success_total = 0.0
+        reward_total = 0.0
+        for item in results[start:start + window]:
+            success_total += 1.0 if item[2] else 0.0
+            reward_total += item[1]
+        success_rate = success_total / window
+        reward_mean = reward_total / window
+        passed = success_rate >= success and reward_mean >= reward
+        end = start + window
+        windows.append([start + 1, end, success_rate, reward_mean, passed])
+        if passed:
+            run += 1
+            if run >= patience and episode is None:
+                episode = end
+        else:
+            run = 0
+
+    success_total = 0.0
+    reward_total = 0.0
+    for item in results:
+        success_total += 1.0 if item[2] else 0.0
+        reward_total += item[1]
+    return {
+        "episodes": results,
+        "windows": windows,
+        "success_rate": success_total / episodes,
+        "reward_mean": reward_total / episodes,
+        "converged": episode is not None,
+        "episode": episode,
+    }
+
+
 def ppo_evaluate_trace(env, h, episodes=100, max_steps=1000, seed=0) -> dict:
     """按 softmax 策略评估 PPO 风格 logits 表，返回可逐步复现的轨迹。
 
