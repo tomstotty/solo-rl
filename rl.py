@@ -3556,6 +3556,162 @@ def ppo_update_kl(
     }
 
 
+def ppo_normalized_update(
+    logits, batch, lr=0.05, c=0.2, epochs=4, epsilon=1e-8
+) -> dict:
+    """优势规范化的 PPO 多轮 logits 更新，返回固定键序 logits、
+    objectives、probabilities、mean、std、advantages 的 dict。
+
+    logits、batch、lr、c、epochs 的校验与异常逐项沿用 ppo_update；
+    epsilon 须为非 bool 的 int/float，类型不符抛 TypeError，转 float
+    溢出、非有限或 <=0 抛 ValueError，校验后记为 e。全部参数先校验
+    完毕且不修改输入。
+
+    随后按 batch 序从 0.0 累加 A 并除以项数得均值 m，再从 0.0 按同序
+    累加 (A-m)**2 并除以项数得总体方差 v，取 d=math.sqrt(v)。v==0.0
+    时规范化优势均为正 0.0，否则按原序取 (A-m)/(d+e)；上述任一运算
+    溢出或中间量、结果非有限均抛 ValueError。以原 s/a/o 与规范化优势
+    构造新行，调用 ppo_update(logits, new_batch, lr, c, epochs)，其
+    异常原样抛出。返回其 logits、objectives、probabilities 及 m、d、
+    规范化优势 float 列表；不修改输入，同输入逐值一致。
+    """
+    if not isinstance(logits, list):
+        raise TypeError("logits must be a list")
+    if not logits:
+        raise ValueError("logits must be non-empty")
+    width = None
+    for row in logits:
+        if not isinstance(row, list):
+            raise TypeError("every row of logits must be a list")
+        if not row:
+            raise ValueError("every row of logits must be non-empty")
+        if width is None:
+            width = len(row)
+        elif len(row) != width:
+            raise ValueError("logits must be rectangular")
+        for item in row:
+            if not isinstance(item, float):
+                raise TypeError("logits must contain only float")
+            if not math.isfinite(item):
+                raise ValueError("logits must contain only finite float")
+    n_rows = len(logits)
+    n_cols = width
+
+    if not isinstance(batch, list):
+        raise TypeError("batch must be a list")
+    if not batch:
+        raise ValueError("batch must be non-empty")
+    samples = []
+    for item in batch:
+        if not isinstance(item, list):
+            raise TypeError("every batch item must be a list")
+        if len(item) != 4:
+            raise ValueError("every batch item must have exactly four elements")
+        s, a, o, adv = item
+        if isinstance(s, bool) or not isinstance(s, int):
+            raise TypeError("state index must be a non-bool int")
+        if isinstance(a, bool) or not isinstance(a, int):
+            raise TypeError("action index must be a non-bool int")
+        if not 0 <= s < n_rows:
+            raise ValueError("state index out of range")
+        if not 0 <= a < n_cols:
+            raise ValueError("action index out of range")
+        if not isinstance(o, float):
+            raise TypeError("old log-prob must be a float")
+        if not math.isfinite(o):
+            raise ValueError("old log-prob must be finite")
+        if not isinstance(adv, float):
+            raise TypeError("advantage must be a float")
+        if not math.isfinite(adv):
+            raise ValueError("advantage must be finite")
+        samples.append((s, a, o, adv))
+
+    if not isinstance(lr, float):
+        raise TypeError("lr must be a float")
+    if not math.isfinite(lr):
+        raise ValueError("lr must be finite")
+    if lr <= 0.0 or lr > 1.0:
+        raise ValueError("lr must be in (0, 1]")
+    if not isinstance(c, float):
+        raise TypeError("c must be a float")
+    if not math.isfinite(c):
+        raise ValueError("c must be finite")
+    if c < 0.0 or c >= 1.0:
+        raise ValueError("c must be in [0, 1)")
+    if isinstance(epochs, bool) or not isinstance(epochs, int):
+        raise TypeError("epochs must be a non-bool int")
+    if epochs <= 0:
+        raise ValueError("epochs must be positive")
+    if isinstance(epsilon, bool) or not isinstance(epsilon, (int, float)):
+        raise TypeError("epsilon must be an int or float")
+    try:
+        e = float(epsilon)
+    except OverflowError:
+        raise ValueError("epsilon must convert to a finite float")
+    if not math.isfinite(e) or e <= 0.0:
+        raise ValueError("epsilon must be finite and > 0")
+
+    n_batch = len(samples)
+    total = 0.0
+    for _s, _a, _o, adv in samples:
+        total += adv
+        if not math.isfinite(total):
+            raise ValueError("advantage sum must be finite")
+    m = total / n_batch
+    if not math.isfinite(m):
+        raise ValueError("advantage mean must be finite")
+    squared = 0.0
+    for _s, _a, _o, adv in samples:
+        diff = adv - m
+        if not math.isfinite(diff):
+            raise ValueError("centered advantage must be finite")
+        try:
+            term = diff ** 2
+        except OverflowError:
+            raise ValueError("squared advantage must be finite")
+        if not math.isfinite(term):
+            raise ValueError("squared advantage must be finite")
+        squared += term
+        if not math.isfinite(squared):
+            raise ValueError("variance sum must be finite")
+    v = squared / n_batch
+    if not math.isfinite(v):
+        raise ValueError("advantage variance must be finite")
+    d = math.sqrt(v)
+    if not math.isfinite(d):
+        raise ValueError("advantage std must be finite")
+
+    if v == 0.0:
+        advantages = [0.0] * n_batch
+    else:
+        denom = d + e
+        if not math.isfinite(denom):
+            raise ValueError("normalization denominator must be finite")
+        advantages = []
+        for _s, _a, _o, adv in samples:
+            diff = adv - m
+            if not math.isfinite(diff):
+                raise ValueError("centered advantage must be finite")
+            normalized = diff / denom
+            if not math.isfinite(normalized):
+                raise ValueError("normalized advantage must be finite")
+            advantages.append(normalized)
+
+    new_batch = [
+        [s, a, o, normalized]
+        for (s, a, o, _adv), normalized in zip(samples, advantages)
+    ]
+    result = ppo_update(logits, new_batch, lr, c, epochs)
+    return {
+        "logits": result["logits"],
+        "objectives": result["objectives"],
+        "probabilities": result["probabilities"],
+        "mean": m,
+        "std": d,
+        "advantages": advantages,
+    }
+
+
 def ppo_policy_kl(old_logits, new_logits) -> dict:
     """新旧策略 logits 的逐行 KL 散度，返回固定键序 rows、mean、max 的
     dict。
