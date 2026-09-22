@@ -3297,44 +3297,38 @@ def ppo_entropy_update(logits, lr=0.05, entropy_coef=0.01, epochs=4) -> dict:
     if epochs <= 0:
         raise ValueError("epochs must be positive")
 
-    def _stable_softmax(row):
-        m = max(row)
-        exps = []
-        total = 0.0
-        for value in row:
-            try:
-                e = math.exp(value - m)
-            except OverflowError:
-                raise ValueError("softmax exp overflow")
-            if not math.isfinite(e):
-                raise ValueError("softmax exp term must be finite")
-            exps.append(e)
-            try:
-                total += e
-            except OverflowError:
-                raise ValueError("softmax normalizer overflow")
-            if not math.isfinite(total):
-                raise ValueError("softmax normalizer must be finite")
-        probs = []
-        for e in exps:
-            p = e / total
-            if not math.isfinite(p):
-                raise ValueError("probabilities must be finite")
-            probs.append(p)
-        return probs
-
     L = [list(row) for row in logits]
     entropies = []
     for _ in range(epochs):
         frozen = [list(row) for row in L]
-        ent_sum = 0.0
         new_rows = [[0.0] * n_cols for _ in range(n_rows)]
+        row_entropies = []
         for i in range(n_rows):
             row = frozen[i]
-            probs = _stable_softmax(row)
-            entropy = 0.0
-            for p in probs:
+            m = max(row)
+            exps = []
+            for j in range(n_cols):
+                try:
+                    e = math.exp(row[j] - m)
+                except OverflowError:
+                    raise ValueError("softmax exp overflow")
+                if not math.isfinite(e):
+                    raise ValueError("softmax exp term must be finite")
+                exps.append(e)
+            total = sum(exps, 0.0)
+            if not math.isfinite(total):
+                raise ValueError("softmax normalizer must be finite")
+            probs = []
+            for j in range(n_cols):
+                p = exps[j] / total
+                if not math.isfinite(p):
+                    raise ValueError("probabilities must be finite")
+                probs.append(p)
+            terms = []
+            for j in range(n_cols):
+                p = probs[j]
                 if p == 0.0:
+                    terms.append(0.0)
                     continue
                 try:
                     term = p * math.log(p)
@@ -3342,18 +3336,11 @@ def ppo_entropy_update(logits, lr=0.05, entropy_coef=0.01, epochs=4) -> dict:
                     raise ValueError("entropy term overflow")
                 if not math.isfinite(term):
                     raise ValueError("entropy term must be finite")
-                try:
-                    entropy -= term
-                except OverflowError:
-                    raise ValueError("entropy sum overflow")
-                if not math.isfinite(entropy):
-                    raise ValueError("entropy must be finite")
-            try:
-                ent_sum += entropy
-            except OverflowError:
-                raise ValueError("entropy mean sum overflow")
-            if not math.isfinite(ent_sum):
-                raise ValueError("entropy mean sum must be finite")
+                terms.append(term)
+            entropy = -sum(terms, 0.0)
+            if not math.isfinite(entropy):
+                raise ValueError("entropy must be finite")
+            row_entropies.append(entropy)
             for j in range(n_cols):
                 p = probs[j]
                 if p == 0.0:
@@ -3372,15 +3359,317 @@ def ppo_entropy_update(logits, lr=0.05, entropy_coef=0.01, epochs=4) -> dict:
                 if not math.isfinite(new_value):
                     raise ValueError("updated logits must be finite")
                 new_rows[i][j] = new_value
-        mean_entropy = ent_sum / n_rows
+        mean_entropy = sum(row_entropies, 0.0) / n_rows
         if not math.isfinite(mean_entropy):
             raise ValueError("epoch mean entropy must be finite")
         entropies.append(mean_entropy)
         L = new_rows
 
-    probabilities = [_stable_softmax(row) for row in L]
+    probabilities = []
+    for row in L:
+        m = max(row)
+        exps = []
+        for j in range(n_cols):
+            try:
+                e = math.exp(row[j] - m)
+            except OverflowError:
+                raise ValueError("softmax exp overflow")
+            if not math.isfinite(e):
+                raise ValueError("softmax exp term must be finite")
+            exps.append(e)
+        total = sum(exps, 0.0)
+        if not math.isfinite(total):
+            raise ValueError("softmax normalizer must be finite")
+        probs = []
+        for j in range(n_cols):
+            p = exps[j] / total
+            if not math.isfinite(p):
+                raise ValueError("probabilities must be finite")
+            probs.append(p)
+        probabilities.append(probs)
     return {
         "logits": L,
+        "entropies": entropies,
+        "probabilities": probabilities,
+    }
+
+
+def ppo_update_entropy(
+    logits, batch, lr=0.05, c=0.2, entropy_coef=0.01, epochs=4
+) -> dict:
+    """PPO 裁剪目标叠加熵正则的多轮 logits 更新，返回固定键序 logits、
+    objectives、entropies、probabilities 的 dict。
+
+    logits、batch、lr、c、epochs 的校验与异常逐项沿用 ppo_update；
+    entropy_coef 须为非 bool 的 int/float，类型不符抛 TypeError，转
+    float 溢出、非有限或越界 [0, 1] 抛 ValueError，校验后记为浮点系数。
+    全部参数先校验完毕且不修改输入。
+
+    每轮冻结 L，逐行取 m=max(row)，按列序求 e_j=exp(L_j-m)；PPO 部分
+    沿用 ppo_update 的顺序累加 normalizer T（T+=e_j）与
+    q_j=L_j-m-log(T)，概率取 p'_j=exp(q_j)；熵部分 normalizer 为
+    S=sum(e_j, 0.0)，概率取 p_j=e_j/S。PPO 部分按 batch 序以 o、q_a 求
+    r=exp(q_a-o)，objective 为 sum(min(r*A, clip(r)*A), 0.0)/len(batch)；
+    若 A>0 且 r>1+c 或 A<0 且 r<1-c，该样本梯度为 0，否则行 s 列 j
+    梯度为 r*A*(I[j==a]-p'_j)，依样本、列序累加后除批量长度。熵部分
+    逐行令 E=-sum(p_j*log(p_j), 0.0)（p_j=0 项以 0 计），列序梯度
+    h_j=entropy_coef*p_j*(-log(p_j)-E)，各轮熵均值为
+    sum(E, 0.0)/行数。两份梯度均取自冻结 L，再同步令
+    L_j+=lr*(ppo_j+entropy_j)；entropy_coef=0 时 logits 与 objectives
+    与 ppo_update 逐值相同。任一 exp/log/乘加/更新或最终输出非有限均
+    抛 ValueError。返回最终 float 矩阵 L、逐轮 objective 均值 list、
+    逐轮熵均值 list 及最终稳定 softmax（按 p_j 配方）二维 float list；
+    同输入逐值一致。
+    """
+    if not isinstance(logits, list):
+        raise TypeError("logits must be a list")
+    if not logits:
+        raise ValueError("logits must be non-empty")
+    width = None
+    for row in logits:
+        if not isinstance(row, list):
+            raise TypeError("every row of logits must be a list")
+        if not row:
+            raise ValueError("every row of logits must be non-empty")
+        if width is None:
+            width = len(row)
+        elif len(row) != width:
+            raise ValueError("logits must be rectangular")
+        for item in row:
+            if not isinstance(item, float):
+                raise TypeError("logits must contain only float")
+            if not math.isfinite(item):
+                raise ValueError("logits must contain only finite float")
+    n_rows = len(logits)
+    n_cols = width
+
+    if not isinstance(batch, list):
+        raise TypeError("batch must be a list")
+    if not batch:
+        raise ValueError("batch must be non-empty")
+    samples = []
+    for item in batch:
+        if not isinstance(item, list):
+            raise TypeError("every batch item must be a list")
+        if len(item) != 4:
+            raise ValueError("every batch item must have exactly four elements")
+        s, a, o, adv = item
+        if isinstance(s, bool) or not isinstance(s, int):
+            raise TypeError("state index must be a non-bool int")
+        if isinstance(a, bool) or not isinstance(a, int):
+            raise TypeError("action index must be a non-bool int")
+        if not 0 <= s < n_rows:
+            raise ValueError("state index out of range")
+        if not 0 <= a < n_cols:
+            raise ValueError("action index out of range")
+        if not isinstance(o, float):
+            raise TypeError("old log-prob must be a float")
+        if not math.isfinite(o):
+            raise ValueError("old log-prob must be finite")
+        if not isinstance(adv, float):
+            raise TypeError("advantage must be a float")
+        if not math.isfinite(adv):
+            raise ValueError("advantage must be finite")
+        samples.append((s, a, o, adv))
+
+    if not isinstance(lr, float):
+        raise TypeError("lr must be a float")
+    if not math.isfinite(lr):
+        raise ValueError("lr must be finite")
+    if lr <= 0.0 or lr > 1.0:
+        raise ValueError("lr must be in (0, 1]")
+    if not isinstance(c, float):
+        raise TypeError("c must be a float")
+    if not math.isfinite(c):
+        raise ValueError("c must be finite")
+    if c < 0.0 or c >= 1.0:
+        raise ValueError("c must be in [0, 1)")
+    if isinstance(epochs, bool) or not isinstance(epochs, int):
+        raise TypeError("epochs must be a non-bool int")
+    if epochs <= 0:
+        raise ValueError("epochs must be positive")
+    if isinstance(entropy_coef, bool) or not isinstance(
+        entropy_coef, (int, float)
+    ):
+        raise TypeError("entropy_coef must be an int or float")
+    try:
+        entropy_coef = float(entropy_coef)
+    except OverflowError:
+        raise ValueError("entropy_coef must convert to a finite float")
+    if not math.isfinite(entropy_coef):
+        raise ValueError("entropy_coef must be finite")
+    if entropy_coef < 0.0 or entropy_coef > 1.0:
+        raise ValueError("entropy_coef must be in [0, 1]")
+
+    def _frozen(row):
+        m = max(row)
+        exps = []
+        total_ppo = 0.0
+        for j in range(n_cols):
+            try:
+                e = math.exp(row[j] - m)
+            except OverflowError:
+                raise ValueError("softmax exp overflow")
+            if not math.isfinite(e):
+                raise ValueError("softmax exp term must be finite")
+            exps.append(e)
+            total_ppo += e
+            if not math.isfinite(total_ppo):
+                raise ValueError("softmax normalizer must be finite")
+        total = sum(exps, 0.0)
+        if not math.isfinite(total):
+            raise ValueError("softmax normalizer must be finite")
+        log_total = math.log(total_ppo)
+        if not math.isfinite(log_total):
+            raise ValueError("softmax log normalizer must be finite")
+        q = []
+        p_ppo = []
+        p_entropy = []
+        for j in range(n_cols):
+            q_j = row[j] - m - log_total
+            if not math.isfinite(q_j):
+                raise ValueError("log-probabilities must be finite")
+            pp_j = math.exp(q_j)
+            if not math.isfinite(pp_j):
+                raise ValueError("probabilities must be finite")
+            pe_j = exps[j] / total
+            if not math.isfinite(pe_j):
+                raise ValueError("probabilities must be finite")
+            q.append(q_j)
+            p_ppo.append(pp_j)
+            p_entropy.append(pe_j)
+        return q, p_ppo, p_entropy
+
+    def _final_probs(row):
+        m = max(row)
+        exps = []
+        for j in range(n_cols):
+            try:
+                e = math.exp(row[j] - m)
+            except OverflowError:
+                raise ValueError("softmax exp overflow")
+            if not math.isfinite(e):
+                raise ValueError("softmax exp term must be finite")
+            exps.append(e)
+        total = sum(exps, 0.0)
+        if not math.isfinite(total):
+            raise ValueError("softmax normalizer must be finite")
+        probs = []
+        for j in range(n_cols):
+            p_j = exps[j] / total
+            if not math.isfinite(p_j):
+                raise ValueError("probabilities must be finite")
+            probs.append(p_j)
+        return probs
+
+    L = [list(row) for row in logits]
+    n_batch = len(samples)
+    objectives = []
+    entropies = []
+    for _ in range(epochs):
+        frozen = [list(row) for row in L]
+        qs = []
+        ps_ppo = []
+        ps_entropy = []
+        for row in frozen:
+            q, p_ppo, p_entropy = _frozen(row)
+            qs.append(q)
+            ps_ppo.append(p_ppo)
+            ps_entropy.append(p_entropy)
+
+        g = [[0.0] * n_cols for _ in range(n_rows)]
+        objective_terms = []
+        for s, a, o, adv in samples:
+            d = qs[s][a] - o
+            if not math.isfinite(d):
+                raise ValueError("log-prob difference must be finite")
+            try:
+                r = math.exp(d)
+            except OverflowError:
+                raise ValueError("probability ratio exp overflow")
+            if not math.isfinite(r):
+                raise ValueError("probability ratio must be finite")
+            clipped = min(max(r, 1.0 - c), 1.0 + c)
+            u = r * adv
+            v = clipped * adv
+            if not math.isfinite(u) or not math.isfinite(v):
+                raise ValueError("clipped objective terms must be finite")
+            objective_terms.append(min(u, v))
+            if (adv > 0.0 and r > 1.0 + c) or (
+                adv < 0.0 and r < 1.0 - c
+            ):
+                continue
+            row_g = g[s]
+            p_row = ps_ppo[s]
+            coeff = r * adv
+            for j in range(n_cols):
+                grad = coeff * ((1.0 if j == a else 0.0) - p_row[j])
+                row_g[j] += grad
+                if not math.isfinite(row_g[j]):
+                    raise ValueError("gradient must be finite")
+        objective_total = sum(objective_terms, 0.0)
+        if not math.isfinite(objective_total):
+            raise ValueError("objective sum must be finite")
+        mean_objective = objective_total / n_batch
+        if not math.isfinite(mean_objective):
+            raise ValueError("epoch mean objective must be finite")
+        objectives.append(mean_objective)
+
+        entropy_grads = [[0.0] * n_cols for _ in range(n_rows)]
+        row_entropies = []
+        for i in range(n_rows):
+            probs = ps_entropy[i]
+            terms = []
+            for j in range(n_cols):
+                p = probs[j]
+                if p == 0.0:
+                    terms.append(0.0)
+                    continue
+                try:
+                    term = p * math.log(p)
+                except OverflowError:
+                    raise ValueError("entropy term overflow")
+                if not math.isfinite(term):
+                    raise ValueError("entropy term must be finite")
+                terms.append(term)
+            entropy = -sum(terms, 0.0)
+            if not math.isfinite(entropy):
+                raise ValueError("entropy must be finite")
+            row_entropies.append(entropy)
+            for j in range(n_cols):
+                p = probs[j]
+                if p == 0.0:
+                    h = 0.0
+                else:
+                    try:
+                        h = entropy_coef * p * (-math.log(p) - entropy)
+                    except OverflowError:
+                        raise ValueError("entropy gradient overflow")
+                if not math.isfinite(h):
+                    raise ValueError("entropy gradient must be finite")
+                entropy_grads[i][j] = h
+        mean_entropy = sum(row_entropies, 0.0) / n_rows
+        if not math.isfinite(mean_entropy):
+            raise ValueError("epoch mean entropy must be finite")
+        entropies.append(mean_entropy)
+
+        for i in range(n_rows):
+            for j in range(n_cols):
+                ppo_grad = g[i][j] / n_batch
+                if not math.isfinite(ppo_grad):
+                    raise ValueError("mean gradient must be finite")
+                total_grad = ppo_grad + entropy_grads[i][j]
+                if not math.isfinite(total_grad):
+                    raise ValueError("combined gradient must be finite")
+                new_value = L[i][j] + lr * total_grad
+                if not math.isfinite(new_value):
+                    raise ValueError("updated logits must be finite")
+                L[i][j] = new_value
+
+    probabilities = [_final_probs(row) for row in L]
+    return {
+        "logits": L,
+        "objectives": objectives,
         "entropies": entropies,
         "probabilities": probabilities,
     }
