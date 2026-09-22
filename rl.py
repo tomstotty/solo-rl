@@ -9075,6 +9075,133 @@ def ppo_trace_verify(env, data) -> dict:
     }
 
 
+def categorical_projection(
+    rewards,
+    dones,
+    next_probs,
+    gamma=0.99,
+    v_min=-10.0,
+    v_max=10.0,
+    atoms=51,
+) -> dict:
+    """C51 分类分布投影，返回固定键序 support、probabilities 的 dict。
+
+    rewards、dones、next_probs 须为非空 list/tuple 且三者等长；
+    next_probs 每行为恰 atoms 项的概率分布。rewards 各项为非 bool
+    的有限 int/float；dones 各项为 bool；概率为非 bool 的有限非负
+    数，且每行按 sum(row, 0.0) 恰为 1.0。gamma 为非 bool 的有限
+    int/float 且须在 [0, 1]；v_min、v_max 为非 bool 的有限数且
+    v_min < v_max；atoms 为非 bool 的 int 且 >= 2。类型错抛
+    TypeError；空、长度/形状、非有限、范围、行和错抛 ValueError。
+    数值先转换为 float，不修改输入。令
+    delta=(v_max-v_min)/(atoms-1)、support[i]=v_min+i*delta。
+    投影质量自 0.0 累加：依 t、j 令
+    z=clip(rewards[t]+(0.0 if dones[t] else gamma*support[j])) 至
+    [v_min, v_max]，b=(z-v_min)/delta，l=floor(b)，u=ceil(b)；
+    l==u 时向 m[l] 加 p，否则先后向 m[l] 加 p*(u-b)、向 m[u] 加
+    p*(b-l)。中间量或输出非有限均抛 ValueError。两个列表均为
+    float 新 list，结果确定。
+    """
+    for name, seq in (
+        ("rewards", rewards),
+        ("dones", dones),
+        ("next_probs", next_probs),
+    ):
+        if not isinstance(seq, (list, tuple)):
+            raise TypeError(f"{name} must be a list or tuple")
+        if len(seq) == 0:
+            raise ValueError(f"{name} must be non-empty")
+    if len(dones) != len(rewards) or len(next_probs) != len(rewards):
+        raise ValueError("rewards, dones and next_probs must be equal length")
+
+    def _to_float(item, name):
+        if isinstance(item, bool) or not isinstance(item, (int, float)):
+            raise TypeError(f"{name} must contain only int or float")
+        try:
+            result = float(item)
+        except OverflowError:
+            raise ValueError(f"{name} must convert to a finite float")
+        if not math.isfinite(result):
+            raise ValueError(f"{name} must contain only finite numbers")
+        return result
+
+    if isinstance(atoms, bool) or not isinstance(atoms, int):
+        raise TypeError("atoms must be an int")
+    if atoms < 2:
+        raise ValueError("atoms must be >= 2")
+
+    g = _to_float(gamma, "gamma")
+    if g < 0.0 or g > 1.0:
+        raise ValueError("gamma must be in [0, 1]")
+    lo = _to_float(v_min, "v_min")
+    hi = _to_float(v_max, "v_max")
+    if not lo < hi:
+        raise ValueError("v_min must be less than v_max")
+
+    rs = [_to_float(item, "rewards") for item in rewards]
+    ds = []
+    for item in dones:
+        if not isinstance(item, bool):
+            raise TypeError("dones must contain only bool")
+        ds.append(item)
+    rows = []
+    for row in next_probs:
+        if not isinstance(row, (list, tuple)):
+            raise TypeError("every next_probs row must be a list or tuple")
+        if len(row) != atoms:
+            raise ValueError("every next_probs row must have exactly atoms items")
+        probs = []
+        for item in row:
+            p = _to_float(item, "next_probs")
+            if p < 0.0:
+                raise ValueError("probabilities must be non-negative")
+            probs.append(p)
+        if sum(row, 0.0) != 1.0:
+            raise ValueError("every next_probs row must sum to 1.0")
+        rows.append(probs)
+
+    delta = (hi - lo) / (atoms - 1)
+    if not math.isfinite(delta):
+        raise ValueError("support spacing must be finite")
+    support = []
+    for i in range(atoms):
+        s = lo + i * delta
+        if not math.isfinite(s):
+            raise ValueError("support values must be finite")
+        support.append(s)
+
+    m = [0.0] * atoms
+    for t in range(len(rs)):
+        r = rs[t]
+        done = ds[t]
+        probs = rows[t]
+        for j in range(atoms):
+            p = probs[j]
+            z = r + (0.0 if done else g * support[j])
+            if not math.isfinite(z):
+                raise ValueError("projected value must be finite")
+            z = min(max(z, lo), hi)
+            b = (z - lo) / delta
+            if not math.isfinite(b):
+                raise ValueError("projection coordinate must be finite")
+            # z 已截断至 [v_min, v_max]，b 数学上属于 [0, atoms-1]；
+            # 浮点误差可能使其略出界，截回以保持下标合法。
+            b = min(max(b, 0.0), float(atoms - 1))
+            l = math.floor(b)
+            u = math.ceil(b)
+            if l == u:
+                m[l] += p
+            else:
+                m[l] += p * (u - b)
+                m[u] += p * (b - l)
+            if not math.isfinite(m[l]) or not math.isfinite(m[u]):
+                raise ValueError("projected probabilities must be finite")
+    for value in m:
+        if not math.isfinite(value):
+            raise ValueError("projected probabilities must be finite")
+    return {"support": support, "probabilities": m}
+
+
 def _format_value(value):
     if abs(value) < 0.5e-12:
         value = 0.0
