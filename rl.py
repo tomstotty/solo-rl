@@ -4179,6 +4179,178 @@ def ppo_kl_penalty_update(logits, batch, lr=0.05, beta=1.0, epochs=4) -> dict:
     }
 
 
+def ppo_adaptive_kl_update(
+    logits,
+    batch,
+    lr=0.05,
+    beta=1.0,
+    target=0.01,
+    factor=2.0,
+    lo=1e-4,
+    hi=1e4,
+    epochs=4,
+) -> dict:
+    """自适应 KL 惩罚系数的 PPO 多轮 logits 更新，返回固定键序 logits、
+    objectives、kls、betas 的 dict。
+
+    logits、batch、lr、epochs 的校验与异常逐项沿用
+    ppo_kl_penalty_update；beta、target、factor、lo、hi 须为非 bool 的
+    int/float，类型不符抛 TypeError；转 float 溢出或非有限，
+    beta、target、lo、hi <= 0，factor <= 1，或 beta 不在 [lo, hi] 内，
+    均抛 ValueError。先完成全部校验再转 float 并复制 logits 为 L，不
+    修改输入。记 b=beta，逐轮调用 ppo_kl_penalty_update(L, batch, lr,
+    b, 1)，以返回的 logits 续训，并收集该轮 objective、KL。若
+    KL>1.5*target 则 b=min(hi, b*factor)；若 KL<target/1.5 则
+    b=max(lo, b/factor)；否则 b 不变；每轮记录调整后的新 b。任一运算
+    溢出或结果非有限均抛 ValueError，失败时无部分结果。返回最终
+    float 矩阵及逐轮 objective、KL、beta 的 float list，均为新容器，
+    同输入逐值一致。
+    """
+    if not isinstance(logits, list):
+        raise TypeError("logits must be a list")
+    if not logits:
+        raise ValueError("logits must be non-empty")
+    width = None
+    for row in logits:
+        if not isinstance(row, list):
+            raise TypeError("every row of logits must be a list")
+        if not row:
+            raise ValueError("every row of logits must be non-empty")
+        if width is None:
+            width = len(row)
+        elif len(row) != width:
+            raise ValueError("logits must be rectangular")
+        for item in row:
+            if not isinstance(item, float):
+                raise TypeError("logits must contain only float")
+            if not math.isfinite(item):
+                raise ValueError("logits must contain only finite float")
+    n_rows = len(logits)
+    n_cols = width
+
+    if not isinstance(batch, list):
+        raise TypeError("batch must be a list")
+    if not batch:
+        raise ValueError("batch must be non-empty")
+    samples = []
+    for item in batch:
+        if not isinstance(item, list):
+            raise TypeError("every batch item must be a list")
+        if len(item) != 4:
+            raise ValueError("every batch item must have exactly four elements")
+        s, a, o, adv = item
+        if isinstance(s, bool) or not isinstance(s, int):
+            raise TypeError("state index must be a non-bool int")
+        if isinstance(a, bool) or not isinstance(a, int):
+            raise TypeError("action index must be a non-bool int")
+        if not 0 <= s < n_rows:
+            raise ValueError("state index out of range")
+        if not 0 <= a < n_cols:
+            raise ValueError("action index out of range")
+        if not isinstance(o, float):
+            raise TypeError("old log-prob must be a float")
+        if not math.isfinite(o):
+            raise ValueError("old log-prob must be finite")
+        if not isinstance(adv, float):
+            raise TypeError("advantage must be a float")
+        if not math.isfinite(adv):
+            raise ValueError("advantage must be finite")
+        samples.append((s, a, o, adv))
+
+    if not isinstance(lr, float):
+        raise TypeError("lr must be a float")
+    if not math.isfinite(lr):
+        raise ValueError("lr must be finite")
+    if lr <= 0.0 or lr > 1.0:
+        raise ValueError("lr must be in (0, 1]")
+
+    numeric_params = (
+        ("beta", beta),
+        ("target", target),
+        ("factor", factor),
+        ("lo", lo),
+        ("hi", hi),
+    )
+    for name, value in numeric_params:
+        if isinstance(value, bool) or not isinstance(value, (int, float)):
+            raise TypeError(f"{name} must be a non-bool int or float")
+
+    numeric_values = {}
+    for name, value in numeric_params:
+        try:
+            converted = float(value)
+        except OverflowError:
+            raise ValueError(f"{name} must convert to a finite float")
+        if not math.isfinite(converted):
+            raise ValueError(f"{name} must be finite")
+        numeric_values[name] = converted
+    b = numeric_values["beta"]
+    t = numeric_values["target"]
+    factor_value = numeric_values["factor"]
+    lo_value = numeric_values["lo"]
+    hi_value = numeric_values["hi"]
+
+    if b <= 0.0:
+        raise ValueError("beta must be positive")
+    if t <= 0.0:
+        raise ValueError("target must be positive")
+    if factor_value <= 1.0:
+        raise ValueError("factor must be greater than 1")
+    if lo_value <= 0.0:
+        raise ValueError("lo must be positive")
+    if hi_value <= 0.0:
+        raise ValueError("hi must be positive")
+    if not lo_value <= b <= hi_value:
+        raise ValueError("beta must be within [lo, hi]")
+
+    if isinstance(epochs, bool) or not isinstance(epochs, int):
+        raise TypeError("epochs must be a non-bool int")
+    if epochs <= 0:
+        raise ValueError("epochs must be positive")
+
+    L = [list(row) for row in logits]
+    objectives = []
+    kls = []
+    betas = []
+    for _ in range(epochs):
+        result = ppo_kl_penalty_update(L, batch, lr, b, 1)
+        L = result["logits"]
+        objective = result["objectives"][0]
+        kl = result["kls"][0]
+        objectives.append(objective)
+        kls.append(kl)
+        try:
+            upper = 1.5 * t
+            lower = t / 1.5
+        except OverflowError:
+            raise ValueError("KL threshold must be finite")
+        if not math.isfinite(upper) or not math.isfinite(lower):
+            raise ValueError("KL threshold must be finite")
+        try:
+            if kl > upper:
+                candidate = b * factor_value
+                if not math.isfinite(candidate):
+                    raise ValueError("updated beta must be finite")
+                b = min(hi_value, candidate)
+            elif kl < lower:
+                candidate = b / factor_value
+                if not math.isfinite(candidate):
+                    raise ValueError("updated beta must be finite")
+                b = max(lo_value, candidate)
+        except OverflowError:
+            raise ValueError("updated beta must be finite")
+        if not math.isfinite(b):
+            raise ValueError("updated beta must be finite")
+        betas.append(b)
+
+    return {
+        "logits": L,
+        "objectives": objectives,
+        "kls": kls,
+        "betas": betas,
+    }
+
+
 def ppo_entropy_update(logits, lr=0.05, entropy_coef=0.01, epochs=4) -> dict:
     """PPO 熵正则多轮 logits 更新，返回固定键序 logits、entropies、
     probabilities 的 dict。
