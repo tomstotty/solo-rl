@@ -7723,6 +7723,228 @@ def ppo_train_minibatch(
     }
 
 
+def ppo_train_minibatch_value_clip(
+    env,
+    episodes=100,
+    alpha=0.05,
+    value_lr=0.1,
+    gamma=0.9,
+    lambda_=0.95,
+    c=0.2,
+    value_clip=0.2,
+    epochs=4,
+    batch_size=32,
+    seed=0,
+    shuffle_seed=0,
+    max_steps=1000,
+) -> dict:
+    """小批量 PPO 训练（策略更新后作截断值函数更新），返回 h/v 表、
+    步表与目标值。
+
+    参数校验沿 ppo_train_value_clip；batch_size 须为非 bool 的正
+    int，类型不符抛 TypeError，非正抛 ValueError；shuffle_seed 须
+    为非 bool 的 int（允许负值），类型不符抛 TypeError；全部校验在
+    采样前完成。状态编号、H/V 初始化、softmax 采样、GAE 轨迹、回合
+    边界与每步仅一次 random.Random(seed).random() 均沿
+    ppo_train_value_clip。第 e 回合（0 起）以步序
+    [s, a, old_logp, A] 为 batch，调用
+    ppo_minibatch(H, batch, batch_size, float(alpha), c, epochs,
+    shuffle_seed+e)，以其返回 logits 续训 H；shuffle_seed+e 只控
+    制该回合洗牌，采样随机流不额外消费。再以按步序的
+    [s, 旧 v, A+旧v] 批次调用
+    ppo_value_update(V, batch, float(value_lr), value_clip,
+    epochs)，以其返回 values 续训 V。两次更新调用均透传异常，无
+    部分结果。
+
+    返回键依次为 h、v、episodes、objectives；h、v、episodes 结构
+    沿 ppo_train_value_clip，objectives 为各回合 ppo_minibatch 返
+    回的完整小批 objectives 列表。同参两 seed（seed 与
+    shuffle_seed）逐值一致。
+    """
+    if not isinstance(env, GridWorld):
+        raise TypeError("env must be a GridWorld")
+    if isinstance(episodes, bool) or not isinstance(episodes, int):
+        raise TypeError("episodes must be an int")
+    if isinstance(seed, bool) or not isinstance(seed, int):
+        raise TypeError("seed must be an int")
+    if isinstance(shuffle_seed, bool) or not isinstance(shuffle_seed, int):
+        raise TypeError("shuffle_seed must be an int")
+    if isinstance(max_steps, bool) or not isinstance(max_steps, int):
+        raise TypeError("max_steps must be an int")
+    if isinstance(alpha, bool) or not isinstance(alpha, (int, float)):
+        raise TypeError("alpha must be an int or float")
+    if isinstance(gamma, bool) or not isinstance(gamma, (int, float)):
+        raise TypeError("gamma must be an int or float")
+    if isinstance(lambda_, bool) or not isinstance(lambda_, (int, float)):
+        raise TypeError("lambda_ must be an int or float")
+    if episodes <= 0:
+        raise ValueError("episodes must be positive")
+    if max_steps <= 0:
+        raise ValueError("max_steps must be positive")
+    if not _is_finite_number(alpha) or alpha <= 0 or alpha > 1:
+        raise ValueError("alpha must be finite and in (0, 1]")
+    if not _is_finite_number(gamma) or gamma < 0 or gamma > 1:
+        raise ValueError("gamma must be finite and in [0, 1]")
+    if not _is_finite_number(lambda_) or lambda_ < 0 or lambda_ > 1:
+        raise ValueError("lambda_ must be finite and in [0, 1]")
+    if not isinstance(c, float):
+        raise TypeError("c must be a float")
+    if not math.isfinite(c):
+        raise ValueError("c must be finite")
+    if c < 0.0 or c >= 1.0:
+        raise ValueError("c must be in [0, 1)")
+    if not isinstance(value_lr, float):
+        raise TypeError("value_lr must be a float")
+    if not math.isfinite(value_lr):
+        raise ValueError("value_lr must be finite")
+    if value_lr <= 0.0 or value_lr > 1.0:
+        raise ValueError("value_lr must be in (0, 1]")
+    if not isinstance(value_clip, float):
+        raise TypeError("value_clip must be a float")
+    if not math.isfinite(value_clip):
+        raise ValueError("value_clip must be finite")
+    if value_clip < 0.0 or value_clip >= 1.0:
+        raise ValueError("value_clip must be in [0, 1)")
+    if isinstance(epochs, bool) or not isinstance(epochs, int):
+        raise TypeError("epochs must be a non-bool int")
+    if epochs <= 0:
+        raise ValueError("epochs must be positive")
+    if isinstance(batch_size, bool) or not isinstance(batch_size, int):
+        raise TypeError("batch_size must be a non-bool int")
+    if batch_size <= 0:
+        raise ValueError("batch_size must be positive")
+
+    actions = tuple(_ACTIONS)  # U, R, D, L
+    states = sorted(
+        state
+        for state in _reachable_cells(env)
+        if env._cell(state) != "G"
+    )
+    state_index = {state: i for i, state in enumerate(states)}
+    h = [[0.0 for _ in actions] for _ in states]
+    values = [0.0 for _ in states]
+    rng = random.Random(seed)
+    all_episodes = []
+    all_objectives = []
+
+    for e in range(episodes):
+        state = env.reset()
+        trajectory = []
+        step_records = []
+        for _ in range(max_steps):
+            s = state_index[state]
+            row = h[s]
+            m = max(row)
+            weights = [math.exp(logit - m) for logit in row]
+            total = sum(weights)
+            if not math.isfinite(total) or total <= 0.0:
+                raise ValueError(
+                    "softmax normalizer must be finite and positive"
+                )
+            probs = [weight / total for weight in weights]
+            log_total = math.log(total)
+            u = rng.random()
+            cumulative = 0.0
+            a = 3
+            for k, p_k in enumerate(probs):
+                cumulative += p_k
+                if cumulative > u:
+                    a = k
+                    break
+            action = actions[a]
+            old_logp = row[a] - m - log_total
+            if not math.isfinite(old_logp):
+                raise ValueError("log-probabilities must be finite")
+            value = values[s]
+            next_state, reward, done = env.step(action)
+            value_next = 0.0 if done else values[state_index[next_state]]
+            trajectory.append(
+                (s, a, reward, old_logp, value, value_next, done)
+            )
+            step_records.append(
+                [state[0], state[1], action, reward, done]
+            )
+            if done:
+                break
+            state = next_state
+
+        advantages = [0.0] * len(trajectory)
+        a_t = 0.0
+        for t in range(len(trajectory) - 1, -1, -1):
+            (
+                _s,
+                _a,
+                reward,
+                _old_logp,
+                value,
+                value_next,
+                _done,
+            ) = trajectory[t]
+            delta = reward + gamma * value_next - value
+            if not math.isfinite(delta):
+                raise ValueError("GAE delta must be finite")
+            a_t = delta + gamma * lambda_ * a_t
+            if not math.isfinite(a_t):
+                raise ValueError("GAE advantage must be finite")
+            advantages[t] = a_t
+
+        policy_batch = [
+            [s, a, old_logp, adv]
+            for (s, a, _r, old_logp, _v, _v2, _done), adv in zip(
+                trajectory, advantages
+            )
+        ]
+        result = ppo_minibatch(
+            h,
+            policy_batch,
+            batch_size,
+            float(alpha),
+            c,
+            epochs,
+            shuffle_seed + e,
+        )
+        h = result["logits"]
+        all_objectives.append(result["objectives"])
+
+        value_batch = [
+            [s, value, adv + value]
+            for (s, _a, _r, _old_logp, value, _v2, _done), adv in zip(
+                trajectory, advantages
+            )
+        ]
+        value_result = ppo_value_update(
+            values,
+            value_batch,
+            float(value_lr),
+            value_clip,
+            epochs,
+        )
+        values = value_result["values"]
+        all_episodes.append(step_records)
+
+    h_table = [
+        [
+            float(r),
+            float(c),
+            h[i][0],
+            h[i][1],
+            h[i][2],
+            h[i][3],
+        ]
+        for i, (r, c) in enumerate(states)
+    ]
+    v_table = [
+        [float(r), float(c), values[i]]
+        for i, (r, c) in enumerate(states)
+    ]
+    return {
+        "h": h_table,
+        "v": v_table,
+        "episodes": all_episodes,
+        "objectives": all_objectives,
+    }
+
+
 def ppo_train_minibatch_kl(
     env,
     episodes=100,
