@@ -6273,6 +6273,241 @@ def ppo_train(
     }
 
 
+def ppo_converge(
+    env,
+    episodes=100,
+    seed=0,
+    max_steps=1000,
+    window=20,
+    success=.9,
+    reward=-20.,
+    patience=3,
+    min_ep=20,
+) -> dict:
+    """PPO 训练带收敛早停，返回 h 表、逐回合步表、目标值与收敛报告。
+
+    训练过程与 ppo_train(env, episodes, 0.05, 0.9, 0.95, 0.2, 4, seed,
+    max_steps) 完全一致：同一 random.Random(seed)，不增随机数调用，
+    实际运行 k 回合时，返回前三个键与 ppo_train 的 k 回合结果逐值一致。
+    window、patience、min_ep 须为非 bool 的 int，且为正，否则按情形抛
+    TypeError 或 ValueError；success、reward 须为非 bool 的 int/float，
+    转 float 溢出或非有限抛 ValueError，success 还须落在 [0, 1]。全部
+    校验在首次 reset 前完成。
+
+    每回合更新后记录该回合是否 done（步限截断记 False）与回报和。
+    end 回合（1 基）满 window 个时记窗
+    [start, end, success_rate, reward_mean, passed]：start 为
+    end-window+1，success_rate 为窗内 done 比例，reward_mean 自 0.0
+    按序累加窗内回报和再除 window，passed 当 success_rate>=success
+    且 reward_mean>=reward。首个 end>=min_ep 且连续 patience 窗
+    passed 时停训，否则训满 episodes。
+
+    返回键依次为 h、episodes、objectives、report；report 键依次为
+    converged、episode、windows：windows 为窗列表，episode 为命中
+    的 end 或 None，converged 等价于 episode 非 None。
+    """
+    if not isinstance(env, GridWorld):
+        raise TypeError("env must be a GridWorld")
+    if isinstance(episodes, bool) or not isinstance(episodes, int):
+        raise TypeError("episodes must be an int")
+    if isinstance(seed, bool) or not isinstance(seed, int):
+        raise TypeError("seed must be an int")
+    if isinstance(max_steps, bool) or not isinstance(max_steps, int):
+        raise TypeError("max_steps must be an int")
+    if isinstance(window, bool) or not isinstance(window, int):
+        raise TypeError("window must be an int")
+    if isinstance(patience, bool) or not isinstance(patience, int):
+        raise TypeError("patience must be an int")
+    if isinstance(min_ep, bool) or not isinstance(min_ep, int):
+        raise TypeError("min_ep must be an int")
+    if isinstance(success, bool) or not isinstance(success, (int, float)):
+        raise TypeError("success must be an int or float")
+    if isinstance(reward, bool) or not isinstance(reward, (int, float)):
+        raise TypeError("reward must be an int or float")
+    if episodes <= 0:
+        raise ValueError("episodes must be positive")
+    if max_steps <= 0:
+        raise ValueError("max_steps must be positive")
+    if window <= 0:
+        raise ValueError("window must be positive")
+    if patience <= 0:
+        raise ValueError("patience must be positive")
+    if min_ep <= 0:
+        raise ValueError("min_ep must be positive")
+    try:
+        success = float(success)
+    except OverflowError:
+        raise ValueError("success must be finite") from None
+    if not math.isfinite(success):
+        raise ValueError("success must be finite")
+    if success < 0.0 or success > 1.0:
+        raise ValueError("success must be in [0, 1]")
+    try:
+        reward = float(reward)
+    except OverflowError:
+        raise ValueError("reward must be finite") from None
+    if not math.isfinite(reward):
+        raise ValueError("reward must be finite")
+
+    alpha = 0.05
+    gamma = 0.9
+    lambda_ = 0.95
+    c = 0.2
+    epochs = 4
+
+    actions = tuple(_ACTIONS)  # U, R, D, L
+    states = sorted(
+        state
+        for state in _reachable_cells(env)
+        if env._cell(state) != "G"
+    )
+    state_index = {state: i for i, state in enumerate(states)}
+    h = [[0.0 for _ in actions] for _ in states]
+    values = [0.0 for _ in states]
+    rng = random.Random(seed)
+    all_episodes = []
+    all_objectives = []
+    dones = []
+    returns = []
+    windows = []
+    streak = 0
+    converged_episode = None
+
+    for _ in range(episodes):
+        state = env.reset()
+        trajectory = []
+        step_records = []
+        for _ in range(max_steps):
+            s = state_index[state]
+            row = h[s]
+            m = max(row)
+            weights = [math.exp(logit - m) for logit in row]
+            total = sum(weights)
+            if not math.isfinite(total) or total <= 0.0:
+                raise ValueError(
+                    "softmax normalizer must be finite and positive"
+                )
+            probs = [weight / total for weight in weights]
+            log_total = math.log(total)
+            u = rng.random()
+            cumulative = 0.0
+            a = 3
+            for k, p_k in enumerate(probs):
+                cumulative += p_k
+                if cumulative > u:
+                    a = k
+                    break
+            action = actions[a]
+            old_logp = row[a] - m - log_total
+            if not math.isfinite(old_logp):
+                raise ValueError("log-probabilities must be finite")
+            value = values[s]
+            next_state, reward_, done = env.step(action)
+            value_next = 0.0 if done else values[state_index[next_state]]
+            trajectory.append(
+                (s, a, reward_, old_logp, value, value_next, done)
+            )
+            step_records.append(
+                [state[0], state[1], action, reward_, done]
+            )
+            if done:
+                break
+            state = next_state
+
+        advantages = [0.0] * len(trajectory)
+        a_t = 0.0
+        for t in range(len(trajectory) - 1, -1, -1):
+            (
+                _s,
+                _a,
+                reward_,
+                _old_logp,
+                value,
+                value_next,
+                _done,
+            ) = trajectory[t]
+            delta = reward_ + gamma * value_next - value
+            if not math.isfinite(delta):
+                raise ValueError("GAE delta must be finite")
+            a_t = delta + gamma * lambda_ * a_t
+            if not math.isfinite(a_t):
+                raise ValueError("GAE advantage must be finite")
+            advantages[t] = a_t
+
+        batch = [
+            [s, a, old_logp, adv]
+            for (s, a, _r, old_logp, _v, _v2, _done), adv in zip(
+                trajectory, advantages
+            )
+        ]
+        result = ppo_update(h, batch, float(alpha), c, epochs)
+        h = result["logits"]
+        all_objectives.append(result["objectives"])
+
+        for (s, _a, _r, _old_logp, value, _v2, _done), adv in zip(
+            trajectory, advantages
+        ):
+            new_value = values[s] + alpha * (
+                adv + value - values[s]
+            )
+            if not math.isfinite(new_value):
+                raise ValueError("updated value must be finite")
+            values[s] = new_value
+        all_episodes.append(step_records)
+
+        dones.append(trajectory[-1][6])
+        episode_return = 0.0
+        for (_s, _a, reward_, _ol, _v, _v2, _d) in trajectory:
+            episode_return += reward_
+        returns.append(episode_return)
+
+        end = len(returns)
+        if end >= window:
+            start = end - window + 1
+            hits = 0
+            for flag in dones[start - 1:end]:
+                if flag:
+                    hits += 1
+            success_rate = hits / window
+            window_return = 0.0
+            for past_return in returns[start - 1:end]:
+                window_return += past_return
+            reward_mean = window_return / window
+            passed = success_rate >= success and reward_mean >= reward
+            windows.append(
+                [start, end, success_rate, reward_mean, passed]
+            )
+            if passed:
+                streak += 1
+            else:
+                streak = 0
+            if end >= min_ep and streak >= patience:
+                converged_episode = end
+                break
+
+    h_table = [
+        [
+            float(r),
+            float(c),
+            h[i][0],
+            h[i][1],
+            h[i][2],
+            h[i][3],
+        ]
+        for i, (r, c) in enumerate(states)
+    ]
+    return {
+        "h": h_table,
+        "episodes": all_episodes,
+        "objectives": all_objectives,
+        "report": {
+            "converged": converged_episode is not None,
+            "episode": converged_episode,
+            "windows": windows,
+        },
+    }
+
+
 def ppo_train_trace_bytes(
     env,
     episodes=100,
