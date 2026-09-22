@@ -3119,6 +3119,119 @@ def ppo_update(logits, batch, lr=0.05, c=0.2, epochs=4) -> dict:
     }
 
 
+def ppo_value_update(values, batch, lr=0.1, clip=0.2, epochs=4) -> dict:
+    """PPO 多轮值函数更新，返回固定键序 values 的 dict。
+
+    values 须为非空 list 且仅含有限 float；batch 须为非空 list，每项
+    恰为三项 list [s, o, t]，其中 s 为非 bool 的 int 且为 values 的
+    有效索引，o、t 为有限 float；lr、clip 为有限 float 且依次属于
+    (0, 1]、[0, 1)；epochs 为非 bool 正 int。容器、项或标量类型错
+    抛 TypeError，空、行长、索引、范围或有限性错抛 ValueError；先
+    全量校验且不改输入。复制 values 为 V，每轮冻结 X 为 V 的副本，
+    g 为同长全 0.0 列表；按 batch 序算 d=X[s]-o、
+    q=o+min(max(d,-clip),clip)、u=(X[s]-t)**2、v=(q-t)**2。若
+    u>=v 则 a=X[s]-t；否则仅当 -clip<d<clip 时 a=q-t，其余情形
+    a=0.0；按顺序累加 g[s]+=a。全批处理后按索引同步令
+    V[i]=X[i]-lr*g[i]/len(batch)。任一运算溢出或中间量、新值非
+    有限均抛 ValueError 且不返回部分结果。返回的 values 为最终
+    float 新 list；同输入逐值一致。
+    """
+    if not isinstance(values, list):
+        raise TypeError("values must be a list")
+    if not values:
+        raise ValueError("values must be non-empty")
+    for item in values:
+        if not isinstance(item, float):
+            raise TypeError("values must contain only float")
+        if not math.isfinite(item):
+            raise ValueError("values must contain only finite float")
+    n = len(values)
+
+    if not isinstance(batch, list):
+        raise TypeError("batch must be a list")
+    if not batch:
+        raise ValueError("batch must be non-empty")
+    samples = []
+    for item in batch:
+        if not isinstance(item, list):
+            raise TypeError("every batch item must be a list")
+        if len(item) != 3:
+            raise ValueError("every batch item must have exactly three elements")
+        s, o, t = item
+        if isinstance(s, bool) or not isinstance(s, int):
+            raise TypeError("state index must be a non-bool int")
+        if not 0 <= s < n:
+            raise ValueError("state index out of range")
+        if not isinstance(o, float):
+            raise TypeError("old value must be a float")
+        if not math.isfinite(o):
+            raise ValueError("old value must be finite")
+        if not isinstance(t, float):
+            raise TypeError("target value must be a float")
+        if not math.isfinite(t):
+            raise ValueError("target value must be finite")
+        samples.append((s, o, t))
+
+    if not isinstance(lr, float):
+        raise TypeError("lr must be a float")
+    if not math.isfinite(lr):
+        raise ValueError("lr must be finite")
+    if lr <= 0.0 or lr > 1.0:
+        raise ValueError("lr must be in (0, 1]")
+    if not isinstance(clip, float):
+        raise TypeError("clip must be a float")
+    if not math.isfinite(clip):
+        raise ValueError("clip must be finite")
+    if clip < 0.0 or clip >= 1.0:
+        raise ValueError("clip must be in [0, 1)")
+    if isinstance(epochs, bool) or not isinstance(epochs, int):
+        raise TypeError("epochs must be a non-bool int")
+    if epochs <= 0:
+        raise ValueError("epochs must be positive")
+
+    V = list(values)
+    n_batch = len(samples)
+    for _ in range(epochs):
+        X = list(V)
+        g = [0.0] * n
+        for s, o, t in samples:
+            x = X[s]
+            d = x - o
+            if not math.isfinite(d):
+                raise ValueError("value difference must be finite")
+            q = o + min(max(d, -clip), clip)
+            if not math.isfinite(q):
+                raise ValueError("clipped value must be finite")
+            try:
+                u = (x - t) ** 2
+                v = (q - t) ** 2
+            except OverflowError:
+                raise ValueError("squared value terms must remain finite")
+            if not math.isfinite(u) or not math.isfinite(v):
+                raise ValueError("squared value terms must be finite")
+            if u >= v:
+                a = x - t
+            elif -clip < d < clip:
+                a = q - t
+            else:
+                a = 0.0
+            if not math.isfinite(a):
+                raise ValueError("gradient term must be finite")
+            g[s] += a
+            if not math.isfinite(g[s]):
+                raise ValueError("gradient sum must be finite")
+        for i in range(n):
+            step = lr * g[i] / n_batch
+            if not math.isfinite(step):
+                raise ValueError("update step must be finite")
+            new_value = X[i] - step
+            if not math.isfinite(new_value):
+                raise ValueError("updated values must be finite")
+            V[i] = new_value
+
+    return {"values": V}
+
+
 def ppo_grad_clip(
     logits, batch, lr=0.05, c=0.2, epochs=4, max_norm=1.0
 ) -> dict:
