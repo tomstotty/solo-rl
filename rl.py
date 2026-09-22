@@ -3211,6 +3211,223 @@ def categorical_projection(
     return {"support": support, "probabilities": projected}
 
 
+def categorical_q_learning(
+    env,
+    episodes=500,
+    alpha=0.5,
+    gamma=0.99,
+    epsilon=0.1,
+    v_min=-10.0,
+    v_max=10.0,
+    atoms=51,
+    seed=0,
+    max_steps=1000,
+) -> dict:
+    """C51 分类分布 Q-learning，返回固定键序 q、distributions 的 dict。
+
+    q 为 {((row, col), action): float}，distributions 为
+    {((row, col), action): [float, ...]}（每项恰有 atoms 个概率），
+    键覆盖从 S 可达的非 G 格与 U/R/D/L 的全部组合，按状态坐标升序、
+    动作 URDL 排列。支撑与投影沿用 categorical_projection：
+    delta=(v_max-v_min)/(atoms-1)、support[i]=v_min+i*delta；初始
+    分布在距 0 最近的支撑原子处置 1.0，等距时取较小索引，其余为 0.0。
+
+    每回合 reset，单回合最多 max_steps 步；全部随机性来自一个
+    random.Random(seed)。每步先调一次 random()：其值 < epsilon 时按
+    URDL 调 randrange(4) 取探索动作，否则取期望 Q
+    （Q=Σsupport[j]*p[j]，从 0.0 按原子序累加）最大且 URDL 中首个
+    的动作。step 后 done 时目标分布为 reward 退化分布，否则取期望 Q
+    最大的下一状态动作分布，按 categorical_projection 的方式投影到
+    支撑，投影行从 0.0 开始累加；随后逐原子
+    p[j]+=alpha*(target[j]-p[j])。任何转换溢出或中间结果非有限抛
+    ValueError。返回 q 值同样从 0.0 按原子序累加，均为有限 float。
+    """
+    if not isinstance(env, GridWorld):
+        raise TypeError("env must be a GridWorld")
+    if isinstance(episodes, bool) or not isinstance(episodes, int):
+        raise TypeError("episodes must be an int")
+    if isinstance(atoms, bool) or not isinstance(atoms, int):
+        raise TypeError("atoms must be an int")
+    if isinstance(seed, bool) or not isinstance(seed, int):
+        raise TypeError("seed must be an int")
+    if isinstance(max_steps, bool) or not isinstance(max_steps, int):
+        raise TypeError("max_steps must be an int")
+    if isinstance(alpha, bool) or not isinstance(alpha, (int, float)):
+        raise TypeError("alpha must be an int or float")
+    if isinstance(gamma, bool) or not isinstance(gamma, (int, float)):
+        raise TypeError("gamma must be an int or float")
+    if isinstance(epsilon, bool) or not isinstance(epsilon, (int, float)):
+        raise TypeError("epsilon must be an int or float")
+    if isinstance(v_min, bool) or not isinstance(v_min, (int, float)):
+        raise TypeError("v_min must be an int or float")
+    if isinstance(v_max, bool) or not isinstance(v_max, (int, float)):
+        raise TypeError("v_max must be an int or float")
+    if episodes <= 0:
+        raise ValueError("episodes must be positive")
+    if max_steps <= 0:
+        raise ValueError("max_steps must be positive")
+    if atoms < 2:
+        raise ValueError("atoms must be >= 2")
+
+    def _scalar(value, name):
+        try:
+            result = float(value)
+        except OverflowError:
+            raise ValueError(f"{name} must convert to a finite float")
+        if not math.isfinite(result):
+            raise ValueError(f"{name} must be finite")
+        return result
+
+    a = _scalar(alpha, "alpha")
+    g = _scalar(gamma, "gamma")
+    e = _scalar(epsilon, "epsilon")
+    lo = _scalar(v_min, "v_min")
+    hi = _scalar(v_max, "v_max")
+    if a <= 0.0 or a > 1.0:
+        raise ValueError("alpha must be in (0, 1]")
+    if g < 0.0 or g >= 1.0:
+        raise ValueError("gamma must be in [0, 1)")
+    if e < 0.0 or e > 1.0:
+        raise ValueError("epsilon must be in [0, 1]")
+    if not lo < hi:
+        raise ValueError("v_min must be less than v_max")
+    if lo > 0.0 or hi < 0.0:
+        raise ValueError("0 must be within [v_min, v_max]")
+
+    delta = (hi - lo) / (atoms - 1)
+    if not math.isfinite(delta):
+        raise ValueError("support spacing must be finite")
+    support = []
+    for i in range(atoms):
+        node = lo + i * delta
+        if not math.isfinite(node):
+            raise ValueError("support must be finite")
+        support.append(node)
+
+    zero_index = 0
+    best_distance = abs(support[0])
+    for i in range(1, atoms):
+        distance = abs(support[i])
+        if distance < best_distance:
+            best_distance = distance
+            zero_index = i
+
+    actions = tuple(_ACTIONS)  # U, R, D, L
+    states = sorted(
+        state
+        for state in _reachable_cells(env)
+        if env._cell(state) != "G"
+    )
+    distributions = {}
+    for state in states:
+        for action in actions:
+            initial = [0.0] * atoms
+            initial[zero_index] = 1.0
+            distributions[(state, action)] = initial
+    rng = random.Random(seed)
+
+    def expected_action(state):
+        best_action = actions[0]
+        best_q = None
+        for action in actions:
+            probs = distributions[(state, action)]
+            value = 0.0
+            for j in range(atoms):
+                value += support[j] * probs[j]
+            if not math.isfinite(value):
+                raise ValueError("expected Q must be finite")
+            if best_q is None or value > best_q:
+                best_q = value
+                best_action = action
+        return best_action
+
+    def _add_mass(row, z, p):
+        if not math.isfinite(z):
+            raise ValueError("projected Bellman value must be finite")
+        if z < lo:
+            z = lo
+        elif z > hi:
+            z = hi
+        b = (z - lo) / delta
+        if not math.isfinite(b):
+            raise ValueError("projection position must be finite")
+        lower_idx = math.floor(b)
+        upper_idx = math.ceil(b)
+        if lower_idx == upper_idx:
+            k = min(max(lower_idx, 0), atoms - 1)
+            row[k] += p
+            if not math.isfinite(row[k]):
+                raise ValueError("projected probability must be finite")
+        else:
+            kl = min(max(lower_idx, 0), atoms - 1)
+            ku = min(max(upper_idx, 0), atoms - 1)
+            lower = p * (upper_idx - b)
+            if not math.isfinite(lower):
+                raise ValueError("projection weight must be finite")
+            row[kl] += lower
+            if not math.isfinite(row[kl]):
+                raise ValueError("projected probability must be finite")
+            upper = p * (b - lower_idx)
+            if not math.isfinite(upper):
+                raise ValueError("projection weight must be finite")
+            row[ku] += upper
+            if not math.isfinite(row[ku]):
+                raise ValueError("projected probability must be finite")
+
+    def project(reward, done, source):
+        r = float(reward)
+        if not math.isfinite(r):
+            raise ValueError("reward must be finite")
+        row = [0.0] * atoms
+        if done:
+            # 终止：目标为 reward 处的单位退化分布。
+            _add_mass(row, r, 1.0)
+        else:
+            for j in range(atoms):
+                _add_mass(row, r + g * support[j], source[j])
+        for value in row:
+            if not math.isfinite(value):
+                raise ValueError("projected probabilities must be finite")
+        return row
+
+    for _ in range(episodes):
+        state = env.reset()
+        for _ in range(max_steps):
+            u = rng.random()
+            if u < e:
+                action = actions[rng.randrange(4)]
+            else:
+                action = expected_action(state)
+            next_state, reward, done = env.step(action)
+            if done:
+                target = project(reward, True, None)
+            else:
+                next_action = expected_action(next_state)
+                target = project(
+                    reward, False, distributions[(next_state, next_action)]
+                )
+            probs = distributions[(state, action)]
+            for j in range(atoms):
+                probs[j] += a * (target[j] - probs[j])
+                if not math.isfinite(probs[j]):
+                    raise ValueError("distribution probability must be finite")
+            if done:
+                break
+            state = next_state
+
+    q = {}
+    for state in states:
+        for action in actions:
+            probs = distributions[(state, action)]
+            value = 0.0
+            for j in range(atoms):
+                value += support[j] * probs[j]
+            if not math.isfinite(value):
+                raise ValueError("Q value must be finite")
+            q[(state, action)] = value
+    return {"q": q, "distributions": distributions}
+
+
 def ppo_clipped_surrogate(
     old_log_probs, new_log_probs, advantages, clip_epsilon=0.2
 ) -> dict:
