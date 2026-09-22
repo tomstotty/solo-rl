@@ -174,6 +174,85 @@ def value_iteration(env, gamma=0.9, tolerance=1e-9, max_iterations=10000):
     raise RuntimeError("value iteration did not converge")
 
 
+def policy_iteration(env, gamma=0.9, tolerance=1e-9, max_iterations=1000):
+    """同步策略迭代，返回 (policy, values, iterations)。
+
+    policy 为 {(row, col): "U|R|D|L"}，values 为 {(row, col): float}，
+    键为从 S 四向避墙可达的非 G 格子（按坐标升序）；
+    iterations 为实际迭代轮数（每轮含一次策略评估与一次策略改进）。
+    """
+    if not isinstance(env, GridWorld):
+        raise TypeError("env must be a GridWorld")
+    if isinstance(gamma, bool) or not isinstance(gamma, (int, float)):
+        raise TypeError("gamma must be an int or float")
+    if not _is_finite_number(gamma) or gamma < 0 or gamma >= 1:
+        raise ValueError("gamma must be finite and in [0, 1)")
+    if isinstance(tolerance, bool) or not isinstance(tolerance, (int, float)):
+        raise TypeError("tolerance must be an int or float")
+    if not _is_finite_number(tolerance) or tolerance <= 0:
+        raise ValueError("tolerance must be finite and in (0, +inf)")
+    if isinstance(max_iterations, bool) or not isinstance(max_iterations, int):
+        raise TypeError("max_iterations must be an int")
+    if max_iterations <= 0:
+        raise ValueError("max_iterations must be positive")
+
+    reachable = sorted(_reachable_cells(env))
+    states = [state for state in reachable if env._cell(state) != "G"]
+    policy = {state: "U" for state in states}
+    values = {state: 0.0 for state in reachable}
+
+    iterations = 0
+    while iterations < max_iterations:
+        # 策略评估：以上轮 V 为初值，固定策略同步迭代至最大变化不超过 tolerance。
+        while True:
+            new_values = {state: 0.0 for state in reachable}
+            delta = 0.0
+            for state in states:
+                nxt, reward, _done = env.transition(state, policy[state])
+                updated = reward + gamma * values[nxt]
+                if not math.isfinite(updated):
+                    raise ValueError("non-finite value during policy evaluation")
+                new_values[state] = updated
+                change = abs(updated - values[state])
+                if change > delta:
+                    delta = change
+            values = new_values
+            if delta <= tolerance:
+                break
+
+        # 策略改进：按 URDL 计算 reward + gamma*V[next]，取首个严格最大者。
+        new_policy = {}
+        stable = True
+        for state in states:
+            best_action = None
+            best_value = None
+            for action in _ACTIONS:
+                nxt, reward, _done = env.transition(state, action)
+                candidate = reward + gamma * values[nxt]
+                if not math.isfinite(candidate):
+                    raise ValueError("non-finite value during policy improvement")
+                if best_value is None or candidate > best_value:
+                    best_value = candidate
+                    best_action = action
+            new_policy[state] = best_action
+            if best_action != policy[state]:
+                stable = False
+
+        iterations += 1
+        policy = new_policy
+        if stable:
+            ordered_policy = {state: policy[state] for state in states}
+            ordered_values = {}
+            for state in states:
+                value = float(values[state])
+                if not math.isfinite(value):
+                    raise ValueError("non-finite value in policy iteration output")
+                ordered_values[state] = value
+            return ordered_policy, ordered_values, iterations
+
+    raise RuntimeError("policy iteration did not converge")
+
+
 def q_learning(
     env,
     episodes=500,
