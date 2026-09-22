@@ -6273,6 +6273,208 @@ def ppo_train(
     }
 
 
+def ppo_train_trace_bytes(
+    env,
+    episodes=100,
+    alpha=0.05,
+    gamma=0.9,
+    lambda_=0.95,
+    c=0.2,
+    epochs=4,
+    seed=0,
+    max_steps=1000,
+) -> bytes:
+    """按 ppo_train 训练并逐回合汇总，序列化为单行 JSON 字节。
+
+    参数校验与异常、状态编号、H/V 初值、采样与随机消费、GAE 逆推、
+    ppo_update 更新、V 的步序更新、终止与截断均逐项沿用
+    ppo_train，全部校验在首次 reset 前完成；同参同 seed 的回合、
+    目标与参数与 ppo_train 逐值一致，且不额外消费随机数。
+
+    输出对象仅含键 episodes，值按回合为
+    [steps, reward, success, rate, objectives, h_delta, v_delta]：
+    steps 为该回合 int 步数；reward 为从整数 0 顺序累加的未折扣
+    回报（int）；success 为末步 done（bool）；rate 为截至该回合
+    的成功比例；objectives 为该回合 ppo_update 返回的目标列表；
+    h_delta、v_delta 分别从 0.0 按坐标升序（H 再按 URDL 列序）
+    累加本回合更新前后 H、V 的绝对差。所有浮点（rate、objectives
+    各项、两个 delta）均以 float.hex() 字符串表示并保留负零，
+    其余类型依次如上。
+
+    返回 (json.dumps(out, ensure_ascii=True, allow_nan=False,
+    separators=(",", ":")) + "\\n").encode("utf-8")：无额外空白，
+    末尾恰一个 LF；同参同 seed 逐字节一致。仅用标准库，不引入
+    命令行入口。
+    """
+    if not isinstance(env, GridWorld):
+        raise TypeError("env must be a GridWorld")
+    if isinstance(episodes, bool) or not isinstance(episodes, int):
+        raise TypeError("episodes must be an int")
+    if isinstance(seed, bool) or not isinstance(seed, int):
+        raise TypeError("seed must be an int")
+    if isinstance(max_steps, bool) or not isinstance(max_steps, int):
+        raise TypeError("max_steps must be an int")
+    if isinstance(alpha, bool) or not isinstance(alpha, (int, float)):
+        raise TypeError("alpha must be an int or float")
+    if isinstance(gamma, bool) or not isinstance(gamma, (int, float)):
+        raise TypeError("gamma must be an int or float")
+    if isinstance(lambda_, bool) or not isinstance(lambda_, (int, float)):
+        raise TypeError("lambda_ must be an int or float")
+    if episodes <= 0:
+        raise ValueError("episodes must be positive")
+    if max_steps <= 0:
+        raise ValueError("max_steps must be positive")
+    if not _is_finite_number(alpha) or alpha <= 0 or alpha > 1:
+        raise ValueError("alpha must be finite and in (0, 1]")
+    if not _is_finite_number(gamma) or gamma < 0 or gamma > 1:
+        raise ValueError("gamma must be finite and in [0, 1]")
+    if not _is_finite_number(lambda_) or lambda_ < 0 or lambda_ > 1:
+        raise ValueError("lambda_ must be finite and in [0, 1]")
+    if not isinstance(c, float):
+        raise TypeError("c must be a float")
+    if not math.isfinite(c):
+        raise ValueError("c must be finite")
+    if c < 0.0 or c >= 1.0:
+        raise ValueError("c must be in [0, 1)")
+    if isinstance(epochs, bool) or not isinstance(epochs, int):
+        raise TypeError("epochs must be a non-bool int")
+    if epochs <= 0:
+        raise ValueError("epochs must be positive")
+
+    actions = tuple(_ACTIONS)  # U, R, D, L
+    states = sorted(
+        state
+        for state in _reachable_cells(env)
+        if env._cell(state) != "G"
+    )
+    state_index = {state: i for i, state in enumerate(states)}
+    h = [[0.0 for _ in actions] for _ in states]
+    values = [0.0 for _ in states]
+    rng = random.Random(seed)
+    trace_episodes = []
+    successes = 0
+
+    for episode_index in range(episodes):
+        state = env.reset()
+        trajectory = []
+        total_reward = 0
+        step_count = 0
+        last_done = False
+        for _ in range(max_steps):
+            s = state_index[state]
+            row = h[s]
+            m = max(row)
+            weights = [math.exp(logit - m) for logit in row]
+            total = sum(weights)
+            if not math.isfinite(total) or total <= 0.0:
+                raise ValueError(
+                    "softmax normalizer must be finite and positive"
+                )
+            probs = [weight / total for weight in weights]
+            log_total = math.log(total)
+            u = rng.random()
+            cumulative = 0.0
+            a = 3
+            for k, p_k in enumerate(probs):
+                cumulative += p_k
+                if cumulative > u:
+                    a = k
+                    break
+            action = actions[a]
+            old_logp = row[a] - m - log_total
+            if not math.isfinite(old_logp):
+                raise ValueError("log-probabilities must be finite")
+            value = values[s]
+            next_state, reward, done = env.step(action)
+            value_next = 0.0 if done else values[state_index[next_state]]
+            trajectory.append(
+                (s, a, reward, old_logp, value, value_next, done)
+            )
+            total_reward += reward
+            step_count += 1
+            last_done = done
+            if done:
+                break
+            state = next_state
+
+        advantages = [0.0] * len(trajectory)
+        a_t = 0.0
+        for t in range(len(trajectory) - 1, -1, -1):
+            (
+                _s,
+                _a,
+                reward,
+                _old_logp,
+                value,
+                value_next,
+                _done,
+            ) = trajectory[t]
+            delta = reward + gamma * value_next - value
+            if not math.isfinite(delta):
+                raise ValueError("GAE delta must be finite")
+            a_t = delta + gamma * lambda_ * a_t
+            if not math.isfinite(a_t):
+                raise ValueError("GAE advantage must be finite")
+            advantages[t] = a_t
+
+        batch = [
+            [s, a, old_logp, adv]
+            for (s, a, _r, old_logp, _v, _v2, _done), adv in zip(
+                trajectory, advantages
+            )
+        ]
+        h_before = h
+        result = ppo_update(h, batch, float(alpha), c, epochs)
+        h = result["logits"]
+        objectives = result["objectives"]
+        h_delta = 0.0
+        for i in range(len(states)):
+            old_row = h_before[i]
+            new_row = h[i]
+            for j in range(len(actions)):
+                h_delta += abs(new_row[j] - old_row[j])
+
+        values_before = list(values)
+        for (s, _a, _r, _old_logp, value, _v2, _done), adv in zip(
+            trajectory, advantages
+        ):
+            new_value = values[s] + alpha * (
+                adv + value - values[s]
+            )
+            if not math.isfinite(new_value):
+                raise ValueError("updated value must be finite")
+            values[s] = new_value
+        v_delta = 0.0
+        for i in range(len(states)):
+            v_delta += abs(values[i] - values_before[i])
+
+        if last_done:
+            successes += 1
+        rate = successes / (episode_index + 1)
+        trace_episodes.append(
+            [
+                step_count,
+                total_reward,
+                last_done,
+                float.hex(rate),
+                [float.hex(objective) for objective in objectives],
+                float.hex(h_delta),
+                float.hex(v_delta),
+            ]
+        )
+
+    out = {"episodes": trace_episodes}
+    return (
+        json.dumps(
+            out,
+            ensure_ascii=True,
+            allow_nan=False,
+            separators=(",", ":"),
+        )
+        + "\n"
+    ).encode("utf-8")
+
+
 def ppo_train_adaptive_kl(
     env,
     episodes=100,
