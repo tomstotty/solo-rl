@@ -11176,6 +11176,261 @@ def ppo_train_until(
     }
 
 
+def ppo_converge(
+    env,
+    episodes=100,
+    seed=0,
+    max_steps=1000,
+    window=20,
+    success=0.9,
+    reward=-20.0,
+    patience=3,
+    min_ep=20,
+) -> dict:
+    """PPO 训练至成功率与平均回报双阈值连续收敛或达回合上限。
+
+    env、episodes、seed、max_steps 的校验与异常沿用 ppo_train，且全
+    部参数在首次 reset 前校验。window、patience、min_ep 须为非 bool
+    正 int；success、reward 须为非 bool 的 int/float；类型错抛
+    TypeError，三整参非正、success/reward 转 float 溢出或非有限、
+    success 越出 [0, 1] 抛 ValueError。两阈值先转为 float。
+
+    以 ppo_train 默认训练超参（alpha=0.05、gamma=0.9、lambda_=0.95、
+    c=0.2、epochs=4）及给定 seed、max_steps 连续训练，全部随机性来
+    自一个 random.Random(seed)。每回合完成采样和更新后，记录本回合
+    末步的 done（步限截断记 False）与逐回报之和。
+
+    对每个长度为 window 的完整连续窗按零基起点 i 升序生成
+    [start, end, success_rate, reward_mean, passed]：start=i+1、
+    end=i+window（均 1 基 int）；success_rate 为窗内 done 为 True 的
+    比例（float）；reward_mean 为窗内各回合回报从 0.0 按序累加后除
+    以 window 的 float 均值；passed 当 success_rate >= success 且
+    reward_mean >= reward 时为 True。首个 end >= min_ep 且连续
+    patience 个窗均 passed 时停止，episode 为命中窗的 end；否则训练
+    至 episodes 回合，episode 为 None。
+
+    返回键依次为 h、episodes、objectives、report；实际完成 k 回合
+    时，前三项逐值等于 ppo_train(env, episodes=k, seed=seed,
+    max_steps=max_steps) 的对应返回。report 键依次为 converged、
+    episode、windows：converged 为 episode 是否非 None，episode 为
+    int 或 None，windows 为全部窗行列表。不额外消费随机数，同参同
+    seed 逐值一致，仅用标准库。
+    """
+    if not isinstance(env, GridWorld):
+        raise TypeError("env must be a GridWorld")
+    if isinstance(episodes, bool) or not isinstance(episodes, int):
+        raise TypeError("episodes must be an int")
+    if isinstance(seed, bool) or not isinstance(seed, int):
+        raise TypeError("seed must be an int")
+    if isinstance(max_steps, bool) or not isinstance(max_steps, int):
+        raise TypeError("max_steps must be an int")
+    if isinstance(window, bool) or not isinstance(window, int):
+        raise TypeError("window must be a non-bool int")
+    if isinstance(patience, bool) or not isinstance(patience, int):
+        raise TypeError("patience must be a non-bool int")
+    if isinstance(min_ep, bool) or not isinstance(min_ep, int):
+        raise TypeError("min_ep must be a non-bool int")
+    if isinstance(success, bool) or not isinstance(
+        success, (int, float)
+    ):
+        raise TypeError("success must be an int or float")
+    if isinstance(reward, bool) or not isinstance(reward, (int, float)):
+        raise TypeError("reward must be an int or float")
+    if episodes <= 0:
+        raise ValueError("episodes must be positive")
+    if max_steps <= 0:
+        raise ValueError("max_steps must be positive")
+    if window <= 0:
+        raise ValueError("window must be positive")
+    if patience <= 0:
+        raise ValueError("patience must be positive")
+    if min_ep <= 0:
+        raise ValueError("min_ep must be positive")
+    try:
+        success_threshold = float(success)
+    except OverflowError:
+        raise ValueError("success must convert to a finite float")
+    if not math.isfinite(success_threshold):
+        raise ValueError("success must be finite")
+    if success_threshold < 0.0 or success_threshold > 1.0:
+        raise ValueError("success must be in [0, 1]")
+    try:
+        reward_threshold = float(reward)
+    except OverflowError:
+        raise ValueError("reward must convert to a finite float")
+    if not math.isfinite(reward_threshold):
+        raise ValueError("reward must be finite")
+
+    alpha = 0.05
+    gamma = 0.9
+    lambda_ = 0.95
+    c = 0.2
+    epochs = 4
+
+    actions = tuple(_ACTIONS)  # U, R, D, L
+    states = sorted(
+        state
+        for state in _reachable_cells(env)
+        if env._cell(state) != "G"
+    )
+    state_index = {state: i for i, state in enumerate(states)}
+    h = [[0.0 for _ in actions] for _ in states]
+    values = [0.0 for _ in states]
+    rng = random.Random(seed)
+    all_episodes = []
+    all_objectives = []
+    dones = []
+    returns = []
+    windows = []
+    episode = None
+
+    for _ in range(episodes):
+        state = env.reset()
+        trajectory = []
+        step_records = []
+        for _ in range(max_steps):
+            s = state_index[state]
+            row = h[s]
+            m = max(row)
+            weights = [math.exp(logit - m) for logit in row]
+            total = sum(weights)
+            if not math.isfinite(total) or total <= 0.0:
+                raise ValueError(
+                    "softmax normalizer must be finite and positive"
+                )
+            probs = [weight / total for weight in weights]
+            log_total = math.log(total)
+            u = rng.random()
+            cumulative = 0.0
+            a = 3
+            for k, p_k in enumerate(probs):
+                cumulative += p_k
+                if cumulative > u:
+                    a = k
+                    break
+            action = actions[a]
+            old_logp = row[a] - m - log_total
+            if not math.isfinite(old_logp):
+                raise ValueError("log-probabilities must be finite")
+            value = values[s]
+            next_state, reward_value, done = env.step(action)
+            value_next = 0.0 if done else values[state_index[next_state]]
+            trajectory.append(
+                (s, a, reward_value, old_logp, value, value_next, done)
+            )
+            step_records.append(
+                [state[0], state[1], action, reward_value, done]
+            )
+            if done:
+                break
+            state = next_state
+
+        advantages = [0.0] * len(trajectory)
+        a_t = 0.0
+        for t in range(len(trajectory) - 1, -1, -1):
+            (
+                _s,
+                _a,
+                reward_value,
+                _old_logp,
+                value,
+                value_next,
+                _done,
+            ) = trajectory[t]
+            delta = reward_value + gamma * value_next - value
+            if not math.isfinite(delta):
+                raise ValueError("GAE delta must be finite")
+            a_t = delta + gamma * lambda_ * a_t
+            if not math.isfinite(a_t):
+                raise ValueError("GAE advantage must be finite")
+            advantages[t] = a_t
+
+        batch = [
+            [s, a, old_logp, adv]
+            for (s, a, _r, old_logp, _v, _v2, _done), adv in zip(
+                trajectory, advantages
+            )
+        ]
+        result = ppo_update(h, batch, float(alpha), c, epochs)
+        h = result["logits"]
+        all_objectives.append(result["objectives"])
+
+        for (s, _a, _r, _old_logp, value, _v2, _done), adv in zip(
+            trajectory, advantages
+        ):
+            new_value = values[s] + alpha * (
+                adv + value - values[s]
+            )
+            if not math.isfinite(new_value):
+                raise ValueError("updated value must be finite")
+            values[s] = new_value
+        all_episodes.append(step_records)
+
+        dones.append(bool(step_records[-1][4]))
+        total_return = 0.0
+        for step in step_records:
+            total_return += step[3]
+        returns.append(total_return)
+
+        n = len(dones)
+        for i in range(len(windows), n - window + 1):
+            successes_in_window = 0
+            reward_sum = 0.0
+            for k in range(i, i + window):
+                if dones[k]:
+                    successes_in_window += 1
+                reward_sum += returns[k]
+            success_rate = successes_in_window / window
+            reward_mean = reward_sum / window
+            passed = (
+                success_rate >= success_threshold
+                and reward_mean >= reward_threshold
+            )
+            windows.append(
+                [
+                    i + 1,
+                    i + window,
+                    success_rate,
+                    reward_mean,
+                    passed,
+                ]
+            )
+
+        if windows and windows[-1][1] >= min_ep:
+            j = len(windows) - 1
+            if (
+                j >= patience - 1
+                and all(
+                    windows[k][4]
+                    for k in range(j - patience + 1, j + 1)
+                )
+            ):
+                episode = windows[j][1]
+                break
+
+    h_table = [
+        [
+            float(r),
+            float(c),
+            h[i][0],
+            h[i][1],
+            h[i][2],
+            h[i][3],
+        ]
+        for i, (r, c) in enumerate(states)
+    ]
+    return {
+        "h": h_table,
+        "episodes": all_episodes,
+        "objectives": all_objectives,
+        "report": {
+            "converged": episode is not None,
+            "episode": episode,
+            "windows": windows,
+        },
+    }
+
+
 def ppo_trace_bytes(data) -> bytes:
     """将一份 PPO 轨迹结构严格校验后序列化为单行 JSON 字节。
 
