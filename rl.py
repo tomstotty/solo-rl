@@ -8844,6 +8844,93 @@ def ppo_eval_stats(
     }
 
 
+def ppo_eval_stats_many(
+    env,
+    h,
+    seeds,
+    episodes=100,
+    max_steps=1000,
+    window=20,
+    success=0.9,
+    reward=-20.0,
+    patience=3,
+    minimum=0.8,
+) -> dict:
+    """按多种子运行 ppo_eval_stats，返回跨种子汇总统计。
+
+    seeds 须为非空 list/tuple，元素为非 bool 的 int，允许重复且不修改
+    seeds；容器或元素类型不符抛 TypeError，空序列抛 ValueError。
+    minimum 须为非 bool 的 int/float，类型不符抛 TypeError，转 float
+    溢出或非有限、或越出 [0, 1] 抛 ValueError。其余契约（含 env、h、
+    episodes、max_steps、window、success、reward、patience 的校验与
+    异常）沿用 ppo_eval_stats；seeds 与 minimum 在首次 reset/step 前
+    校验完毕，h 坐标域仅以只读方式经 env 核验。按 seeds 顺序逐项独立
+    调用 ppo_eval_stats（各自独立随机流），h、seeds 及其成员均不变，
+    env 无需恢复。
+
+    返回键依次为 results、means、passed、pass_rate、converged；
+    results 与 seeds 同序，每项为键序 seed、result 的 dict，result
+    即对应 ppo_eval_stats 的完整返回值。means 键序 success_rate、
+    reward_mean，分别为各 result 同名顶层 float 按 results 序从 0.0
+    累加后除以项数所得的 float。passed 为 result.converged 为真的
+    数量；pass_rate 为 passed / len(seeds) 的 float；converged 等价
+    于 pass_rate >= float(minimum)。相同输入逐值一致。
+    """
+    if not isinstance(seeds, (list, tuple)):
+        raise TypeError("seeds must be a list or tuple")
+    if not seeds:
+        raise ValueError("seeds must be non-empty")
+    for seed in seeds:
+        if isinstance(seed, bool) or not isinstance(seed, int):
+            raise TypeError("every seed must be a non-bool int")
+    if isinstance(minimum, bool) or not isinstance(minimum, (int, float)):
+        raise TypeError("minimum must be an int or float")
+    try:
+        minimum_ratio = float(minimum)
+    except OverflowError:
+        raise ValueError("minimum must be finite and in [0, 1]")
+    if not math.isfinite(minimum_ratio):
+        raise ValueError("minimum must be finite and in [0, 1]")
+    if minimum_ratio < 0.0 or minimum_ratio > 1.0:
+        raise ValueError("minimum must be finite and in [0, 1]")
+
+    results = []
+    for seed in seeds:
+        result = ppo_eval_stats(
+            env,
+            h,
+            episodes=episodes,
+            max_steps=max_steps,
+            seed=seed,
+            window=window,
+            success=success,
+            reward=reward,
+            patience=patience,
+        )
+        results.append({"seed": seed, "result": result})
+
+    success_total = 0.0
+    reward_total = 0.0
+    for item in results:
+        success_total += item["result"]["success_rate"]
+        reward_total += item["result"]["reward_mean"]
+    count = len(results)
+    means = {
+        "success_rate": success_total / count,
+        "reward_mean": reward_total / count,
+    }
+
+    passed = sum(1 for item in results if item["result"]["converged"])
+    pass_rate = passed / len(seeds)
+    return {
+        "results": results,
+        "means": means,
+        "passed": passed,
+        "pass_rate": pass_rate,
+        "converged": pass_rate >= minimum_ratio,
+    }
+
+
 def ppo_evaluate_trace(env, h, episodes=100, max_steps=1000, seed=0) -> dict:
     """按 softmax 策略评估 PPO 风格 logits 表，返回可逐步复现的轨迹。
 
