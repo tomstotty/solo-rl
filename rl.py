@@ -3211,6 +3211,209 @@ def categorical_projection(
     return {"support": support, "probabilities": projected}
 
 
+def categorical_q_learning(
+    env,
+    episodes=500,
+    alpha=0.5,
+    gamma=0.99,
+    epsilon=0.1,
+    v_min=-10.0,
+    v_max=10.0,
+    atoms=51,
+    seed=0,
+    max_steps=1000,
+) -> dict:
+    """C51 式分类 Q-learning，返回 {"q": ..., "distributions": ...}。
+
+    支撑与投影规则同 categorical_projection：delta=(v_max-v_min)/(atoms-1)，
+    support[i]=v_min+i*delta，且 0 须落在 [v_min, v_max] 内。分布覆盖从 S
+    可达的非 G 格与 U/R/D/L 的全部组合，初始时距 0 最近的 atom 置 1
+    （等距取较小索引），其余为 0.0。每回合 reset，单回合最多 max_steps
+    步；全部随机性来自一个 random.Random(seed)。
+
+    每步先调一次 random()：其值 < epsilon 时按 URDL 调 randrange(4)
+    取探索动作，否则取期望 Q（按 atom 序从 0.0 累加 support[i]*p[i]）
+    最大且 URDL 中首个的动作。step 后 done 时目标为 reward 的单点投
+    影，否则取下一状态期望 Q 最大动作的分布，按
+    reward+gamma*support[j] 投影；投影行从 0.0 累加，随后逐 atom 执
+    行 p+=alpha*(target-p)。任何中间或输出值非有限抛 ValueError。
+    done 即停；到达步限且未终止的末步仍照常更新。返回 q 为
+    {((row, col), action): float}，distributions 为
+    {((row, col), action): [float]}，均按状态坐标升序、动作 URDL
+    键序。
+    """
+    if not isinstance(env, GridWorld):
+        raise TypeError("env must be a GridWorld")
+    if isinstance(episodes, bool) or not isinstance(episodes, int):
+        raise TypeError("episodes must be an int")
+    if isinstance(seed, bool) or not isinstance(seed, int):
+        raise TypeError("seed must be an int")
+    if isinstance(atoms, bool) or not isinstance(atoms, int):
+        raise TypeError("atoms must be an int")
+    if isinstance(max_steps, bool) or not isinstance(max_steps, int):
+        raise TypeError("max_steps must be an int")
+    if isinstance(alpha, bool) or not isinstance(alpha, (int, float)):
+        raise TypeError("alpha must be an int or float")
+    if isinstance(gamma, bool) or not isinstance(gamma, (int, float)):
+        raise TypeError("gamma must be an int or float")
+    if isinstance(epsilon, bool) or not isinstance(epsilon, (int, float)):
+        raise TypeError("epsilon must be an int or float")
+    if isinstance(v_min, bool) or not isinstance(v_min, (int, float)):
+        raise TypeError("v_min must be an int or float")
+    if isinstance(v_max, bool) or not isinstance(v_max, (int, float)):
+        raise TypeError("v_max must be an int or float")
+    if episodes <= 0:
+        raise ValueError("episodes must be positive")
+    if max_steps <= 0:
+        raise ValueError("max_steps must be positive")
+    if atoms < 2:
+        raise ValueError("atoms must be >= 2")
+    if not _is_finite_number(alpha) or alpha <= 0 or alpha > 1:
+        raise ValueError("alpha must be finite and in (0, 1]")
+    if not _is_finite_number(gamma) or gamma < 0 or gamma >= 1:
+        raise ValueError("gamma must be finite and in [0, 1)")
+    if not _is_finite_number(epsilon) or epsilon < 0 or epsilon > 1:
+        raise ValueError("epsilon must be finite and in [0, 1]")
+
+    def _to_bound(item, name):
+        try:
+            result = float(item)
+        except OverflowError:
+            raise ValueError(f"{name} must convert to a finite float")
+        if not math.isfinite(result):
+            raise ValueError(f"{name} must be finite")
+        return result
+
+    lo = _to_bound(v_min, "v_min")
+    hi = _to_bound(v_max, "v_max")
+    if not lo < hi:
+        raise ValueError("v_min must be less than v_max")
+    if not lo <= 0.0 <= hi:
+        raise ValueError("0 must be within [v_min, v_max]")
+
+    delta = (hi - lo) / (atoms - 1)
+    if not math.isfinite(delta):
+        raise ValueError("support spacing must be finite")
+    support = []
+    for i in range(atoms):
+        node = lo + i * delta
+        if not math.isfinite(node):
+            raise ValueError("support must be finite")
+        support.append(node)
+
+    actions = tuple(_ACTIONS)  # U, R, D, L
+    states = sorted(
+        state
+        for state in _reachable_cells(env)
+        if env._cell(state) != "G"
+    )
+    nearest = 0
+    for i in range(1, atoms):
+        if abs(support[i]) < abs(support[nearest]):
+            nearest = i
+    distributions = {}
+    for state in states:
+        for action in actions:
+            probs = [0.0] * atoms
+            probs[nearest] = 1.0
+            distributions[(state, action)] = probs
+    rng = random.Random(seed)
+
+    def expected_q(probs):
+        total = 0.0
+        for i in range(atoms):
+            total += support[i] * probs[i]
+        return total
+
+    for _ in range(episodes):
+        state = env.reset()
+        for _ in range(max_steps):
+            if rng.random() < epsilon:
+                action = actions[rng.randrange(4)]
+            else:
+                action = max(
+                    actions,
+                    key=lambda a: expected_q(distributions[(state, a)]),
+                )
+            next_state, reward, done = env.step(action)
+            target = [0.0] * atoms
+            if done:
+                sources = ((float(reward), 1.0),)
+            else:
+                best = max(
+                    actions,
+                    key=lambda a: expected_q(
+                        distributions[(next_state, a)]
+                    ),
+                )
+                next_probs = distributions[(next_state, best)]
+                sources = tuple(
+                    (float(reward) + gamma * support[j], next_probs[j])
+                    for j in range(atoms)
+                )
+            for z, p in sources:
+                if not math.isfinite(z):
+                    raise ValueError("projected Bellman value must be finite")
+                if z < lo:
+                    z = lo
+                elif z > hi:
+                    z = hi
+                b = (z - lo) / delta
+                if not math.isfinite(b):
+                    raise ValueError("projection position must be finite")
+                l = math.floor(b)
+                u = math.ceil(b)
+                if l == u:
+                    k = min(max(l, 0), atoms - 1)
+                    target[k] += p
+                    if not math.isfinite(target[k]):
+                        raise ValueError(
+                            "projected probability must be finite"
+                        )
+                else:
+                    kl = min(max(l, 0), atoms - 1)
+                    ku = min(max(u, 0), atoms - 1)
+                    lower = p * (u - b)
+                    if not math.isfinite(lower):
+                        raise ValueError("projection weight must be finite")
+                    target[kl] += lower
+                    if not math.isfinite(target[kl]):
+                        raise ValueError(
+                            "projected probability must be finite"
+                        )
+                    upper = p * (b - l)
+                    if not math.isfinite(upper):
+                        raise ValueError("projection weight must be finite")
+                    target[ku] += upper
+                    if not math.isfinite(target[ku]):
+                        raise ValueError(
+                            "projected probability must be finite"
+                        )
+            probs = distributions[(state, action)]
+            for i in range(atoms):
+                new_p = probs[i] + alpha * (target[i] - probs[i])
+                if not math.isfinite(new_p):
+                    raise ValueError("probabilities must remain finite")
+                probs[i] = new_p
+            if done:
+                break
+            state = next_state
+
+    q = {}
+    out_distributions = {}
+    for state in states:
+        for action in actions:
+            probs = distributions[(state, action)]
+            value = 0.0
+            for i in range(atoms):
+                value += support[i] * probs[i]
+            if not math.isfinite(value):
+                raise ValueError("Q value must be finite")
+            q[(state, action)] = float(value)
+            out_distributions[(state, action)] = [float(p) for p in probs]
+    return {"q": q, "distributions": out_distributions}
+
+
 def ppo_clipped_surrogate(
     old_log_probs, new_log_probs, advantages, clip_epsilon=0.2
 ) -> dict:
