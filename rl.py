@@ -7359,6 +7359,97 @@ def ppo_trace_from_bytes(payload) -> dict:
     return data
 
 
+def ppo_trace_verify(env, data) -> dict:
+    """对照 GridWorld 环境逐步验证一份 PPO 轨迹并给出指纹摘要。
+
+    env 须为 GridWorld，否则抛 TypeError。先调用 ppo_trace_bytes(data)
+    校验结构并取得规范字节，其异常原样透传；不修改输入。
+
+    随后逐回合验证：每回合首步的 (r, c) 须为起点 S；其余各步的
+    (r, c) 须等于上一步的 (next_r, next_c)；每步须满足
+    env.transition((r, c), action) == ((next_r, next_c), reward, done)；
+    done 为 True 仅允许出现在末步；回合 success 须等于末步 done；
+    total_reward 须等于从整数 0 起按步序累加各步 reward 的结果。
+    任何违约均抛 ValueError。
+
+    successes 为成功回合数，rate = successes / len(episodes)；rate 与
+    data["success_rate"] 的 float.hex() 须相同，否则抛 ValueError。
+    digest 为 hashlib.sha256(规范字节).hexdigest()。
+
+    返回键序恰为 episodes、steps、successes、success_rate、
+    fingerprint 的 dict，依次为回合数、总步数、成功数（int）、
+    rate（float）、digest（小写 64 位十六进制 str）。无随机消费，
+    重复调用逐值一致。仅用标准库，不引入命令行入口。
+    """
+    if not isinstance(env, GridWorld):
+        raise TypeError("env must be a GridWorld")
+    canonical = ppo_trace_bytes(data)
+
+    start = None
+    for r, row in enumerate(env.rows):
+        for c, cell in enumerate(row):
+            if cell == "S":
+                start = (r, c)
+                break
+        if start is not None:
+            break
+
+    episodes = data["episodes"]
+    steps = 0
+    successes = 0
+    for ep_index, episode in enumerate(episodes):
+        trace = episode["trace"]
+        total = 0
+        for step_index, step in enumerate(trace):
+            r, c, action, next_r, next_c, reward, done = step
+            where = f"episodes[{ep_index}] trace[{step_index}]"
+            expected = start if step_index == 0 else prev_next
+            if (r, c) != expected:
+                raise ValueError(
+                    f"{where} (r, c) must be {expected}, got {(r, c)}"
+                )
+            outcome = env.transition((r, c), action)
+            if outcome != ((next_r, next_c), reward, done):
+                raise ValueError(
+                    f"{where} does not match env.transition: "
+                    f"expected {outcome}, got "
+                    f"{((next_r, next_c), reward, done)}"
+                )
+            if done and step_index != len(trace) - 1:
+                raise ValueError(
+                    f"{where} done may be True only at the last step"
+                )
+            total += reward
+            prev_next = (next_r, next_c)
+        if episode["success"] != trace[-1][6]:
+            raise ValueError(
+                f"episodes[{ep_index}] success must equal the last"
+                " step's done"
+            )
+        if episode["total_reward"] != total:
+            raise ValueError(
+                f"episodes[{ep_index}] total_reward must equal the sum"
+                " of step rewards"
+            )
+        steps += len(trace)
+        if episode["success"]:
+            successes += 1
+
+    rate = successes / len(episodes)
+    if rate.hex() != data["success_rate"].hex():
+        raise ValueError(
+            "success_rate must equal successes / len(episodes)"
+        )
+    digest = hashlib.sha256(canonical).hexdigest()
+    return {
+        "episodes": len(episodes),
+        "steps": steps,
+        "successes": successes,
+        "success_rate": rate,
+        "fingerprint": digest,
+    }
+
+
 def _format_value(value):
     if abs(value) < 0.5e-12:
         value = 0.0
