@@ -464,6 +464,137 @@ def q_learning_trace(
     return {"q": q, "episodes": episode_records}
 
 
+def q_learning_trace_bytes(env, data) -> bytes:
+    """将 q_learning_trace 的结果严格校验并规范序列化为单行 JSON 字节。
+
+    env 须为 GridWorld、data 须为 dict，否则抛 TypeError；其余任何
+    违约均抛 ValueError。data 键序须恰为 q、episodes。q 须为恰覆盖
+    从 S 可达的非 G 格与 U/R/D/L 全部组合的 dict，键为
+    ((row, col), action)，值须为有限 float；输入键序不限。episodes
+    须为非空 list，每回合为非空步 list；每步恰为
+    [r, c, action, next_r, next_c, reward, done]，五个数值字段为非
+    bool 的 int，action 为 U、R、D、L 之一，done 为 bool。逐回合
+    首步 (r, c) 须为 S，其余各步 (r, c) 须等于上一步的
+    (next_r, next_c)；每步须严格等于
+    env.transition((r, c), action) 的结果；done 为 True 仅允许出现
+    在末步。不修改输入。
+
+    输出 JSON 键序为 q、episodes：q 转为按坐标升序 × URDL 的
+    [r, c, action, value] 列表，episodes 保序原样嵌入。返回
+    (json.dumps(out, ensure_ascii=True, allow_nan=False,
+    separators=(",", ":")) + "\\n").encode("utf-8")：无额外空白，
+    末尾恰一个 LF，保留 -0.0；相同输入逐字节一致。仅用标准库，
+    不引入命令行入口。
+    """
+    if not isinstance(env, GridWorld):
+        raise TypeError("env must be a GridWorld")
+    if not isinstance(data, dict):
+        raise TypeError("data must be a dict")
+    if list(data) != ["q", "episodes"]:
+        raise ValueError("data must have exactly the keys q, episodes")
+
+    actions = tuple(_ACTIONS)  # U, R, D, L
+    states = [
+        state
+        for state in sorted(_reachable_cells(env))
+        if env._cell(state) != "G"
+    ]
+    expected_keys = {
+        (state, action) for state in states for action in actions
+    }
+
+    q = data["q"]
+    if not isinstance(q, dict):
+        raise ValueError("q must be a dict")
+    for key, value in q.items():
+        if (
+            not isinstance(key, tuple)
+            or len(key) != 2
+            or not isinstance(key[0], tuple)
+            or len(key[0]) != 2
+            or any(
+                isinstance(v, bool) or not isinstance(v, int)
+                for v in key[0]
+            )
+            or not isinstance(key[1], str)
+            or key[1] not in _ACTIONS
+        ):
+            raise ValueError(
+                "q keys must be ((row, col), action) tuples with action"
+                " one of U, R, D, L"
+            )
+        if not isinstance(value, float) or not math.isfinite(value):
+            raise ValueError("q values must be finite floats")
+    if set(q) != expected_keys:
+        raise ValueError(
+            "q must cover exactly the reachable non-G cells times"
+            " U, R, D, L"
+        )
+
+    episodes = data["episodes"]
+    if not isinstance(episodes, list) or not episodes:
+        raise ValueError("episodes must be a non-empty list")
+    start = env._start
+    for ep_index, episode in enumerate(episodes):
+        if not isinstance(episode, list) or not episode:
+            raise ValueError(
+                f"episodes[{ep_index}] must be a non-empty list"
+            )
+        for step_index, step in enumerate(episode):
+            where = f"episodes[{ep_index}][{step_index}]"
+            if not isinstance(step, list) or len(step) != 7:
+                raise ValueError(
+                    f"{where} must be a list of exactly 7 items"
+                )
+            r, c, action, next_r, next_c, reward, done = step
+            for field in (r, c, next_r, next_c, reward):
+                if isinstance(field, bool) or not isinstance(field, int):
+                    raise ValueError(
+                        f"{where} numeric fields must be non-bool ints"
+                    )
+            if not isinstance(action, str) or action not in _ACTIONS:
+                raise ValueError(
+                    f"{where} action must be one of U, R, D, L"
+                )
+            if not isinstance(done, bool):
+                raise ValueError(f"{where} done must be a bool")
+            expected_state = start if step_index == 0 else prev_next
+            if (r, c) != expected_state:
+                raise ValueError(
+                    f"{where} (r, c) must be {expected_state},"
+                    f" got {(r, c)}"
+                )
+            outcome = env.transition((r, c), action)
+            if outcome != ((next_r, next_c), reward, done):
+                raise ValueError(
+                    f"{where} does not match env.transition: expected"
+                    f" {outcome}, got {((next_r, next_c), reward, done)}"
+                )
+            if done and step_index != len(episode) - 1:
+                raise ValueError(
+                    f"{where} done may be True only at the last step"
+                )
+            prev_next = (next_r, next_c)
+
+    out = {
+        "q": [
+            [state[0], state[1], action, q[(state, action)]]
+            for state in states
+            for action in actions
+        ],
+        "episodes": episodes,
+    }
+    return (
+        json.dumps(
+            out,
+            ensure_ascii=True,
+            allow_nan=False,
+            separators=(",", ":"),
+        )
+        + "\n"
+    ).encode("utf-8")
+
+
 def dueling_q_learning(
     env,
     episodes=500,
