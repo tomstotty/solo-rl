@@ -3801,6 +3801,133 @@ def ppo_policy_kl(old_logits, new_logits) -> dict:
     return {"rows": rows, "mean": mean, "max": maximum}
 
 
+def ppo_line_search(
+    logits, batch, lr=0.05, c=0.2, target=0.01, steps=8
+) -> dict:
+    """按几何衰减学习率做 PPO 单轮候选搜索，返回固定键序 logits、
+    kls、accepted、lr 的 dict。
+
+    logits、batch、lr、c 的校验与异常逐项沿用 ppo_update；target 须为
+    非 bool 的 int/float，类型不符抛 TypeError，转 float 溢出、非有限
+    或 <=0 抛 ValueError，校验后记为 t；steps 须为非 bool 的 int 且
+    属于 [1, 61]，类型不符抛 TypeError，越界抛 ValueError。全部参数
+    先校验完毕且不修改输入。
+
+    按 i=0..steps-1 令 rate=lr/(2**i)，每次均从原 logits 调用
+    ppo_update(logits, batch, rate, c, 1)，候选之间不串接；以
+    ppo_policy_kl 计算原 logits 到候选 logits 的 mean KL，将该 float
+    依序加入 kls，首个 KL<=t 即接受并停止。新中间量非有限抛
+    ValueError 且无部分结果。成功时 logits 取该候选的新矩阵、
+    accepted 为 True、lr 为对应 rate；全部拒绝时 logits 为原矩阵的
+    新副本、accepted 为 False、lr 为 None；kls 为已尝试的 KL float
+    列表。同输入逐值一致。
+    """
+    if not isinstance(logits, list):
+        raise TypeError("logits must be a list")
+    if not logits:
+        raise ValueError("logits must be non-empty")
+    width = None
+    for row in logits:
+        if not isinstance(row, list):
+            raise TypeError("every row of logits must be a list")
+        if not row:
+            raise ValueError("every row of logits must be non-empty")
+        if width is None:
+            width = len(row)
+        elif len(row) != width:
+            raise ValueError("logits must be rectangular")
+        for item in row:
+            if not isinstance(item, float):
+                raise TypeError("logits must contain only float")
+            if not math.isfinite(item):
+                raise ValueError("logits must contain only finite float")
+    n_rows = len(logits)
+    n_cols = width
+
+    if not isinstance(batch, list):
+        raise TypeError("batch must be a list")
+    if not batch:
+        raise ValueError("batch must be non-empty")
+    for item in batch:
+        if not isinstance(item, list):
+            raise TypeError("every batch item must be a list")
+        if len(item) != 4:
+            raise ValueError("every batch item must have exactly four elements")
+        s, a, o, adv = item
+        if isinstance(s, bool) or not isinstance(s, int):
+            raise TypeError("state index must be a non-bool int")
+        if isinstance(a, bool) or not isinstance(a, int):
+            raise TypeError("action index must be a non-bool int")
+        if not 0 <= s < n_rows:
+            raise ValueError("state index out of range")
+        if not 0 <= a < n_cols:
+            raise ValueError("action index out of range")
+        if not isinstance(o, float):
+            raise TypeError("old log-prob must be a float")
+        if not math.isfinite(o):
+            raise ValueError("old log-prob must be finite")
+        if not isinstance(adv, float):
+            raise TypeError("advantage must be a float")
+        if not math.isfinite(adv):
+            raise ValueError("advantage must be finite")
+
+    if not isinstance(lr, float):
+        raise TypeError("lr must be a float")
+    if not math.isfinite(lr):
+        raise ValueError("lr must be finite")
+    if lr <= 0.0 or lr > 1.0:
+        raise ValueError("lr must be in (0, 1]")
+    if not isinstance(c, float):
+        raise TypeError("c must be a float")
+    if not math.isfinite(c):
+        raise ValueError("c must be finite")
+    if c < 0.0 or c >= 1.0:
+        raise ValueError("c must be in [0, 1)")
+    if isinstance(target, bool) or not isinstance(target, (int, float)):
+        raise TypeError("target must be an int or float")
+    try:
+        t = float(target)
+    except OverflowError:
+        raise ValueError("target must convert to a finite float")
+    if not math.isfinite(t) or t <= 0.0:
+        raise ValueError("target must be finite and > 0")
+    if isinstance(steps, bool) or not isinstance(steps, int):
+        raise TypeError("steps must be a non-bool int")
+    if steps < 1 or steps > 61:
+        raise ValueError("steps must be in [1, 61]")
+
+    kls = []
+    accepted_logits = None
+    accepted_rate = None
+    for i in range(steps):
+        rate = lr / (2 ** i)
+        if not math.isfinite(rate):
+            raise ValueError("candidate learning rate must be finite")
+        candidate = ppo_update(logits, batch, rate, c, 1)["logits"]
+        kl = ppo_policy_kl(logits, candidate)["mean"]
+        if not math.isfinite(kl):
+            raise ValueError("KL must be finite")
+        kls.append(kl)
+        if kl <= t:
+            accepted_logits = candidate
+            accepted_rate = rate
+            break
+
+    if accepted_logits is None:
+        return {
+            "logits": [list(row) for row in logits],
+            "kls": kls,
+            "accepted": False,
+            "lr": None,
+        }
+    return {
+        "logits": accepted_logits,
+        "kls": kls,
+        "accepted": True,
+        "lr": accepted_rate,
+    }
+
+
 def ppo_train(
     env,
     episodes=100,
