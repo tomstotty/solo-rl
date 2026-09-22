@@ -9076,6 +9076,91 @@ def ppo_evaluate_trace(env, h, episodes=100, max_steps=1000, seed=0) -> dict:
     }
 
 
+def ppo_evaluate_trace_many(
+    env, h, seeds, episodes=100, max_steps=1000
+) -> dict:
+    """按多种子评估 PPO 风格 logits 表，返回轨迹与可复现性分组。
+
+    seeds 须为非空 list/tuple，元素为非 bool 的 int，允许重复且不修改
+    seeds；容器或元素类型不符抛 TypeError，空序列抛 ValueError。其余
+    参数（env、h、episodes、max_steps）的校验与异常沿用
+    ppo_evaluate_trace；全部参数校验在首次 reset/step 之前完成，且不
+    修改 h 或 seeds。按 seeds 顺序逐项调用 ppo_evaluate_trace，每项仅
+    替换 seed（各自独立的 random.Random(seed) 随机流）。
+
+    返回键依次为 results、groups、reproducible。results 与 seeds 同序，
+    每项为键序 seed、result、summary 的 dict：result 即对应
+    ppo_evaluate_trace 的完整返回值；summary 为
+    [steps, rewards, successes]，三个列表逐回合取 trace 长度、
+    total_reward、success。groups 按 seed 首次出现序排列，每项为键序
+    seed、indices、identical 的 dict：indices 为该 seed 在 seeds 中的
+    零基索引列表；identical 仅当组内各 result 经 ppo_trace_bytes 所得
+    规范字节均与首项相同，单项组为 True。reproducible 等价于所有组
+    identical。相同输入逐值一致。
+    """
+    if not isinstance(seeds, (list, tuple)):
+        raise TypeError("seeds must be a list or tuple")
+    if not seeds:
+        raise ValueError("seeds must be non-empty")
+    for seed in seeds:
+        if isinstance(seed, bool) or not isinstance(seed, int):
+            raise TypeError("every seed must be a non-bool int")
+
+    results = []
+    for seed in seeds:
+        result = ppo_evaluate_trace(
+            env,
+            h,
+            episodes=episodes,
+            max_steps=max_steps,
+            seed=seed,
+        )
+        steps = []
+        rewards = []
+        successes = []
+        for episode in result["episodes"]:
+            steps.append(len(episode["trace"]))
+            rewards.append(episode["total_reward"])
+            successes.append(episode["success"])
+        results.append(
+            {
+                "seed": seed,
+                "result": result,
+                "summary": [steps, rewards, successes],
+            }
+        )
+
+    order = []
+    indices_by_seed = {}
+    for index, seed in enumerate(seeds):
+        if seed not in indices_by_seed:
+            indices_by_seed[seed] = []
+            order.append(seed)
+        indices_by_seed[seed].append(index)
+
+    groups = []
+    for seed in order:
+        indices = indices_by_seed[seed]
+        canonical = ppo_trace_bytes(results[indices[0]]["result"])
+        identical = all(
+            ppo_trace_bytes(results[index]["result"]) == canonical
+            for index in indices[1:]
+        )
+        groups.append(
+            {
+                "seed": seed,
+                "indices": indices,
+                "identical": identical,
+            }
+        )
+
+    return {
+        "results": results,
+        "groups": groups,
+        "reproducible": all(group["identical"] for group in groups),
+    }
+
+
 def ppo_evaluate_many(
     env, h, seeds, episodes=100, max_steps=1000, window=20, threshold=0.9
 ) -> dict:
