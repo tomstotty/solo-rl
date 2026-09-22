@@ -5273,6 +5273,186 @@ def ppo_minibatch_kl(
     }
 
 
+def ppo_minibatch_adaptive_kl(
+    logits,
+    batch,
+    batch_size=32,
+    lr=0.05,
+    beta=1.0,
+    target=0.01,
+    factor=2.0,
+    lo=1e-4,
+    hi=1e4,
+    epochs=4,
+    seed=0,
+) -> dict:
+    """自适应 KL 惩罚系数的小批量 PPO 多轮 logits 更新，返回固定键序
+    logits、objectives、kls、betas 的 dict。
+
+    logits、batch、lr 的校验与异常逐项沿用 ppo_kl_penalty_update；
+    beta、target、factor、lo、hi 五个 KL 参数的校验与异常逐项沿用
+    ppo_adaptive_kl_update；batch_size、epochs、seed 三个整数的校验
+    与异常逐项沿用 ppo_minibatch。全部参数先校验完毕且不修改输入，
+    随后复制 logits 为 L，仅建一个 random.Random(seed)，令
+    b=float(beta)。
+
+    每轮令 p=list(range(len(batch)))，按 i 从 n-1 降至 1 取
+    j=rng.randrange(i+1) 并交换 p[i]、p[j]（Fisher–Yates）；再按 p
+    连续切为至多 batch_size 项的小批，尾批保留。依 p 取 batch 行，
+    对每个小批调用
+    ppo_adaptive_kl_update(L, sub, lr, b, target, factor, lo, hi, 1)，
+    以返回的 logits 续训，三份历史首项按小批顺序展平收集，调整后的
+    新 beta 跨小批、跨轮持续传递；失败原样抛出且无部分结果。返回
+    最终 float 矩阵 L 及按批序展平的 objectives、kls、betas 的
+    float list，均为新容器，同输入同 seed 逐值一致。
+    """
+    if not isinstance(logits, list):
+        raise TypeError("logits must be a list")
+    if not logits:
+        raise ValueError("logits must be non-empty")
+    width = None
+    for row in logits:
+        if not isinstance(row, list):
+            raise TypeError("every row of logits must be a list")
+        if not row:
+            raise ValueError("every row of logits must be non-empty")
+        if width is None:
+            width = len(row)
+        elif len(row) != width:
+            raise ValueError("logits must be rectangular")
+        for item in row:
+            if not isinstance(item, float):
+                raise TypeError("logits must contain only float")
+            if not math.isfinite(item):
+                raise ValueError("logits must contain only finite float")
+    n_rows = len(logits)
+    n_cols = width
+
+    if not isinstance(batch, list):
+        raise TypeError("batch must be a list")
+    if not batch:
+        raise ValueError("batch must be non-empty")
+    for item in batch:
+        if not isinstance(item, list):
+            raise TypeError("every batch item must be a list")
+        if len(item) != 4:
+            raise ValueError("every batch item must have exactly four elements")
+        s, a, o, adv = item
+        if isinstance(s, bool) or not isinstance(s, int):
+            raise TypeError("state index must be a non-bool int")
+        if isinstance(a, bool) or not isinstance(a, int):
+            raise TypeError("action index must be a non-bool int")
+        if not 0 <= s < n_rows:
+            raise ValueError("state index out of range")
+        if not 0 <= a < n_cols:
+            raise ValueError("action index out of range")
+        if not isinstance(o, float):
+            raise TypeError("old log-prob must be a float")
+        if not math.isfinite(o):
+            raise ValueError("old log-prob must be finite")
+        if not isinstance(adv, float):
+            raise TypeError("advantage must be a float")
+        if not math.isfinite(adv):
+            raise ValueError("advantage must be finite")
+
+    if not isinstance(lr, float):
+        raise TypeError("lr must be a float")
+    if not math.isfinite(lr):
+        raise ValueError("lr must be finite")
+    if lr <= 0.0 or lr > 1.0:
+        raise ValueError("lr must be in (0, 1]")
+
+    numeric_params = (
+        ("beta", beta),
+        ("target", target),
+        ("factor", factor),
+        ("lo", lo),
+        ("hi", hi),
+    )
+    for name, value in numeric_params:
+        if isinstance(value, bool) or not isinstance(value, (int, float)):
+            raise TypeError(f"{name} must be a non-bool int or float")
+
+    numeric_values = {}
+    for name, value in numeric_params:
+        try:
+            converted = float(value)
+        except OverflowError:
+            raise ValueError(f"{name} must convert to a finite float")
+        if not math.isfinite(converted):
+            raise ValueError(f"{name} must be finite")
+        numeric_values[name] = converted
+    beta_value = numeric_values["beta"]
+    target_value = numeric_values["target"]
+    factor_value = numeric_values["factor"]
+    lo_value = numeric_values["lo"]
+    hi_value = numeric_values["hi"]
+
+    if beta_value <= 0.0:
+        raise ValueError("beta must be positive")
+    if target_value <= 0.0:
+        raise ValueError("target must be positive")
+    if factor_value <= 1.0:
+        raise ValueError("factor must be greater than 1")
+    if lo_value <= 0.0:
+        raise ValueError("lo must be positive")
+    if hi_value <= 0.0:
+        raise ValueError("hi must be positive")
+    if not lo_value <= beta_value <= hi_value:
+        raise ValueError("beta must be within [lo, hi]")
+
+    if isinstance(batch_size, bool) or not isinstance(batch_size, int):
+        raise TypeError("batch_size must be a non-bool int")
+    if isinstance(epochs, bool) or not isinstance(epochs, int):
+        raise TypeError("epochs must be a non-bool int")
+    if isinstance(seed, bool) or not isinstance(seed, int):
+        raise TypeError("seed must be a non-bool int")
+    if batch_size <= 0:
+        raise ValueError("batch_size must be positive")
+    if epochs <= 0:
+        raise ValueError("epochs must be positive")
+
+    L = [list(row) for row in logits]
+    rng = random.Random(seed)
+    b = float(beta)
+    n_batch = len(batch)
+    objectives = []
+    kls = []
+    betas = []
+    for _ in range(epochs):
+        order = list(range(n_batch))
+        for i in range(n_batch - 1, 0, -1):
+            j = rng.randrange(i + 1)
+            order[i], order[j] = order[j], order[i]
+        for start in range(0, n_batch, batch_size):
+            sub = [batch[order[k]] for k in range(
+                start, min(start + batch_size, n_batch)
+            )]
+            result = ppo_adaptive_kl_update(
+                L,
+                sub,
+                lr,
+                b,
+                target_value,
+                factor_value,
+                lo_value,
+                hi_value,
+                1,
+            )
+            L = result["logits"]
+            objectives.append(result["objectives"][0])
+            kls.append(result["kls"][0])
+            b = result["betas"][0]
+            betas.append(b)
+
+    return {
+        "logits": L,
+        "objectives": objectives,
+        "kls": kls,
+        "betas": betas,
+    }
+
+
 def ppo_update_kl(
     logits, batch, lr=0.05, c=0.2, epochs=4, target_kl=0.01
 ) -> dict:
