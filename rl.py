@@ -341,6 +341,111 @@ def q_learning(
     return q
 
 
+def dyna_q(
+    env,
+    episodes=500,
+    alpha=0.5,
+    gamma=0.9,
+    epsilon=0.1,
+    planning_steps=5,
+    seed=0,
+    max_steps=1000,
+) -> dict:
+    """Dyna-Q，返回 {((row, col), action): float}。
+
+    Q 覆盖从 S 可达的非 G 格与 U/R/D/L 的全部组合，键序为坐标升序
+    再按 U/R/D/L，初始为 0.0。每回合 reset，单回合最多 max_steps 步
+    （截断时末步仍执行）；全部随机性来自一个 random.Random(seed)。
+
+    每个真实步先用 random() 判定探索，探索时按 U/R/D/L 序
+    randrange(4) 选动作，否则取首个最大 Q 的动作；step 后按 done 取
+    reward 或 reward + gamma * maxQ(next) 更新。转移按首次出现写入
+    模型，重复键覆盖但保持插入序；模型非空时每个真实步后再做
+    planning_steps 次规划：按插入序对模型键 randrange(len(model))
+    采样，以相同公式更新，规划不调用 random()。
+    """
+    if not isinstance(env, GridWorld):
+        raise TypeError("env must be a GridWorld")
+    if isinstance(episodes, bool) or not isinstance(episodes, int):
+        raise TypeError("episodes must be an int")
+    if isinstance(planning_steps, bool) or not isinstance(
+        planning_steps, int
+    ):
+        raise TypeError("planning_steps must be an int")
+    if isinstance(seed, bool) or not isinstance(seed, int):
+        raise TypeError("seed must be an int")
+    if isinstance(max_steps, bool) or not isinstance(max_steps, int):
+        raise TypeError("max_steps must be an int")
+    if isinstance(alpha, bool) or not isinstance(alpha, (int, float)):
+        raise TypeError("alpha must be an int or float")
+    if isinstance(gamma, bool) or not isinstance(gamma, (int, float)):
+        raise TypeError("gamma must be an int or float")
+    if isinstance(epsilon, bool) or not isinstance(epsilon, (int, float)):
+        raise TypeError("epsilon must be an int or float")
+    if episodes <= 0:
+        raise ValueError("episodes must be positive")
+    if planning_steps <= 0:
+        raise ValueError("planning_steps must be positive")
+    if max_steps <= 0:
+        raise ValueError("max_steps must be positive")
+    if not _is_finite_number(alpha) or alpha <= 0 or alpha > 1:
+        raise ValueError("alpha must be finite and in (0, 1]")
+    if not _is_finite_number(gamma) or gamma < 0 or gamma >= 1:
+        raise ValueError("gamma must be finite and in [0, 1)")
+    if not _is_finite_number(epsilon) or epsilon < 0 or epsilon > 1:
+        raise ValueError("epsilon must be finite and in [0, 1]")
+
+    actions = tuple(_ACTIONS)  # U, R, D, L
+    q = {
+        (state, action): 0.0
+        for state in sorted(_reachable_cells(env))
+        if env._cell(state) != "G"
+        for action in actions
+    }
+    model = {}
+    rng = random.Random(seed)
+
+    for _episode in range(episodes):
+        state = env.reset()
+        for _step in range(max_steps):
+            if rng.random() < epsilon:
+                action = actions[rng.randrange(4)]
+            else:
+                action = max(actions, key=lambda a: q[(state, a)])
+            next_state, reward, done = env.step(action)
+            if done:
+                target = reward
+            else:
+                target = reward + gamma * max(
+                    q[(next_state, a)] for a in actions
+                )
+            key = (state, action)
+            q[key] += alpha * (target - q[key])
+            if not math.isfinite(q[key]):
+                raise ValueError("non-finite Q value during dyna_q")
+            model[key] = (next_state, reward, done)
+            if model:
+                keys = tuple(model)
+                for _ in range(planning_steps):
+                    p_key = keys[rng.randrange(len(model))]
+                    p_next, p_reward, p_done = model[p_key]
+                    if p_done:
+                        p_target = p_reward
+                    else:
+                        p_target = p_reward + gamma * max(
+                            q[(p_next, a)] for a in actions
+                        )
+                    q[p_key] += alpha * (p_target - q[p_key])
+                    if not math.isfinite(q[p_key]):
+                        raise ValueError(
+                            "non-finite Q value during dyna_q planning"
+                        )
+            if done:
+                break
+            state = next_state
+    return q
+
+
 def sarsa_lambda(
     env,
     episodes=500,
