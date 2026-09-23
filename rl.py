@@ -6781,6 +6781,206 @@ def ppo_train_trace_bytes(
     ).encode("utf-8")
 
 
+def _ppo_train_trace_canonical_float(text, name, nonnegative=False):
+    """解析单个规范 float.hex() 字符串并返回其 float 值。"""
+    if not isinstance(text, str):
+        raise ValueError(f"{name} must be a canonical float.hex() str")
+    try:
+        value = float.fromhex(text)
+    except (ValueError, OverflowError) as exc:
+        raise ValueError(
+            f"{name} must be a canonical float.hex() str"
+        ) from exc
+    if not math.isfinite(value):
+        raise ValueError(f"{name} must be finite")
+    if value.hex() != text:
+        raise ValueError(f"{name} must be a canonical float.hex() str")
+    if nonnegative and value < 0.0:
+        raise ValueError(f"{name} must be >= 0.0")
+    return value
+
+
+def _ppo_train_trace_validate(data):
+    """结构与取值校验，返回 episodes 列表。"""
+    if not isinstance(data, dict) or list(data) != ["episodes"]:
+        raise ValueError("data must have exactly the key episodes")
+    episodes = data["episodes"]
+    if not isinstance(episodes, list) or not episodes:
+        raise ValueError("episodes must be a non-empty list")
+    for ep_index, row in enumerate(episodes):
+        if not isinstance(row, list) or len(row) != 7:
+            raise ValueError(
+                f"episodes[{ep_index}] must be a list of exactly 7 items"
+            )
+        steps, reward, success, rate, objectives, h_delta, v_delta = row
+        if (
+            isinstance(steps, bool)
+            or not isinstance(steps, int)
+            or steps <= 0
+        ):
+            raise ValueError(
+                f"episodes[{ep_index}] steps must be a non-bool positive"
+                " int"
+            )
+        if isinstance(reward, bool) or not isinstance(reward, int):
+            raise ValueError(
+                f"episodes[{ep_index}] reward must be a non-bool int"
+            )
+        if not isinstance(success, bool):
+            raise ValueError(
+                f"episodes[{ep_index}] success must be a bool"
+            )
+        rate_value = _ppo_train_trace_canonical_float(
+            rate, f"episodes[{ep_index}] rate"
+        )
+        if rate_value < 0.0 or rate_value > 1.0:
+            raise ValueError(
+                f"episodes[{ep_index}] rate must be in [0, 1]"
+            )
+        if not isinstance(objectives, list) or not objectives:
+            raise ValueError(
+                f"episodes[{ep_index}] objectives must be a non-empty"
+                " list"
+            )
+        for obj_index, objective in enumerate(objectives):
+            _ppo_train_trace_canonical_float(
+                objective,
+                f"episodes[{ep_index}] objectives[{obj_index}]",
+            )
+        _ppo_train_trace_canonical_float(
+            h_delta, f"episodes[{ep_index}] h_delta", nonnegative=True
+        )
+        _ppo_train_trace_canonical_float(
+            v_delta, f"episodes[{ep_index}] v_delta", nonnegative=True
+        )
+    return episodes
+
+
+def ppo_train_trace_from_bytes(payload) -> dict:
+    """将 ppo_train_trace_bytes 的产物严格解析回逐回合训练追踪。
+
+    payload 须恰为 bytes（bytearray、memoryview 等均拒绝），否则抛
+    TypeError；空字节、严格 UTF-8 解码失败、BOM、JSON 语法错误或尾随
+    内容、重复对象键、NaN/Infinity/-Infinity、根值非 dict、结构或编码
+    违约均抛 ValueError。
+
+    仅接受规范单行紧凑 ASCII JSON：末尾恰一个 LF，无 BOM 或额外空白/
+    换行。顶层须仅含键 episodes，值为非空 list；每行须恰为七项 list
+    [steps, reward, success, rate, objectives, h_delta, v_delta]：
+    steps 为非 bool 正 int，reward 为非 bool int，success 为 bool，
+    objectives 为非空 list；rate、objectives 各项及两个 delta 均须为
+    有限 float 的规范 float.hex() 字符串，rate 值须在 [0, 1] 内，两个
+    delta 须 >= 0.0。按 ppo_train_trace_bytes 生成器规则重编码后的字节
+    须与输入逐字节相同。
+
+    返回解析得到的独立新容器，同一 payload 多次解析逐值一致。仅用标准
+    库，不引入命令行入口。
+    """
+    if not isinstance(payload, bytes):
+        raise TypeError("payload must be bytes")
+    if not payload:
+        raise ValueError("payload must not be empty")
+    if payload.startswith(_UTF8_BOM):
+        raise ValueError("payload must not start with a BOM")
+    try:
+        text = payload.decode("utf-8")
+    except UnicodeDecodeError as exc:
+        raise ValueError("payload must be valid UTF-8") from exc
+    if not text.endswith("\n"):
+        raise ValueError("payload must end with exactly one LF")
+    body = text[:-1]
+
+    def reject_constant(value):
+        raise ValueError(f"invalid JSON constant: {value}")
+
+    def reject_duplicate_keys(pairs):
+        result = {}
+        for key, value in pairs:
+            if key in result:
+                raise ValueError(f"duplicate object key: {key!r}")
+            result[key] = value
+        return result
+
+    decoder = json.JSONDecoder(
+        object_pairs_hook=reject_duplicate_keys,
+        parse_constant=reject_constant,
+    )
+    try:
+        data, end = decoder.raw_decode(body)
+    except RecursionError as exc:
+        raise ValueError("payload nesting too deep") from exc
+    except json.JSONDecodeError as exc:
+        raise ValueError("payload must be valid JSON") from exc
+    if end != len(body):
+        raise ValueError("payload must not contain trailing content")
+    if not isinstance(data, dict):
+        raise ValueError("payload root value must be a dict")
+    _ppo_train_trace_validate(data)
+
+    canonical = (
+        json.dumps(
+            data,
+            ensure_ascii=True,
+            allow_nan=False,
+            separators=(",", ":"),
+        )
+        + "\n"
+    ).encode("utf-8")
+    if canonical != payload:
+        raise ValueError(
+            "payload must be canonical ppo_train_trace_bytes output"
+        )
+    return data
+
+
+def ppo_train_trace_verify(payload) -> dict:
+    """严格解析 PPO 训练追踪字节并校验逐回合汇总一致性。
+
+    先执行 ppo_train_trace_from_bytes 的全部字节、JSON、结构与编码
+    校验（TypeError/ValueError 原样透传），再校验跨回合约束：第 i 行
+    （0 基）的 rate 须等于截至该行累计成功数 / (i + 1) 的 float.hex()
+    字符串，各行 objectives 长度须相等，否则抛 ValueError。
+
+    返回键序恰为 episodes、steps、successes、success_rate、
+    fingerprint 的 dict，依次为回合数、各行 steps 之和、成功回合数
+    （int）、最终成功率（float）、输入字节的 hashlib.sha256 小写 64 位
+    十六进制摘要。重复调用逐值一致。仅用标准库，不引入命令行入口。
+    """
+    data = ppo_train_trace_from_bytes(payload)
+    episodes = data["episodes"]
+
+    total_steps = 0
+    successes = 0
+    objective_count = None
+    for ep_index, row in enumerate(episodes):
+        steps, _reward, success, rate, objectives, _h, _v = row
+        total_steps += steps
+        if success:
+            successes += 1
+        expected_rate = (successes / (ep_index + 1)).hex()
+        if rate != expected_rate:
+            raise ValueError(
+                f"episodes[{ep_index}] rate must be {expected_rate},"
+                f" got {rate}"
+            )
+        if objective_count is None:
+            objective_count = len(objectives)
+        elif len(objectives) != objective_count:
+            raise ValueError(
+                f"episodes[{ep_index}] objectives length must equal the"
+                f" first row's ({objective_count})"
+            )
+
+    digest = hashlib.sha256(payload).hexdigest()
+    return {
+        "episodes": len(episodes),
+        "steps": total_steps,
+        "successes": successes,
+        "success_rate": successes / len(episodes),
+        "fingerprint": digest,
+    }
+
+
 def ppo_train_adaptive_kl(
     env,
     episodes=100,
