@@ -11851,6 +11851,117 @@ def ppo_trace_verify(env, data) -> dict:
     }
 
 
+def ppo_trace_converge(
+    items, window=20, threshold=0.9, tolerance=0.01
+) -> dict:
+    """对多份 PPO 训练追踪按完整滑窗判定成功收敛，返回汇总字典。
+
+    items 须为至少两项的 list，每项须恰为 bytes（bytearray、
+    memoryview 等均拒绝）：非 list 抛 TypeError，成员非 bytes 抛
+    TypeError，长度小于 2 抛 ValueError。window 须为非 bool 正 int，
+    否则错型抛 TypeError、非正抛 ValueError；threshold、tolerance 须
+    恰为 float（bool 与 int 均拒绝）且有限，threshold 须在 [0, 1] 内，
+    tolerance 须 >= 0.0，错型抛 TypeError、非有限或越界抛 ValueError。
+
+    各项先通过 ppo_train_trace_verify 的全部校验，异常原样透传；各项
+    追踪的回合数须相同，否则抛 ValueError。不修改输入。
+
+    对每个长度为 window 的完整连续滑窗（window 大于回合数时为空），
+    按窗终点（1 基回合号）升序生成 [end, rate, change]：end 为窗内末
+    回合的 1 基序号 int；rate 从 0.0 起按 items 序、各份内回合序累加
+    窗内 success（bool 作为 0/1），再除以 len(items) * window；每份每
+    回合目标取其 objectives 末项 float.fromhex(objectives[-1])，change
+    为窗内、跨各份相邻回合目标绝对差的最大值（window 为 1 时无相邻
+    对，取 0.0）；rate 或 change 非有限均抛 ValueError。
+
+    返回键序恰为 reproducible、episode、windows：reproducible 为各项
+    输入字节是否全等；episode 为可复现且窗内 rate >= threshold、
+    change <= tolerance 的首个窗 end，否则 None。重复调用逐值一致，
+    仅用标准库，不引入命令行入口。
+    """
+    if not isinstance(items, list):
+        raise TypeError("items must be a list")
+    for index, item in enumerate(items):
+        if not isinstance(item, bytes):
+            raise TypeError(f"items[{index}] must be bytes")
+    if len(items) < 2:
+        raise ValueError("items must contain at least two entries")
+    if isinstance(window, bool) or not isinstance(window, int):
+        raise TypeError("window must be a non-bool int")
+    if window <= 0:
+        raise ValueError("window must be positive")
+    if not isinstance(threshold, float):
+        raise TypeError("threshold must be a float")
+    if not math.isfinite(threshold):
+        raise ValueError("threshold must be finite")
+    if threshold < 0.0 or threshold > 1.0:
+        raise ValueError("threshold must be in [0, 1]")
+    if not isinstance(tolerance, float):
+        raise TypeError("tolerance must be a float")
+    if not math.isfinite(tolerance):
+        raise ValueError("tolerance must be finite")
+    if tolerance < 0.0:
+        raise ValueError("tolerance must be >= 0.0")
+
+    traces = []
+    episode_count = None
+    for index, item in enumerate(items):
+        ppo_train_trace_verify(item)
+        data = ppo_train_trace_from_bytes(item)
+        episodes = data["episodes"]
+        if episode_count is None:
+            episode_count = len(episodes)
+        elif len(episodes) != episode_count:
+            raise ValueError(
+                f"items[{index}] episodes length must equal the first"
+                f" item's ({episode_count})"
+            )
+        traces.append(episodes)
+
+    reproducible = all(item == items[0] for item in items[1:])
+
+    windows = []
+    denominator = len(items) * window
+    for end_zero in range(window - 1, episode_count):
+        success_sum = 0.0
+        change = 0.0
+        for episodes in traces:
+            for ep_index in range(end_zero - window + 1, end_zero + 1):
+                row = episodes[ep_index]
+                success_sum += 1.0 if row[2] else 0.0
+            for ep_index in range(
+                end_zero - window + 2, end_zero + 1
+            ):
+                current = float.fromhex(
+                    episodes[ep_index][4][-1]
+                )
+                previous = float.fromhex(
+                    episodes[ep_index - 1][4][-1]
+                )
+                difference = abs(current - previous)
+                if difference > change:
+                    change = difference
+        rate = success_sum / denominator
+        if not math.isfinite(rate):
+            raise ValueError("window rate must be finite")
+        if not math.isfinite(change):
+            raise ValueError("window change must be finite")
+        windows.append([end_zero + 1, rate, change])
+
+    episode = None
+    if reproducible:
+        for end, rate, change in windows:
+            if rate >= threshold and change <= tolerance:
+                episode = end
+                break
+
+    return {
+        "reproducible": reproducible,
+        "episode": episode,
+        "windows": windows,
+    }
+
+
 def _format_value(value):
     if abs(value) < 0.5e-12:
         value = 0.0
