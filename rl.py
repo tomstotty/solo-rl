@@ -6093,6 +6093,284 @@ def ppo_line_search(
     }
 
 
+def _ppo_training_setup(env, seed):
+    """初始化共享 PPO 训练状态：URDL 状态编号、零 logits/值表与随机源。"""
+    actions = tuple(_ACTIONS)  # U, R, D, L
+    states = sorted(
+        state
+        for state in _reachable_cells(env)
+        if env._cell(state) != "G"
+    )
+    state_index = {state: i for i, state in enumerate(states)}
+    h = [[0.0 for _ in actions] for _ in states]
+    values = [0.0 for _ in states]
+    rng = random.Random(seed)
+    return actions, states, state_index, h, values, rng
+
+
+def _ppo_run_episode(
+    env,
+    actions,
+    state_index,
+    h,
+    values,
+    rng,
+    max_steps,
+    gamma,
+    lambda_,
+    alpha,
+    c,
+    epochs,
+):
+    """执行一个 PPO 回合（三个 PPO 入口共享的逐回合内核）。
+
+    reset 后至 done 或 max_steps 步：每步按稳定 softmax(H[s,·])
+    （列序 U/R/D/L）采样动作，仅消费一次 rng.random()，记录
+    (s, a, r, old_logp, v, v2, done) 与 [r, c, action, reward, done]
+    步项；done 时 v2=0.0，步限截断仍自举。回合末自 A=0.0 逆序递推
+    GAE，调用 ppo_update 多轮截断更新，再按步序更新 V。返回
+    (更新后的 h, 步表, objectives, 末步 done, 回报和)。
+    """
+    state = env.reset()
+    trajectory = []
+    step_records = []
+    for _ in range(max_steps):
+        s = state_index[state]
+        row = h[s]
+        m = max(row)
+        weights = [math.exp(logit - m) for logit in row]
+        total = sum(weights)
+        if not math.isfinite(total) or total <= 0.0:
+            raise ValueError(
+                "softmax normalizer must be finite and positive"
+            )
+        probs = [weight / total for weight in weights]
+        log_total = math.log(total)
+        u = rng.random()
+        cumulative = 0.0
+        a = 3
+        for k, p_k in enumerate(probs):
+            cumulative += p_k
+            if cumulative > u:
+                a = k
+                break
+        action = actions[a]
+        old_logp = row[a] - m - log_total
+        if not math.isfinite(old_logp):
+            raise ValueError("log-probabilities must be finite")
+        value = values[s]
+        next_state, reward, done = env.step(action)
+        value_next = 0.0 if done else values[state_index[next_state]]
+        trajectory.append(
+            (s, a, reward, old_logp, value, value_next, done)
+        )
+        step_records.append(
+            [state[0], state[1], action, reward, done]
+        )
+        if done:
+            break
+        state = next_state
+
+    advantages = [0.0] * len(trajectory)
+    a_t = 0.0
+    for t in range(len(trajectory) - 1, -1, -1):
+        (
+            _s,
+            _a,
+            reward,
+            _old_logp,
+            value,
+            value_next,
+            _done,
+        ) = trajectory[t]
+        delta = reward + gamma * value_next - value
+        if not math.isfinite(delta):
+            raise ValueError("GAE delta must be finite")
+        a_t = delta + gamma * lambda_ * a_t
+        if not math.isfinite(a_t):
+            raise ValueError("GAE advantage must be finite")
+        advantages[t] = a_t
+
+    batch = [
+        [s, a, old_logp, adv]
+        for (s, a, _r, old_logp, _v, _v2, _done), adv in zip(
+            trajectory, advantages
+        )
+    ]
+    result = ppo_update(h, batch, float(alpha), c, epochs)
+    h = result["logits"]
+    objectives = result["objectives"]
+
+    for (s, _a, _r, _old_logp, value, _v2, _done), adv in zip(
+        trajectory, advantages
+    ):
+        new_value = values[s] + alpha * (
+            adv + value - values[s]
+        )
+        if not math.isfinite(new_value):
+            raise ValueError("updated value must be finite")
+        values[s] = new_value
+
+    episode_done = trajectory[-1][6]
+    episode_return = 0.0
+    for (_s, _a, reward, _ol, _v, _v2, _d) in trajectory:
+        episode_return += reward
+    return h, step_records, objectives, episode_done, episode_return
+
+
+def _ppo_h_table(h, states):
+    """将 logits 表连同按坐标升序的状态编号整理为最终 h 表。"""
+    return [
+        [
+            float(r),
+            float(c),
+            h[i][0],
+            h[i][1],
+            h[i][2],
+            h[i][3],
+        ]
+        for i, (r, c) in enumerate(states)
+    ]
+
+
+class _PpoEpisodeCollector:
+    """固定回合收集器：累积步表与 objectives，停止谓词恒为假。"""
+
+    def __init__(self):
+        self.episodes = []
+        self.objectives = []
+
+    def record(self, step_records, objectives, done, episode_return):
+        self.episodes.append(step_records)
+        self.objectives.append(objectives)
+
+    def should_stop(self):
+        return False
+
+
+class _PpoSuccessCollector:
+    """成功率早停收集器：累积成功序列并逐回合调用 ppo_success_streak。"""
+
+    def __init__(self, window, threshold, patience):
+        self.episodes = []
+        self.objectives = []
+        self.successes = []
+        self.convergence = None
+        self._window = window
+        self._threshold = threshold
+        self._patience = patience
+
+    def record(self, step_records, objectives, done, episode_return):
+        self.episodes.append(step_records)
+        self.objectives.append(objectives)
+        self.successes.append(step_records[-1][4])
+        self.convergence = ppo_success_streak(
+            self.successes,
+            self._window,
+            self._threshold,
+            self._patience,
+        )
+
+    def should_stop(self):
+        return self.convergence["converged"]
+
+
+class _PpoConvergeCollector:
+    """成功率/回报双阈值早停收集器，维护完整滑窗与命中回合。"""
+
+    def __init__(self, window, success, reward, patience, min_ep):
+        self.episodes = []
+        self.objectives = []
+        self.dones = []
+        self.returns = []
+        self.windows = []
+        self.converged_episode = None
+        self._window = window
+        self._success = success
+        self._reward = reward
+        self._patience = patience
+        self._min_ep = min_ep
+        self._streak = 0
+
+    def record(self, step_records, objectives, done, episode_return):
+        self.episodes.append(step_records)
+        self.objectives.append(objectives)
+        self.dones.append(done)
+        self.returns.append(episode_return)
+
+        end = len(self.returns)
+        if end >= self._window:
+            start = end - self._window + 1
+            hits = 0
+            for flag in self.dones[start - 1:end]:
+                if flag:
+                    hits += 1
+            success_rate = hits / self._window
+            window_return = 0.0
+            for past_return in self.returns[start - 1:end]:
+                window_return += past_return
+            reward_mean = window_return / self._window
+            passed = (
+                success_rate >= self._success
+                and reward_mean >= self._reward
+            )
+            self.windows.append(
+                [start, end, success_rate, reward_mean, passed]
+            )
+            if passed:
+                self._streak += 1
+            else:
+                self._streak = 0
+            if end >= self._min_ep and self._streak >= self._patience:
+                self.converged_episode = end
+
+    def should_stop(self):
+        return self.converged_episode is not None
+
+
+def _ppo_run_episodes(
+    env,
+    limit,
+    actions,
+    state_index,
+    h,
+    values,
+    rng,
+    max_steps,
+    gamma,
+    lambda_,
+    alpha,
+    c,
+    epochs,
+    collector,
+):
+    """固定回合上限的逐回合驱动：每回合运行私有内核，再交由收集器
+    record，并以其停止谓词 should_stop 决定是否早停。返回更新后的 h。"""
+    for _ in range(limit):
+        h, step_records, objectives, done, episode_return = (
+            _ppo_run_episode(
+                env,
+                actions,
+                state_index,
+                h,
+                values,
+                rng,
+                max_steps,
+                gamma,
+                lambda_,
+                alpha,
+                c,
+                epochs,
+            )
+        )
+        collector.record(
+            step_records, objectives, done, episode_return
+        )
+        if collector.should_stop():
+            break
+    return h
+
+
 def ppo_train(
     env,
     episodes=100,
@@ -6160,116 +6438,31 @@ def ppo_train(
     if epochs <= 0:
         raise ValueError("epochs must be positive")
 
-    actions = tuple(_ACTIONS)  # U, R, D, L
-    states = sorted(
-        state
-        for state in _reachable_cells(env)
-        if env._cell(state) != "G"
+    actions, states, state_index, h, values, rng = _ppo_training_setup(
+        env, seed
     )
-    state_index = {state: i for i, state in enumerate(states)}
-    h = [[0.0 for _ in actions] for _ in states]
-    values = [0.0 for _ in states]
-    rng = random.Random(seed)
-    all_episodes = []
-    all_objectives = []
+    collector = _PpoEpisodeCollector()
+    h = _ppo_run_episodes(
+        env,
+        episodes,
+        actions,
+        state_index,
+        h,
+        values,
+        rng,
+        max_steps,
+        gamma,
+        lambda_,
+        alpha,
+        c,
+        epochs,
+        collector,
+    )
 
-    for _ in range(episodes):
-        state = env.reset()
-        trajectory = []
-        step_records = []
-        for _ in range(max_steps):
-            s = state_index[state]
-            row = h[s]
-            m = max(row)
-            weights = [math.exp(logit - m) for logit in row]
-            total = sum(weights)
-            if not math.isfinite(total) or total <= 0.0:
-                raise ValueError(
-                    "softmax normalizer must be finite and positive"
-                )
-            probs = [weight / total for weight in weights]
-            log_total = math.log(total)
-            u = rng.random()
-            cumulative = 0.0
-            a = 3
-            for k, p_k in enumerate(probs):
-                cumulative += p_k
-                if cumulative > u:
-                    a = k
-                    break
-            action = actions[a]
-            old_logp = row[a] - m - log_total
-            if not math.isfinite(old_logp):
-                raise ValueError("log-probabilities must be finite")
-            value = values[s]
-            next_state, reward, done = env.step(action)
-            value_next = 0.0 if done else values[state_index[next_state]]
-            trajectory.append(
-                (s, a, reward, old_logp, value, value_next, done)
-            )
-            step_records.append(
-                [state[0], state[1], action, reward, done]
-            )
-            if done:
-                break
-            state = next_state
-
-        advantages = [0.0] * len(trajectory)
-        a_t = 0.0
-        for t in range(len(trajectory) - 1, -1, -1):
-            (
-                _s,
-                _a,
-                reward,
-                _old_logp,
-                value,
-                value_next,
-                _done,
-            ) = trajectory[t]
-            delta = reward + gamma * value_next - value
-            if not math.isfinite(delta):
-                raise ValueError("GAE delta must be finite")
-            a_t = delta + gamma * lambda_ * a_t
-            if not math.isfinite(a_t):
-                raise ValueError("GAE advantage must be finite")
-            advantages[t] = a_t
-
-        batch = [
-            [s, a, old_logp, adv]
-            for (s, a, _r, old_logp, _v, _v2, _done), adv in zip(
-                trajectory, advantages
-            )
-        ]
-        result = ppo_update(h, batch, float(alpha), c, epochs)
-        h = result["logits"]
-        all_objectives.append(result["objectives"])
-
-        for (s, _a, _r, _old_logp, value, _v2, _done), adv in zip(
-            trajectory, advantages
-        ):
-            new_value = values[s] + alpha * (
-                adv + value - values[s]
-            )
-            if not math.isfinite(new_value):
-                raise ValueError("updated value must be finite")
-            values[s] = new_value
-        all_episodes.append(step_records)
-
-    h_table = [
-        [
-            float(r),
-            float(c),
-            h[i][0],
-            h[i][1],
-            h[i][2],
-            h[i][3],
-        ]
-        for i, (r, c) in enumerate(states)
-    ]
     return {
-        "h": h_table,
-        "episodes": all_episodes,
-        "objectives": all_objectives,
+        "h": _ppo_h_table(h, states),
+        "episodes": collector.episodes,
+        "objectives": collector.objectives,
     }
 
 
@@ -6355,155 +6548,37 @@ def ppo_converge(
     c = 0.2
     epochs = 4
 
-    actions = tuple(_ACTIONS)  # U, R, D, L
-    states = sorted(
-        state
-        for state in _reachable_cells(env)
-        if env._cell(state) != "G"
+    actions, states, state_index, h, values, rng = _ppo_training_setup(
+        env, seed
     )
-    state_index = {state: i for i, state in enumerate(states)}
-    h = [[0.0 for _ in actions] for _ in states]
-    values = [0.0 for _ in states]
-    rng = random.Random(seed)
-    all_episodes = []
-    all_objectives = []
-    dones = []
-    returns = []
-    windows = []
-    streak = 0
-    converged_episode = None
+    collector = _PpoConvergeCollector(
+        window, success, reward, patience, min_ep
+    )
+    h = _ppo_run_episodes(
+        env,
+        episodes,
+        actions,
+        state_index,
+        h,
+        values,
+        rng,
+        max_steps,
+        gamma,
+        lambda_,
+        alpha,
+        c,
+        epochs,
+        collector,
+    )
 
-    for _ in range(episodes):
-        state = env.reset()
-        trajectory = []
-        step_records = []
-        for _ in range(max_steps):
-            s = state_index[state]
-            row = h[s]
-            m = max(row)
-            weights = [math.exp(logit - m) for logit in row]
-            total = sum(weights)
-            if not math.isfinite(total) or total <= 0.0:
-                raise ValueError(
-                    "softmax normalizer must be finite and positive"
-                )
-            probs = [weight / total for weight in weights]
-            log_total = math.log(total)
-            u = rng.random()
-            cumulative = 0.0
-            a = 3
-            for k, p_k in enumerate(probs):
-                cumulative += p_k
-                if cumulative > u:
-                    a = k
-                    break
-            action = actions[a]
-            old_logp = row[a] - m - log_total
-            if not math.isfinite(old_logp):
-                raise ValueError("log-probabilities must be finite")
-            value = values[s]
-            next_state, reward_, done = env.step(action)
-            value_next = 0.0 if done else values[state_index[next_state]]
-            trajectory.append(
-                (s, a, reward_, old_logp, value, value_next, done)
-            )
-            step_records.append(
-                [state[0], state[1], action, reward_, done]
-            )
-            if done:
-                break
-            state = next_state
-
-        advantages = [0.0] * len(trajectory)
-        a_t = 0.0
-        for t in range(len(trajectory) - 1, -1, -1):
-            (
-                _s,
-                _a,
-                reward_,
-                _old_logp,
-                value,
-                value_next,
-                _done,
-            ) = trajectory[t]
-            delta = reward_ + gamma * value_next - value
-            if not math.isfinite(delta):
-                raise ValueError("GAE delta must be finite")
-            a_t = delta + gamma * lambda_ * a_t
-            if not math.isfinite(a_t):
-                raise ValueError("GAE advantage must be finite")
-            advantages[t] = a_t
-
-        batch = [
-            [s, a, old_logp, adv]
-            for (s, a, _r, old_logp, _v, _v2, _done), adv in zip(
-                trajectory, advantages
-            )
-        ]
-        result = ppo_update(h, batch, float(alpha), c, epochs)
-        h = result["logits"]
-        all_objectives.append(result["objectives"])
-
-        for (s, _a, _r, _old_logp, value, _v2, _done), adv in zip(
-            trajectory, advantages
-        ):
-            new_value = values[s] + alpha * (
-                adv + value - values[s]
-            )
-            if not math.isfinite(new_value):
-                raise ValueError("updated value must be finite")
-            values[s] = new_value
-        all_episodes.append(step_records)
-
-        dones.append(trajectory[-1][6])
-        episode_return = 0.0
-        for (_s, _a, reward_, _ol, _v, _v2, _d) in trajectory:
-            episode_return += reward_
-        returns.append(episode_return)
-
-        end = len(returns)
-        if end >= window:
-            start = end - window + 1
-            hits = 0
-            for flag in dones[start - 1:end]:
-                if flag:
-                    hits += 1
-            success_rate = hits / window
-            window_return = 0.0
-            for past_return in returns[start - 1:end]:
-                window_return += past_return
-            reward_mean = window_return / window
-            passed = success_rate >= success and reward_mean >= reward
-            windows.append(
-                [start, end, success_rate, reward_mean, passed]
-            )
-            if passed:
-                streak += 1
-            else:
-                streak = 0
-            if end >= min_ep and streak >= patience:
-                converged_episode = end
-                break
-
-    h_table = [
-        [
-            float(r),
-            float(c),
-            h[i][0],
-            h[i][1],
-            h[i][2],
-            h[i][3],
-        ]
-        for i, (r, c) in enumerate(states)
-    ]
     return {
-        "h": h_table,
-        "episodes": all_episodes,
-        "objectives": all_objectives,
+        "h": _ppo_h_table(h, states),
+        "episodes": collector.episodes,
+        "objectives": collector.objectives,
         "report": {
-            "converged": converged_episode is not None,
-            "episode": converged_episode,
-            "windows": windows,
+            "converged": collector.converged_episode is not None,
+            "episode": collector.converged_episode,
+            "windows": collector.windows,
         },
     }
 
@@ -11288,126 +11363,32 @@ def ppo_train_until(
     c = 0.2
     epochs = 4
 
-    actions = tuple(_ACTIONS)  # U, R, D, L
-    states = sorted(
-        state
-        for state in _reachable_cells(env)
-        if env._cell(state) != "G"
+    actions, states, state_index, h, values, rng = _ppo_training_setup(
+        env, seed
     )
-    state_index = {state: i for i, state in enumerate(states)}
-    h = [[0.0 for _ in actions] for _ in states]
-    values = [0.0 for _ in states]
-    rng = random.Random(seed)
-    all_episodes = []
-    all_objectives = []
-    successes = []
-    convergence = None
+    collector = _PpoSuccessCollector(window, threshold, patience)
+    h = _ppo_run_episodes(
+        env,
+        max_episodes,
+        actions,
+        state_index,
+        h,
+        values,
+        rng,
+        max_steps,
+        gamma,
+        lambda_,
+        alpha,
+        c,
+        epochs,
+        collector,
+    )
 
-    for _ in range(max_episodes):
-        state = env.reset()
-        trajectory = []
-        step_records = []
-        for _ in range(max_steps):
-            s = state_index[state]
-            row = h[s]
-            m = max(row)
-            weights = [math.exp(logit - m) for logit in row]
-            total = sum(weights)
-            if not math.isfinite(total) or total <= 0.0:
-                raise ValueError(
-                    "softmax normalizer must be finite and positive"
-                )
-            probs = [weight / total for weight in weights]
-            log_total = math.log(total)
-            u = rng.random()
-            cumulative = 0.0
-            a = 3
-            for k, p_k in enumerate(probs):
-                cumulative += p_k
-                if cumulative > u:
-                    a = k
-                    break
-            action = actions[a]
-            old_logp = row[a] - m - log_total
-            if not math.isfinite(old_logp):
-                raise ValueError("log-probabilities must be finite")
-            value = values[s]
-            next_state, reward, done = env.step(action)
-            value_next = 0.0 if done else values[state_index[next_state]]
-            trajectory.append(
-                (s, a, reward, old_logp, value, value_next, done)
-            )
-            step_records.append(
-                [state[0], state[1], action, reward, done]
-            )
-            if done:
-                break
-            state = next_state
-
-        advantages = [0.0] * len(trajectory)
-        a_t = 0.0
-        for t in range(len(trajectory) - 1, -1, -1):
-            (
-                _s,
-                _a,
-                reward,
-                _old_logp,
-                value,
-                value_next,
-                _done,
-            ) = trajectory[t]
-            delta = reward + gamma * value_next - value
-            if not math.isfinite(delta):
-                raise ValueError("GAE delta must be finite")
-            a_t = delta + gamma * lambda_ * a_t
-            if not math.isfinite(a_t):
-                raise ValueError("GAE advantage must be finite")
-            advantages[t] = a_t
-
-        batch = [
-            [s, a, old_logp, adv]
-            for (s, a, _r, old_logp, _v, _v2, _done), adv in zip(
-                trajectory, advantages
-            )
-        ]
-        result = ppo_update(h, batch, float(alpha), c, epochs)
-        h = result["logits"]
-        all_objectives.append(result["objectives"])
-
-        for (s, _a, _r, _old_logp, value, _v2, _done), adv in zip(
-            trajectory, advantages
-        ):
-            new_value = values[s] + alpha * (
-                adv + value - values[s]
-            )
-            if not math.isfinite(new_value):
-                raise ValueError("updated value must be finite")
-            values[s] = new_value
-        all_episodes.append(step_records)
-
-        successes.append(step_records[-1][4])
-        convergence = ppo_success_streak(
-            successes, window, threshold, patience
-        )
-        if convergence["converged"]:
-            break
-
-    h_table = [
-        [
-            float(r),
-            float(c),
-            h[i][0],
-            h[i][1],
-            h[i][2],
-            h[i][3],
-        ]
-        for i, (r, c) in enumerate(states)
-    ]
     return {
-        "h": h_table,
-        "episodes": all_episodes,
-        "objectives": all_objectives,
-        "convergence": convergence,
+        "h": _ppo_h_table(h, states),
+        "episodes": collector.episodes,
+        "objectives": collector.objectives,
+        "convergence": collector.convergence,
     }
 
 
