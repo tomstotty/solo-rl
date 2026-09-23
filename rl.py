@@ -370,6 +370,121 @@ def q_learning(
     return q
 
 
+def ucb_q_learning(
+    env,
+    episodes=500,
+    alpha=0.5,
+    gamma=0.9,
+    c=1.0,
+    max_steps=1000,
+) -> dict:
+    """确定性 UCB 探索的 Q-learning，返回 {"q": ..., "counts": ...}。
+
+    Q 与 N 均覆盖从 S 可达的非 G 格与 U/R/D/L 的全部组合，键序为
+    坐标升序 × URDL，初值分别为 0.0 与 0。每回合 reset，单回合最多
+    max_steps 步，全程不消费任何随机性。
+
+    状态 s 存在 N[s,a]==0 的动作时，取 URDL 序首个未访问动作；否则
+    取 Q[s,a] + c*sqrt(log(sum_b N[s,b]) / N[s,a]) 的 URDL 序首个
+    最大动作。step 后先 N[s,a]+=1；done 时目标为 reward，否则为
+    reward + gamma*max_a Q[next,a]（到达步限被截断的末步 done=False
+    时同样自举），再作 Q[s,a] += alpha*(目标-Q[s,a])。reward 或新
+    Q 非有限时抛 ValueError。
+
+    返回两个相互独立的 dict，键序均为坐标升序 × URDL，q 的值为
+    float、counts 的值为 int。
+    """
+    if not isinstance(env, GridWorld):
+        raise TypeError("env must be a GridWorld")
+    if isinstance(episodes, bool) or not isinstance(episodes, int):
+        raise TypeError("episodes must be an int")
+    if isinstance(max_steps, bool) or not isinstance(max_steps, int):
+        raise TypeError("max_steps must be an int")
+    if episodes <= 0:
+        raise ValueError("episodes must be positive")
+    if max_steps <= 0:
+        raise ValueError("max_steps must be positive")
+    if isinstance(alpha, bool) or not isinstance(alpha, (int, float)):
+        raise TypeError("alpha must be an int or float")
+    if isinstance(gamma, bool) or not isinstance(gamma, (int, float)):
+        raise TypeError("gamma must be an int or float")
+    if isinstance(c, bool) or not isinstance(c, (int, float)):
+        raise TypeError("c must be an int or float")
+    try:
+        alpha = float(alpha)
+    except OverflowError:
+        raise ValueError("alpha must be finite and in (0, 1]")
+    if not math.isfinite(alpha) or alpha <= 0 or alpha > 1:
+        raise ValueError("alpha must be finite and in (0, 1]")
+    try:
+        gamma = float(gamma)
+    except OverflowError:
+        raise ValueError("gamma must be finite and in [0, 1)")
+    if not math.isfinite(gamma) or gamma < 0 or gamma >= 1:
+        raise ValueError("gamma must be finite and in [0, 1)")
+    try:
+        c = float(c)
+    except OverflowError:
+        raise ValueError("c must be finite and in [0, +inf)")
+    if not math.isfinite(c) or c < 0:
+        raise ValueError("c must be finite and in [0, +inf)")
+
+    actions = tuple(_ACTIONS)  # U, R, D, L
+    states = [
+        state
+        for state in sorted(_reachable_cells(env))
+        if env._cell(state) != "G"
+    ]
+    q = {(state, action): 0.0 for state in states for action in actions}
+    counts = {(state, action): 0 for state in states for action in actions}
+
+    for _ in range(episodes):
+        state = env.reset()
+        for _ in range(max_steps):
+            action = None
+            for candidate in actions:
+                if counts[(state, candidate)] == 0:
+                    action = candidate
+                    break
+            if action is None:
+                total = sum(counts[(state, a)] for a in actions)
+                best_action = None
+                best_value = None
+                for candidate in actions:
+                    n = counts[(state, candidate)]
+                    value = q[(state, candidate)] + c * math.sqrt(
+                        math.log(total) / n
+                    )
+                    if best_value is None or value > best_value:
+                        best_value = value
+                        best_action = candidate
+                action = best_action
+            next_state, reward, done = env.step(action)
+            if not math.isfinite(reward):
+                raise ValueError("reward must be finite")
+            key = (state, action)
+            counts[key] += 1
+            if done:
+                target = reward
+            else:
+                target = reward + gamma * max(
+                    q[(next_state, a)] for a in actions
+                )
+            new_value = q[key] + alpha * (target - q[key])
+            if not math.isfinite(new_value):
+                raise ValueError("Q value must remain finite")
+            q[key] = new_value
+            if done:
+                break
+            state = next_state
+
+    ordered_keys = [(state, action) for state in states for action in actions]
+    return {
+        "q": {key: float(q[key]) for key in ordered_keys},
+        "counts": {key: int(counts[key]) for key in ordered_keys},
+    }
+
+
 def q_learning_trace(
     env,
     episodes=500,
