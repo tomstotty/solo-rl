@@ -12305,13 +12305,13 @@ def _trace_converge_compare(base_path, new_path):
     )
 
 
-def _trace_converge_history(paths):
-    """加载多份 trace-converge 清单并按 M1 的 seed 顺序汇总历史。
+def _trace_converge_history_reports(paths):
+    """加载多份 trace-converge 清单并返回各自的汇总报告。
 
-    全部清单完整加载、轨迹全部读取、汇总完成后才生成输出字符串；
-    window 须相同，threshold/tolerance/minimum 转 float 后
-    float.hex() 须相同，seed 集合须相同（各清单内重复 seed 已由
-    清单契约拒绝）。任一违约抛 ValueError。
+    全部清单完整加载、轨迹全部读取、汇总完成后才返回；window 须相同，
+    threshold/tolerance/minimum 转 float 后 float.hex() 须相同，seed
+    集合须相同（各清单内重复 seed 已由清单契约拒绝）。任一违约抛
+    ValueError。
     """
     loaded = [_load_trace_converge_manifest(path) for path in paths]
     (
@@ -12335,7 +12335,7 @@ def _trace_converge_history(paths):
         if {run["seed"] for run in runs} != base_seed_set:
             raise ValueError("seed sets must match between manifests")
 
-    reports = [
+    return [
         ppo_trace_converge_many(
             runs,
             window=window,
@@ -12345,6 +12345,16 @@ def _trace_converge_history(paths):
         )
         for runs, window, threshold, tolerance, minimum in loaded
     ]
+
+
+def _trace_converge_history(paths):
+    """加载多份 trace-converge 清单并按 M1 的 seed 顺序汇总历史。
+
+    全部清单完整加载、轨迹全部读取、汇总完成后才生成输出字符串；
+    跨清单的 window、三项浮点参数与 seed 集合规则同
+    _trace_converge_history_reports。
+    """
+    reports = _trace_converge_history_reports(paths)
 
     experiments = [
         [index, report["converged"], report["rate"], report["failed"]]
@@ -12376,6 +12386,101 @@ def _trace_converge_history(paths):
         "experiments": experiments,
         "deltas": deltas,
         "trends": trends,
+    }
+    return json.dumps(
+        result,
+        ensure_ascii=True,
+        allow_nan=False,
+        separators=(",", ":"),
+    )
+
+
+_GATE_PARAM_DECODER = json.JSONDecoder(parse_constant=_reject_constant)
+
+
+def _trace_converge_history_gate(drop_text, delay_text, paths):
+    """加载多份 trace-converge 清单并按 DROP/DELAY 门限汇总历史。
+
+    DROP 须为 JSON 非 bool 有限数且在 [0, 1]，DELAY 须为 JSON 非
+    bool 非负整数，否则抛 ValueError；不允许尾随内容。全部清单完整
+    加载、轨迹全部读取、汇总完成后才生成输出字符串，跨清单的
+    window、三项浮点参数与 seed 集合规则同
+    _trace_converge_history_reports。
+
+    对每对相邻实验令 d = 新 rate - 旧 rate；逐 seed 比较收敛回合：
+    旧为 int 而新为 None 记 lost，均为 int 且新 - 旧 > DELAY 记
+    late。该对仅在 d >= -DROP 且无任何 lost/late 时通过。输出键序
+    恰为 passed、comparisons、seeds，seed 顺序取首份清单。
+    """
+    try:
+        drop_raw, drop_end = _GATE_PARAM_DECODER.raw_decode(drop_text)
+    except (json.JSONDecodeError, RecursionError) as exc:
+        raise ValueError("DROP must be valid JSON") from exc
+    if drop_end != len(drop_text):
+        raise ValueError("DROP must not contain trailing content")
+    if isinstance(drop_raw, bool) or not isinstance(drop_raw, (int, float)):
+        raise ValueError("DROP must be a non-bool JSON number")
+    try:
+        drop = float(drop_raw)
+    except OverflowError as exc:
+        raise ValueError("DROP must be convertible to float") from exc
+    if not math.isfinite(drop) or drop < 0.0 or drop > 1.0:
+        raise ValueError("DROP must be finite and in [0, 1]")
+
+    try:
+        delay, delay_end = _GATE_PARAM_DECODER.raw_decode(delay_text)
+    except (json.JSONDecodeError, RecursionError) as exc:
+        raise ValueError("DELAY must be valid JSON") from exc
+    if delay_end != len(delay_text):
+        raise ValueError("DELAY must not contain trailing content")
+    if isinstance(delay, bool) or not isinstance(delay, int):
+        raise ValueError("DELAY must be a non-bool JSON integer")
+    if delay < 0:
+        raise ValueError("DELAY must be >= 0")
+
+    reports = _trace_converge_history_reports(paths)
+
+    episodes_by_seed = [
+        {seed: group["episode"] for seed, group in report["groups"]}
+        for report in reports
+    ]
+
+    comparisons = []
+    pair_passes = []
+    pair_failures_by_seed = {
+        seed: [] for seed, _ in reports[0]["groups"]
+    }
+    for index in range(1, len(reports)):
+        rate_delta = reports[index]["rate"] - reports[index - 1]["rate"]
+        failures = []
+        for seed, _ in reports[0]["groups"]:
+            old_episode = episodes_by_seed[index - 1][seed]
+            new_episode = episodes_by_seed[index][seed]
+            if isinstance(old_episode, int) and new_episode is None:
+                kind = "lost"
+            elif (
+                isinstance(old_episode, int)
+                and isinstance(new_episode, int)
+                and new_episode - old_episode > delay
+            ):
+                kind = "late"
+            else:
+                continue
+            failures.append([seed, kind])
+            pair_failures_by_seed[seed].append([index - 1, index, kind])
+        pair_pass = rate_delta >= -drop and not failures
+        comparisons.append([index - 1, index, rate_delta, pair_pass])
+        pair_passes.append(pair_pass)
+
+    seeds = []
+    for seed, _ in reports[0]["groups"]:
+        episodes = [per_seed[seed] for per_seed in episodes_by_seed]
+        seeds.append([seed, episodes, pair_failures_by_seed[seed]])
+
+    result = {
+        "passed": all(pair_passes),
+        "comparisons": comparisons,
+        "seeds": seeds,
     }
     return json.dumps(
         result,
@@ -12456,6 +12561,15 @@ def _run(argv):
     if command == "trace-converge-history" and len(argv) >= 4:
         try:
             out = _trace_converge_history(argv[2:])
+        except (TypeError, ValueError):
+            return 2
+        _write_line(out)
+        return 0
+    if command == "trace-converge-history-gate" and len(argv) >= 6:
+        try:
+            out = _trace_converge_history_gate(
+                argv[2], argv[3], argv[4:]
+            )
         except (TypeError, ValueError):
             return 2
         _write_line(out)
