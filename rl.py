@@ -3163,6 +3163,150 @@ def td_lambda_prediction(
     return v
 
 
+def true_online_td_lambda_prediction(
+    env,
+    policy,
+    episodes=500,
+    alpha=0.1,
+    gamma=0.9,
+    lambda_=0.9,
+    seed=0,
+    max_steps=1000,
+) -> dict:
+    """按给定策略做 True Online TD(λ) 策略评估，返回 V 表。
+
+    policy 为 dict，键恰为从 S 可达的非 G 格（二元非 bool 整数 tuple），
+    值为 U/R/D/L 序的四项 list，各项为有限非负 float 且行和为 1.0。
+    V 覆盖从 S 可达的全部格（含 G），按坐标升序、初值均为 0.0，G 格
+    V 值恒为 0.0；资格迹 E 仅覆盖非 G 格。每回合 reset，E 清零，
+    v_old=0.0，至 done 或 max_steps 步。每步仅调用一次 random()：按
+    URDL 累计概率取首个严格大于样本的动作，未命中取 L。每步 step 前
+    记 v=V[s]；step 得 (s2, r, done)，done 时 v2=0.0，否则取更新前的
+    V[s2]（达到步限且未 done 的末步同样自举）。令 d=r+gamma*v2-v，
+    按坐标序先对每个非 G 格作 E[x]*=gamma*lambda_，再作
+    E[s]+=1-alpha*E[s]；随后按坐标序作 V[x]+=alpha*(d+v-v_old)*E[x]，
+    再作 V[s]-=alpha*(v-v_old)。d、E 或任一新 V 非有限即抛
+    ValueError。done 即停，否则置 s, v_old = s2, v2。全部随机性来自
+    一个 random.Random(seed)。
+    """
+    if not isinstance(env, GridWorld):
+        raise TypeError("env must be a GridWorld")
+    if isinstance(episodes, bool) or not isinstance(episodes, int):
+        raise TypeError("episodes must be an int")
+    if isinstance(seed, bool) or not isinstance(seed, int):
+        raise TypeError("seed must be an int")
+    if isinstance(max_steps, bool) or not isinstance(max_steps, int):
+        raise TypeError("max_steps must be an int")
+    if isinstance(alpha, bool) or not isinstance(alpha, (int, float)):
+        raise TypeError("alpha must be an int or float")
+    if isinstance(gamma, bool) or not isinstance(gamma, (int, float)):
+        raise TypeError("gamma must be an int or float")
+    if isinstance(lambda_, bool) or not isinstance(lambda_, (int, float)):
+        raise TypeError("lambda_ must be an int or float")
+    if episodes <= 0:
+        raise ValueError("episodes must be positive")
+    if max_steps <= 0:
+        raise ValueError("max_steps must be positive")
+    if not _is_finite_number(alpha) or alpha <= 0 or alpha > 1:
+        raise ValueError("alpha must be finite and in (0, 1]")
+    if not _is_finite_number(gamma) or gamma < 0 or gamma >= 1:
+        raise ValueError("gamma must be finite and in [0, 1)")
+    if not _is_finite_number(lambda_) or lambda_ < 0 or lambda_ > 1:
+        raise ValueError("lambda_ must be finite and in [0, 1]")
+
+    actions = tuple(_ACTIONS)  # U, R, D, L
+    states = sorted(
+        state
+        for state in _reachable_cells(env)
+        if env._cell(state) != "G"
+    )
+    all_states = sorted(_reachable_cells(env))
+    if not isinstance(policy, dict):
+        raise TypeError("policy must be a dict")
+    for key in policy:
+        if (
+            not isinstance(key, tuple)
+            or len(key) != 2
+            or any(
+                isinstance(v, bool) or not isinstance(v, int) for v in key
+            )
+        ):
+            raise TypeError(
+                "policy keys must be tuples of two non-bool ints"
+            )
+    if set(policy) != set(states):
+        raise ValueError(
+            "policy keys must exactly be the reachable non-goal cells"
+        )
+    for state in states:
+        row = policy[state]
+        if not isinstance(row, list):
+            raise TypeError("policy rows must be lists")
+        if len(row) != 4:
+            raise ValueError(
+                "policy rows must have four entries in U, R, D, L order"
+            )
+        for probability in row:
+            if isinstance(probability, bool) or not isinstance(
+                probability, float
+            ):
+                raise TypeError("policy probabilities must be floats")
+        for probability in row:
+            if not math.isfinite(probability):
+                raise ValueError("policy probabilities must be finite")
+            if probability < 0:
+                raise ValueError("policy probabilities must be non-negative")
+        if sum(row, 0.0) != 1.0:
+            raise ValueError("policy rows must sum to 1.0")
+
+    v = {cell: 0.0 for cell in all_states}
+    rng = random.Random(seed)
+
+    for _ in range(episodes):
+        state = env.reset()
+        trace = {cell: 0.0 for cell in states}
+        v_old = 0.0
+        for _ in range(max_steps):
+            sample = rng.random()
+            cumulative = 0.0
+            action = "L"
+            for candidate, probability in zip(actions, policy[state]):
+                cumulative += probability
+                if cumulative > sample:
+                    action = candidate
+                    break
+            value = v[state]
+            next_state, reward, done = env.step(action)
+            if done:
+                next_value = 0.0
+            else:
+                next_value = v[next_state]
+            delta = reward + gamma * next_value - value
+            if not math.isfinite(delta):
+                raise ValueError("TD error must remain finite")
+            decay = gamma * lambda_
+            for cell in states:
+                trace[cell] *= decay
+                if not math.isfinite(trace[cell]):
+                    raise ValueError("eligibility trace must remain finite")
+            trace[state] += 1.0 - alpha * trace[state]
+            if not math.isfinite(trace[state]):
+                raise ValueError("eligibility trace must remain finite")
+            step_size = alpha * (delta + value - v_old)
+            for cell in states:
+                v[cell] += step_size * trace[cell]
+                if not math.isfinite(v[cell]):
+                    raise ValueError("V value must remain finite")
+            v[state] -= alpha * (value - v_old)
+            if not math.isfinite(v[state]):
+                raise ValueError("V value must remain finite")
+            if done:
+                break
+            state = next_state
+            v_old = next_value
+    return v
+
+
 def nstep_actor_critic(
     env,
     episodes=500,
