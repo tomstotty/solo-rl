@@ -3,6 +3,7 @@
 import hashlib
 import json
 import math
+import os
 import random
 import sys
 
@@ -12088,6 +12089,134 @@ def _format_value(value):
     return format(value, ".12f")
 
 
+def _reject_constant(value):
+    raise ValueError(f"invalid JSON constant: {value}")
+
+
+def _reject_duplicate_keys(pairs):
+    result = {}
+    for key, value in pairs:
+        if key in result:
+            raise ValueError(f"duplicate object key: {key!r}")
+        result[key] = value
+    return result
+
+
+_MANIFEST_DECODER = json.JSONDecoder(
+    object_pairs_hook=_reject_duplicate_keys,
+    parse_constant=_reject_constant,
+)
+
+
+def _load_trace_converge_manifest(path):
+    """严格解析 trace-converge 清单，返回可直接传给
+    ppo_trace_converge_many 的实参与轨迹文件字节。
+
+    清单须为 UTF-8 JSON 字节：无 BOM、无重复键、无
+    NaN/Infinity/-Infinity、无尾随内容；结构与取值违约均抛
+    ValueError。相对路径基于清单所在目录按序读取，文件读取失败
+    抛 ValueError。
+    """
+    try:
+        with open(path, "rb") as handle:
+            payload = handle.read()
+    except OSError as exc:
+        raise ValueError("cannot read manifest") from exc
+    if not payload:
+        raise ValueError("manifest must not be empty")
+    if payload.startswith(_UTF8_BOM):
+        raise ValueError("manifest must not start with a BOM")
+    try:
+        text = payload.decode("utf-8")
+    except UnicodeDecodeError as exc:
+        raise ValueError("manifest must be valid UTF-8") from exc
+    try:
+        manifest, end = _MANIFEST_DECODER.raw_decode(text)
+    except RecursionError as exc:
+        raise ValueError("manifest nesting too deep") from exc
+    except json.JSONDecodeError as exc:
+        raise ValueError("manifest must be valid JSON") from exc
+    if end != len(text):
+        raise ValueError("manifest must not contain trailing content")
+    if not isinstance(manifest, dict) or list(manifest) != [
+        "runs",
+        "window",
+        "threshold",
+        "tolerance",
+        "minimum",
+    ]:
+        raise ValueError(
+            "manifest root keys must be exactly"
+            " ['runs', 'window', 'threshold', 'tolerance',"
+            " 'minimum'] in order"
+        )
+
+    runs = manifest["runs"]
+    if not isinstance(runs, list) or not runs:
+        raise ValueError("runs must be a non-empty list")
+    base_dir = os.path.dirname(os.path.abspath(path))
+    seen_seeds = set()
+    converted = []
+    for index, run in enumerate(runs):
+        if not isinstance(run, dict) or list(run) != ["seed", "files"]:
+            raise ValueError(
+                f"runs[{index}] keys must be exactly ['seed', 'files']"
+                " in order"
+            )
+        seed = run["seed"]
+        if isinstance(seed, bool) or not isinstance(seed, int):
+            raise TypeError(f"runs[{index}] seed must be a non-bool int")
+        if seed in seen_seeds:
+            raise ValueError(f"runs[{index}] seed must be unique")
+        seen_seeds.add(seed)
+        files = run["files"]
+        if not isinstance(files, list) or len(files) < 2:
+            raise ValueError(
+                f"runs[{index}] files must contain at least two entries"
+            )
+        items = []
+        for file_index, name in enumerate(files):
+            if not isinstance(name, str) or not name:
+                raise ValueError(
+                    f"runs[{index}] files[{file_index}] must be a"
+                    " non-empty str"
+                )
+            trace_path = os.path.join(base_dir, name)
+            try:
+                with open(trace_path, "rb") as handle:
+                    items.append(handle.read())
+            except OSError as exc:
+                raise ValueError(
+                    f"runs[{index}] files[{file_index}] cannot be read"
+                ) from exc
+        converted.append({"seed": seed, "items": items})
+
+    window = manifest["window"]
+    if isinstance(window, bool) or not isinstance(window, int) or window <= 0:
+        raise ValueError("window must be a non-bool positive int")
+    threshold = manifest["threshold"]
+    if not isinstance(threshold, float) or not math.isfinite(threshold):
+        raise ValueError("threshold must be a finite float")
+    if threshold < 0.0 or threshold > 1.0:
+        raise ValueError("threshold must be in [0, 1]")
+    tolerance = manifest["tolerance"]
+    if not isinstance(tolerance, float) or not math.isfinite(tolerance):
+        raise ValueError("tolerance must be a finite float")
+    if tolerance < 0.0:
+        raise ValueError("tolerance must be >= 0.0")
+    minimum = manifest["minimum"]
+    if isinstance(minimum, bool) or not isinstance(minimum, (int, float)):
+        raise ValueError("minimum must be a non-bool number")
+    try:
+        minimum = float(minimum)
+    except OverflowError as exc:
+        raise ValueError("minimum must be convertible to float") from exc
+    if not math.isfinite(minimum) or minimum < 0.0 or minimum > 1.0:
+        raise ValueError("minimum must be finite and in [0, 1]")
+
+    return converted, window, threshold, tolerance, minimum
+
+
 def _run(argv):
     if len(argv) < 2:
         return 2
@@ -12118,6 +12247,32 @@ def _run(argv):
         except (TypeError, ValueError, RuntimeError):
             return 2
         sys.stdout.write(json.dumps(out, separators=(",", ":")) + "\n")
+        return 0
+    if command == "trace-converge" and len(argv) == 3:
+        try:
+            (
+                runs,
+                window,
+                threshold,
+                tolerance,
+                minimum,
+            ) = _load_trace_converge_manifest(argv[2])
+            report = ppo_trace_converge_many(
+                runs,
+                window=window,
+                threshold=threshold,
+                tolerance=tolerance,
+                minimum=minimum,
+            )
+            out = json.dumps(
+                report,
+                ensure_ascii=True,
+                allow_nan=False,
+                separators=(",", ":"),
+            )
+        except (TypeError, ValueError):
+            return 2
+        sys.stdout.write(out + "\n")
         return 0
     return 2
 
