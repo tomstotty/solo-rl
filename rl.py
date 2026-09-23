@@ -12395,14 +12395,35 @@ def _trace_converge_history(paths):
     )
 
 
-_GATE_PARAM_DECODER = json.JSONDecoder(parse_constant=_reject_constant)
+def _parse_gate_int(text):
+    """JSON 整数解析钩子：允许任意位数字面量。
+
+    标准 int() 受 sys.get_int_max_str_digits() 位数上限约束；超过
+    上限时逐位累加转换，保证任意位整数字面量（含 -0）均可解析。
+    """
+    try:
+        return int(text)
+    except ValueError:
+        negative = text.startswith("-")
+        digits = text[1:] if negative else text
+        value = 0
+        for char in digits:
+            value = value * 10 + (ord(char) - ord("0"))
+        return -value if negative else value
+
+
+_GATE_PARAM_DECODER = json.JSONDecoder(
+    parse_constant=_reject_constant,
+    parse_int=_parse_gate_int,
+)
 
 
 def _trace_converge_history_gate(drop_text, delay_text, paths):
     """加载多份 trace-converge 清单并按 DROP/DELAY 门限汇总历史。
 
     DROP 须为 JSON 非 bool 有限数且在 [0, 1]，DELAY 须为 JSON 非
-    bool 非负整数，否则抛 ValueError；不允许尾随内容。全部清单完整
+    bool 非负整数字面量（任意位，-0 合法），否则抛 ValueError；
+    不允许尾随内容。全部清单完整
     加载、轨迹全部读取、汇总完成后才生成输出字符串，跨清单的
     window、三项浮点参数与 seed 集合规则同
     _trace_converge_history_reports。
@@ -12488,6 +12509,279 @@ def _trace_converge_history_gate(drop_text, delay_text, paths):
         allow_nan=False,
         separators=(",", ":"),
     )
+
+
+def _validate_gate_result(result, name, drop, delay):
+    """校验一份 trace-converge-history-gate 成功输出。
+
+    键序须恰为 passed、comparisons、seeds；错型抛 TypeError，其余
+    违约抛 ValueError。failures 须与 episodes 及 delay 隐含的
+    lost/late 事件一致，通过标记与 passed 须满足门限等式。返回
+    (comparisons, seeds)，不修改输入。
+    """
+    if not isinstance(result, dict):
+        raise TypeError(f"{name} must be a dict")
+    if list(result) != ["passed", "comparisons", "seeds"]:
+        raise ValueError(
+            f"{name} must have exactly the keys passed, comparisons,"
+            " seeds in order"
+        )
+    passed = result["passed"]
+    if not isinstance(passed, bool):
+        raise TypeError(f"{name} passed must be a bool")
+
+    comparisons = result["comparisons"]
+    if not isinstance(comparisons, list):
+        raise TypeError(f"{name} comparisons must be a list")
+    if not comparisons:
+        raise ValueError(f"{name} comparisons must be non-empty")
+    for index, entry in enumerate(comparisons):
+        entry_name = f"{name} comparisons[{index}]"
+        if not isinstance(entry, list):
+            raise TypeError(f"{entry_name} must be a list")
+        if len(entry) != 4:
+            raise ValueError(
+                f"{entry_name} must contain exactly four fields"
+            )
+        left, right, delta, pair_pass = entry
+        if isinstance(left, bool) or not isinstance(left, int):
+            raise TypeError(
+                f"{entry_name} left index must be a non-bool int"
+            )
+        if isinstance(right, bool) or not isinstance(right, int):
+            raise TypeError(
+                f"{entry_name} right index must be a non-bool int"
+            )
+        if left != index or right != index + 1:
+            raise ValueError(
+                f"{entry_name} indices must be [{index}, {index + 1}]"
+            )
+        if not isinstance(delta, float):
+            raise TypeError(f"{entry_name} rate delta must be a float")
+        if not math.isfinite(delta) or delta < -1.0 or delta > 1.0:
+            raise ValueError(
+                f"{entry_name} rate delta must be finite and in [-1, 1]"
+            )
+        if not isinstance(pair_pass, bool):
+            raise TypeError(f"{entry_name} pair pass flag must be a bool")
+
+    seeds = result["seeds"]
+    if not isinstance(seeds, list):
+        raise TypeError(f"{name} seeds must be a list")
+    if not seeds:
+        raise ValueError(f"{name} seeds must be non-empty")
+    episode_count = len(comparisons) + 1
+    seen_seeds = set()
+    failed_pairs = set()
+    for seed_index, entry in enumerate(seeds):
+        entry_name = f"{name} seeds[{seed_index}]"
+        if not isinstance(entry, list):
+            raise TypeError(f"{entry_name} must be a list")
+        if len(entry) != 3:
+            raise ValueError(
+                f"{entry_name} must contain exactly three fields"
+            )
+        seed, episodes, failures = entry
+        if isinstance(seed, bool) or not isinstance(seed, int):
+            raise TypeError(f"{entry_name} seed must be a non-bool int")
+        if seed in seen_seeds:
+            raise ValueError(f"{entry_name} seed must be unique")
+        seen_seeds.add(seed)
+        if not isinstance(episodes, list):
+            raise TypeError(f"{entry_name} episodes must be a list")
+        if len(episodes) != episode_count:
+            raise ValueError(
+                f"{entry_name} episodes must contain {episode_count}"
+                " entries"
+            )
+        for episode_index, episode in enumerate(episodes):
+            if episode is None:
+                continue
+            if isinstance(episode, bool) or not isinstance(episode, int):
+                raise TypeError(
+                    f"{entry_name} episodes[{episode_index}] must be"
+                    " None or a non-bool int"
+                )
+            if episode <= 0:
+                raise ValueError(
+                    f"{entry_name} episodes[{episode_index}] must be"
+                    " positive"
+                )
+        if not isinstance(failures, list):
+            raise TypeError(f"{entry_name} failures must be a list")
+        for failure_index, failure in enumerate(failures):
+            failure_name = f"{entry_name} failures[{failure_index}]"
+            if not isinstance(failure, list):
+                raise TypeError(f"{failure_name} must be a list")
+            if len(failure) != 3:
+                raise ValueError(
+                    f"{failure_name} must contain exactly three fields"
+                )
+            left, right, kind = failure
+            if isinstance(left, bool) or not isinstance(left, int):
+                raise TypeError(
+                    f"{failure_name} left index must be a non-bool int"
+                )
+            if isinstance(right, bool) or not isinstance(right, int):
+                raise TypeError(
+                    f"{failure_name} right index must be a non-bool int"
+                )
+            if not isinstance(kind, str):
+                raise TypeError(f"{failure_name} kind must be a str")
+        expected_failures = []
+        for index in range(len(comparisons)):
+            old_episode = episodes[index]
+            new_episode = episodes[index + 1]
+            if old_episode is not None and new_episode is None:
+                expected_failures.append([index, index + 1, "lost"])
+            elif (
+                old_episode is not None
+                and new_episode is not None
+                and new_episode - old_episode > delay
+            ):
+                expected_failures.append([index, index + 1, "late"])
+        if failures != expected_failures:
+            raise ValueError(
+                f"{entry_name} failures must equal the lost/late events"
+                " implied by episodes and delay"
+            )
+        for left, _, _ in expected_failures:
+            failed_pairs.add(left)
+
+    pair_passes = []
+    for index, entry in enumerate(comparisons):
+        expected_pass = entry[2] >= -drop and index not in failed_pairs
+        if entry[3] != expected_pass:
+            raise ValueError(
+                f"{name} comparisons[{index}] pair pass flag must equal"
+                " (rate delta >= -drop and no lost/late)"
+            )
+        pair_passes.append(entry[3])
+    if passed != all(pair_passes):
+        raise ValueError(
+            f"{name} passed must equal the conjunction of pair pass"
+            " flags"
+        )
+    return comparisons, seeds
+
+
+def _gate_deep_identical(left, right):
+    """按类型、float.hex 与顺序判定两个 JSON-like 值全同。"""
+    if type(left) is not type(right):
+        return False
+    if isinstance(left, float):
+        return float.hex(left) == float.hex(right)
+    if isinstance(left, dict):
+        if list(left) != list(right):
+            return False
+        return all(
+            _gate_deep_identical(left[key], right[key]) for key in left
+        )
+    if isinstance(left, list):
+        if len(left) != len(right):
+            return False
+        return all(
+            _gate_deep_identical(item_left, item_right)
+            for item_left, item_right in zip(left, right)
+        )
+    return left == right
+
+
+def ppo_trace_gate_consensus(groups) -> dict:
+    """汇总多组 trace-converge-history-gate 成功结果的一致性。
+
+    groups 须为至少两项的 list；每项须为键序恰为 drop、delay、
+    result 的 dict：drop 须为 [0, 1] 有限 float，delay 须为非
+    bool 非负 int，result 须符合 trace-converge-history-gate 成功
+    输出契约（键序 passed、comparisons、seeds；comparisons 非空，
+    逐项为 [左索引, 右索引, rate 差, 通过标记]，索引须从 0 起连续，
+    rate 差须为 [-1, 1] 有限 float；seeds 非空且 seed 唯一，逐项为
+    [seed, episodes, failures]，episodes 长度须为比较数加一且每项
+    为 None 或非 bool 正 int，failures 须与 episodes 及 delay 隐含
+    的 lost/late 事件完全一致；通过标记须等于 rate 差 >= -drop 且
+    该对无 lost/late，passed 须等于各对通过标记的合取）。错型抛
+    TypeError，其余违约抛 ValueError；不修改输入。
+
+    全部校验通过后，各组 drop 的 float.hex()、delay、比较索引与
+    seed 顺序还须相同，否则抛 ValueError；失败不产生部分结果。
+
+    返回键序 fingerprint、consensus、passed、seeds：fingerprint 为
+    完整 groups（保持列表及公开 dict 键序）经 _fingerprint_encode
+    编码所得 UTF-8 字节的 SHA-256 小写 64 位 hex；consensus 仅当各
+    result 按类型、float.hex 与顺序全同；passed 仅当各 result 的
+    passed 全真；seeds 按首组 seed 顺序列 [seed, lost_count,
+    late_count]，计数为各组该 seed 的 lost/late 失败数之和。结果
+    确定，仅用标准库，不新增命令行入口。
+    """
+    if not isinstance(groups, list):
+        raise TypeError("groups must be a list")
+    if len(groups) < 2:
+        raise ValueError("groups must contain at least two entries")
+
+    validated = []
+    for index, group in enumerate(groups):
+        name = f"groups[{index}]"
+        if not isinstance(group, dict):
+            raise TypeError(f"{name} must be a dict")
+        if list(group) != ["drop", "delay", "result"]:
+            raise ValueError(
+                f"{name} keys must be exactly ['drop', 'delay',"
+                " 'result'] in order"
+            )
+        drop = group["drop"]
+        if not isinstance(drop, float):
+            raise TypeError(f"{name} drop must be a float")
+        if not math.isfinite(drop) or drop < 0.0 or drop > 1.0:
+            raise ValueError(f"{name} drop must be finite and in [0, 1]")
+        delay = group["delay"]
+        if isinstance(delay, bool) or not isinstance(delay, int):
+            raise TypeError(f"{name} delay must be a non-bool int")
+        if delay < 0:
+            raise ValueError(f"{name} delay must be >= 0")
+        comparisons, seeds = _validate_gate_result(
+            group["result"], f"{name} result", drop, delay
+        )
+        validated.append((drop, delay, comparisons, seeds, group["result"]))
+
+    first_drop_hex = float.hex(validated[0][0])
+    first_delay = validated[0][1]
+    first_indices = [[entry[0], entry[1]] for entry in validated[0][2]]
+    first_seed_order = [entry[0] for entry in validated[0][3]]
+    for drop, delay, comparisons, seeds, _ in validated[1:]:
+        if float.hex(drop) != first_drop_hex:
+            raise ValueError("drop must match between groups")
+        if delay != first_delay:
+            raise ValueError("delay must match between groups")
+        if [[entry[0], entry[1]] for entry in comparisons] != first_indices:
+            raise ValueError(
+                "comparison indices must match between groups"
+            )
+        if [entry[0] for entry in seeds] != first_seed_order:
+            raise ValueError("seed order must match between groups")
+
+    results = [entry[4] for entry in validated]
+    consensus = all(
+        _gate_deep_identical(results[0], result) for result in results[1:]
+    )
+    passed = all(result["passed"] for result in results)
+    seeds_out = []
+    for position, seed in enumerate(first_seed_order):
+        lost_count = 0
+        late_count = 0
+        for _, _, _, seeds, _ in validated:
+            for _, _, kind in seeds[position][2]:
+                if kind == "lost":
+                    lost_count += 1
+                else:
+                    late_count += 1
+        seeds_out.append([seed, lost_count, late_count])
+
+    return {
+        "fingerprint": _fingerprint_hex(groups),
+        "consensus": consensus,
+        "passed": passed,
+        "seeds": seeds_out,
+    }
 
 
 def _write_line(text):
