@@ -12395,16 +12395,34 @@ def _trace_converge_history(paths):
     )
 
 
+def _parse_gate_int(text):
+    """解析任意位数的 JSON 整数字面量，不受 int 字符串位数限制。"""
+    set_limit = getattr(sys, "set_int_max_str_digits", None)
+    if set_limit is None:
+        return int(text)
+    previous = sys.get_int_max_str_digits()
+    try:
+        set_limit(0)
+        return int(text)
+    finally:
+        set_limit(previous)
+
+
 _GATE_PARAM_DECODER = json.JSONDecoder(parse_constant=_reject_constant)
+_GATE_DELAY_DECODER = json.JSONDecoder(
+    parse_constant=_reject_constant,
+    parse_int=_parse_gate_int,
+)
 
 
 def _trace_converge_history_gate(drop_text, delay_text, paths):
     """加载多份 trace-converge 清单并按 DROP/DELAY 门限汇总历史。
 
-    DROP 须为 JSON 非 bool 有限数且在 [0, 1]，DELAY 须为 JSON 非
-    bool 非负整数，否则抛 ValueError；不允许尾随内容。全部清单完整
-    加载、轨迹全部读取、汇总完成后才生成输出字符串，跨清单的
-    window、三项浮点参数与 seed 集合规则同
+    DROP 须为 JSON 非 bool 有限数且在 [0, 1]，DELAY 须为任意位的
+    JSON 非 bool 非负整数字面量（-0 合法；小数、指数、前导零、
+    bool、负值与尾随内容均违约），否则抛 ValueError；不允许尾随
+    内容。全部清单完整加载、轨迹全部读取、汇总完成后才生成输出
+    字符串，跨清单的 window、三项浮点参数与 seed 集合规则同
     _trace_converge_history_reports。
 
     对每对相邻实验令 d = 新 rate - 旧 rate；逐 seed 比较收敛回合：
@@ -12428,7 +12446,7 @@ def _trace_converge_history_gate(drop_text, delay_text, paths):
         raise ValueError("DROP must be finite and in [0, 1]")
 
     try:
-        delay, delay_end = _GATE_PARAM_DECODER.raw_decode(delay_text)
+        delay, delay_end = _GATE_DELAY_DECODER.raw_decode(delay_text)
     except (json.JSONDecodeError, RecursionError) as exc:
         raise ValueError("DELAY must be valid JSON") from exc
     if delay_end != len(delay_text):
@@ -12488,6 +12506,296 @@ def _trace_converge_history_gate(drop_text, delay_text, paths):
         allow_nan=False,
         separators=(",", ":"),
     )
+
+
+def _validate_gate_result(result, name):
+    """校验一份 trace-converge-history-gate 成功结果，返回
+    (比较索引列表, seed 顺序列表)。"""
+    if not isinstance(result, dict):
+        raise TypeError(f"{name} must be a dict")
+    if list(result) != ["passed", "comparisons", "seeds"]:
+        raise ValueError(
+            f"{name} keys must be exactly"
+            " ['passed', 'comparisons', 'seeds'] in order"
+        )
+    if not isinstance(result["passed"], bool):
+        raise TypeError(f"{name}['passed'] must be a bool")
+    comparisons = result["comparisons"]
+    if not isinstance(comparisons, list):
+        raise TypeError(f"{name}['comparisons'] must be a list")
+    indices = []
+    for position, row in enumerate(comparisons):
+        if not isinstance(row, list):
+            raise TypeError(
+                f"{name}['comparisons'][{position}] must be a list"
+            )
+        if len(row) != 4:
+            raise ValueError(
+                f"{name}['comparisons'][{position}] must have four fields"
+            )
+        old_index, new_index, rate_delta, pair_pass = row
+        if isinstance(old_index, bool) or not isinstance(old_index, int):
+            raise TypeError(
+                f"{name}['comparisons'][{position}] indices must be"
+                " non-bool ints"
+            )
+        if isinstance(new_index, bool) or not isinstance(new_index, int):
+            raise TypeError(
+                f"{name}['comparisons'][{position}] indices must be"
+                " non-bool ints"
+            )
+        if old_index != position or new_index != position + 1:
+            raise ValueError(
+                f"{name}['comparisons'][{position}] indices must be"
+                f" [{position}, {position + 1}]"
+            )
+        if not isinstance(rate_delta, float):
+            raise TypeError(
+                f"{name}['comparisons'][{position}] rate delta must be"
+                " a float"
+            )
+        if (
+            not math.isfinite(rate_delta)
+            or rate_delta < -1.0
+            or rate_delta > 1.0
+        ):
+            raise ValueError(
+                f"{name}['comparisons'][{position}] rate delta must be"
+                " finite and in [-1, 1]"
+            )
+        if not isinstance(pair_pass, bool):
+            raise TypeError(
+                f"{name}['comparisons'][{position}] pass flag must be"
+                " a bool"
+            )
+        indices.append([old_index, new_index])
+    seeds = result["seeds"]
+    if not isinstance(seeds, list):
+        raise TypeError(f"{name}['seeds'] must be a list")
+    seed_order = []
+    seen_seeds = set()
+    for position, entry in enumerate(seeds):
+        if not isinstance(entry, list):
+            raise TypeError(
+                f"{name}['seeds'][{position}] must be a list"
+            )
+        if len(entry) != 3:
+            raise ValueError(
+                f"{name}['seeds'][{position}] must have three fields"
+            )
+        seed, episodes, failures = entry
+        if isinstance(seed, bool) or not isinstance(seed, int):
+            raise TypeError(
+                f"{name}['seeds'][{position}] seed must be a non-bool int"
+            )
+        if seed in seen_seeds:
+            raise ValueError(
+                f"{name}['seeds'][{position}] seed must be unique"
+            )
+        seen_seeds.add(seed)
+        if not isinstance(episodes, list):
+            raise TypeError(
+                f"{name}['seeds'][{position}] episodes must be a list"
+            )
+        if len(episodes) != len(comparisons) + 1:
+            raise ValueError(
+                f"{name}['seeds'][{position}] episodes must have one"
+                " entry per experiment"
+            )
+        for episode in episodes:
+            if episode is None:
+                continue
+            if isinstance(episode, bool) or not isinstance(episode, int):
+                raise TypeError(
+                    f"{name}['seeds'][{position}] episodes must be"
+                    " non-bool ints or None"
+                )
+            if episode < 0:
+                raise ValueError(
+                    f"{name}['seeds'][{position}] episodes must be"
+                    " non-negative"
+                )
+        if not isinstance(failures, list):
+            raise TypeError(
+                f"{name}['seeds'][{position}] failures must be a list"
+            )
+        for failure in failures:
+            if not isinstance(failure, list):
+                raise TypeError(
+                    f"{name}['seeds'][{position}] failure must be a list"
+                )
+            if len(failure) != 3:
+                raise ValueError(
+                    f"{name}['seeds'][{position}] failure must have"
+                    " three fields"
+                )
+            old_index, new_index, kind = failure
+            if isinstance(old_index, bool) or not isinstance(
+                old_index, int
+            ):
+                raise TypeError(
+                    f"{name}['seeds'][{position}] failure indices must"
+                    " be non-bool ints"
+                )
+            if isinstance(new_index, bool) or not isinstance(
+                new_index, int
+            ):
+                raise TypeError(
+                    f"{name}['seeds'][{position}] failure indices must"
+                    " be non-bool ints"
+                )
+            if (
+                old_index < 0
+                or new_index != old_index + 1
+                or new_index > len(comparisons)
+            ):
+                raise ValueError(
+                    f"{name}['seeds'][{position}] failure indices must"
+                    " reference a comparison"
+                )
+            if not isinstance(kind, str):
+                raise TypeError(
+                    f"{name}['seeds'][{position}] failure kind must be"
+                    " a str"
+                )
+            if kind not in ("lost", "late"):
+                raise ValueError(
+                    f"{name}['seeds'][{position}] failure kind must be"
+                    " 'lost' or 'late'"
+                )
+        seed_order.append(seed)
+    return indices, seed_order
+
+
+def ppo_trace_gate_consensus(groups) -> dict:
+    """汇总多组 trace-converge-history-gate 结果的一致性结论。
+
+    groups 须为至少两项的 list，否则非 list 抛 TypeError、少于两项
+    抛 ValueError；每项须为键序恰为 drop、delay、result 的 dict，
+    非 dict 抛 TypeError、键序不符抛 ValueError。drop 须为 [0, 1]
+    内有限 float，错型抛 TypeError，非有限或越界抛 ValueError；
+    delay 须为非 bool 非负 int，错型抛 TypeError，负值抛
+    ValueError。result 须严格符合 trace-converge-history-gate 的
+    成功结果契约：键序恰为 passed、comparisons、seeds；passed 为
+    bool；comparisons 为 list，第 i 行恰为 [i, i + 1, delta, ok]，
+    索引为非 bool int，delta 为 [-1, 1] 内有限 float，ok 为 bool；
+    seeds 为 list，每项恰为 [seed, episodes, failures]，seed 为
+    互异的非 bool int，episodes 为长度恰等于比较数加一的 list，
+    成员为非 bool 非负 int 或 None，failures 为 list，每项恰为
+    [old, old + 1, kind] 且引用已有比较，kind 为 "lost" 或
+    "late"。错型抛 TypeError，其余违约抛 ValueError。
+
+    全量校验通过后，各组 drop 的 float.hex()、delay、比较索引与
+    seed 顺序须相同，否则抛 ValueError；失败不产生部分结果，且
+    不修改输入。
+
+    返回键序恰为 fingerprint、consensus、passed、seeds 的 dict：
+    fingerprint 为完整 groups（保持列表及公开 dict 键序）经 PPO
+    指纹编码所得 UTF-8 字节的 hashlib.sha256 小写 64 位十六进制
+    str；consensus 仅当各 result 按类型、float.hex() 与顺序逐值
+    全同时为 True；passed 仅当各 result 的 passed 全真为 True；
+    seeds 按首组 seed 顺序逐项为 [seed, lost_count, late_count]，
+    汇总各组该 seed 的 lost、late 失败次数。重复调用逐值一致，
+    仅用标准库，不引入命令行入口。
+    """
+    if not isinstance(groups, list):
+        raise TypeError("groups must be a list")
+    if len(groups) < 2:
+        raise ValueError("groups must contain at least two entries")
+    validated = []
+    for index, group in enumerate(groups):
+        if not isinstance(group, dict):
+            raise TypeError(f"groups[{index}] must be a dict")
+        if list(group) != ["drop", "delay", "result"]:
+            raise ValueError(
+                f"groups[{index}] keys must be exactly"
+                " ['drop', 'delay', 'result'] in order"
+            )
+        drop = group["drop"]
+        if not isinstance(drop, float):
+            raise TypeError(f"groups[{index}] drop must be a float")
+        if not math.isfinite(drop):
+            raise ValueError(f"groups[{index}] drop must be finite")
+        if drop < 0.0 or drop > 1.0:
+            raise ValueError(f"groups[{index}] drop must be in [0, 1]")
+        delay = group["delay"]
+        if isinstance(delay, bool) or not isinstance(delay, int):
+            raise TypeError(
+                f"groups[{index}] delay must be a non-bool int"
+            )
+        if delay < 0:
+            raise ValueError(f"groups[{index}] delay must be >= 0")
+        validated.append(
+            (float.hex(drop), delay)
+            + _validate_gate_result(
+                group["result"], f"groups[{index}]['result']"
+            )
+        )
+
+    base_drop_hex, base_delay, base_indices, base_seed_order = validated[0]
+    for drop_hex, delay, indices, seed_order in validated[1:]:
+        if drop_hex != base_drop_hex:
+            raise ValueError("drop must match between groups")
+        if delay != base_delay:
+            raise ValueError("delay must match between groups")
+        if indices != base_indices:
+            raise ValueError(
+                "comparison indices must match between groups"
+            )
+        if seed_order != base_seed_order:
+            raise ValueError("seed order must match between groups")
+
+    results = [group["result"] for group in groups]
+
+    def _same(left, right):
+        if type(left) is not type(right):
+            return False
+        if isinstance(left, float):
+            return float.hex(left) == float.hex(right)
+        if isinstance(left, list):
+            return len(left) == len(right) and all(
+                _same(a, b) for a, b in zip(left, right)
+            )
+        if isinstance(left, dict):
+            return list(left) == list(right) and all(
+                _same(left[key], right[key]) for key in left
+            )
+        return left == right
+
+    consensus = all(
+        _same(results[0], result) for result in results[1:]
+    )
+    passed = all(result["passed"] for result in results)
+
+    seeds = []
+    for position, seed in enumerate(base_seed_order):
+        lost_count = 0
+        late_count = 0
+        for result in results:
+            for _, _, kind in result["seeds"][position][2]:
+                if kind == "lost":
+                    lost_count += 1
+                else:
+                    late_count += 1
+        seeds.append([seed, lost_count, late_count])
+
+    def _fingerprint_of_groups():
+        set_limit = getattr(sys, "set_int_max_str_digits", None)
+        if set_limit is None:
+            return _fingerprint_hex(groups)
+        previous = sys.get_int_max_str_digits()
+        try:
+            set_limit(0)
+            return _fingerprint_hex(groups)
+        finally:
+            set_limit(previous)
+
+    return {
+        "fingerprint": _fingerprint_of_groups(),
+        "consensus": consensus,
+        "passed": passed,
+        "seeds": seeds,
+    }
 
 
 def _write_line(text):
