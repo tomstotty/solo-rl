@@ -12305,6 +12305,90 @@ def _trace_converge_compare(base_path, new_path):
     )
 
 
+def _trace_converge_history(paths):
+    """加载多份 trace-converge 清单并按 M1 的 seed 顺序汇总历史。
+
+    全部清单完整加载、轨迹全部读取、汇总完成后才生成输出字符串；
+    window 须相同，threshold/tolerance/minimum 转 float 后
+    float.hex() 须相同，seed 集合须相同（各清单内重复 seed 已由
+    清单契约拒绝）。任一违约抛 ValueError。
+    """
+    loaded = [_load_trace_converge_manifest(path) for path in paths]
+    (
+        base_runs,
+        base_window,
+        base_threshold,
+        base_tolerance,
+        base_minimum,
+    ) = loaded[0]
+    base_seed_set = {run["seed"] for run in base_runs}
+    for runs, window, threshold, tolerance, minimum in loaded[1:]:
+        if window != base_window:
+            raise ValueError("window must match between manifests")
+        for name, base_value, value in (
+            ("threshold", base_threshold, threshold),
+            ("tolerance", base_tolerance, tolerance),
+            ("minimum", base_minimum, minimum),
+        ):
+            if float.hex(float(base_value)) != float.hex(float(value)):
+                raise ValueError(f"{name} must match between manifests")
+        if {run["seed"] for run in runs} != base_seed_set:
+            raise ValueError("seed sets must match between manifests")
+
+    reports = [
+        ppo_trace_converge_many(
+            runs,
+            window=window,
+            threshold=threshold,
+            tolerance=tolerance,
+            minimum=minimum,
+        )
+        for runs, window, threshold, tolerance, minimum in loaded
+    ]
+
+    experiments = [
+        [index, report["converged"], report["rate"], report["failed"]]
+        for index, report in enumerate(reports)
+    ]
+    deltas = [
+        [index - 1, index, reports[index]["rate"] - reports[index - 1]["rate"]]
+        for index in range(1, len(reports))
+    ]
+
+    episodes_by_seed = [
+        {seed: group["episode"] for seed, group in report["groups"]}
+        for report in reports
+    ]
+    trends = []
+    for seed, _ in reports[0]["groups"]:
+        episodes = [per_seed[seed] for per_seed in episodes_by_seed]
+        changes = []
+        for index in range(1, len(episodes)):
+            old_episode = episodes[index - 1]
+            new_episode = episodes[index]
+            if old_episode is not None and new_episode is not None:
+                changes.append(new_episode - old_episode)
+            else:
+                changes.append(None)
+        trends.append([seed, episodes, changes])
+
+    result = {
+        "experiments": experiments,
+        "deltas": deltas,
+        "trends": trends,
+    }
+    return json.dumps(
+        result,
+        ensure_ascii=True,
+        allow_nan=False,
+        separators=(",", ":"),
+    )
+
+
+def _write_line(text):
+    sys.stdout.buffer.write(text.encode("utf-8") + b"\n")
+
+
 def _run(argv):
     if len(argv) < 2:
         return 2
@@ -12321,7 +12405,7 @@ def _run(argv):
                 out.append([state[0], state[1], reward, done])
         except (TypeError, ValueError, RuntimeError):
             return 2
-        sys.stdout.write(json.dumps(out, separators=(",", ":")) + "\n")
+        _write_line(json.dumps(out, separators=(",", ":")))
         return 0
     if command == "value" and len(argv) == 3:
         try:
@@ -12334,7 +12418,7 @@ def _run(argv):
             out = {"iterations": iterations, "values": ordered}
         except (TypeError, ValueError, RuntimeError):
             return 2
-        sys.stdout.write(json.dumps(out, separators=(",", ":")) + "\n")
+        _write_line(json.dumps(out, separators=(",", ":")))
         return 0
     if command == "trace-converge" and len(argv) == 3:
         try:
@@ -12360,14 +12444,21 @@ def _run(argv):
             )
         except (TypeError, ValueError):
             return 2
-        sys.stdout.write(out + "\n")
+        _write_line(out)
         return 0
     if command == "trace-converge-compare" and len(argv) == 4:
         try:
             out = _trace_converge_compare(argv[2], argv[3])
         except (TypeError, ValueError):
             return 2
-        sys.stdout.write(out + "\n")
+        _write_line(out)
+        return 0
+    if command == "trace-converge-history" and len(argv) >= 4:
+        try:
+            out = _trace_converge_history(argv[2:])
+        except (TypeError, ValueError):
+            return 2
+        _write_line(out)
         return 0
     return 2
 
@@ -12378,5 +12469,5 @@ if __name__ == "__main__":
     except Exception:
         code = 2
     if code != 0:
-        sys.stderr.write("error\n")
+        sys.stderr.buffer.write(b"error\n")
     sys.exit(code)
