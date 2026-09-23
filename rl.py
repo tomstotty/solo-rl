@@ -377,6 +377,8 @@ def ucb_q_learning(
     gamma=0.9,
     c=1.0,
     max_steps=1000,
+    c_end=None,
+    c_mode="linear",
 ) -> dict:
     """UCB1 探索的确定性 Q-learning，返回键序 q、counts 的 dict。
 
@@ -384,9 +386,17 @@ def ucb_q_learning(
     升序 × URDL，初始分别为 0.0、0，两表互相独立。每回合 reset，单
     回合最多 max_steps 步；全程不消费任何随机性。
 
+    c_end 为 None 时各回合探索系数恒为 c；否则 episodes 为 1 时恒为
+    c，第 e 回合（0 起）令 t=e/(episodes-1)，按 c_mode 在 c 与
+    c_end 间变化：linear 为 c+(c_end-c)*t；cosine 为
+    c_end+(c-c_end)*(1+cos(pi*t))/2；exponential 为
+    c*(c_end/c)**t。指数模式两端均须为正，否则抛 ValueError。
+
     状态 s 若存在 N[s,a]==0 的动作，取 URDL 中首个未访问动作；否则
-    取 Q[s,a]+c*sqrt(log(Σb N[s,b])/N[s,a]) 最大且 URDL 中首个的
-    动作。step 后先令 N[s,a]+=1；done 时目标为 reward，否则目标为
+    取 Q[s,a]+c_e*sqrt(log(Σb N[s,b])/N[s,a]) 最大且 URDL 中首个
+    的动作，其中 c_e 为当前回合的探索系数。每回合系数及每个 UCB
+    分数均须有限，且在该步 step 之前校验，非有限抛 ValueError。
+    step 后先令 N[s,a]+=1；done 时目标为 reward，否则目标为
     reward+gamma*max_a Q[next,a]，随后 Q[s,a]+=alpha*(目标-Q[s,a])。
     到达 G 立即结束；到达步限截断时末步 done=False，仍照常自举更新。
     reward 或新 Q 非有限时抛 ValueError。
@@ -403,10 +413,22 @@ def ucb_q_learning(
         raise TypeError("gamma must be an int or float")
     if isinstance(c, bool) or not isinstance(c, (int, float)):
         raise TypeError("c must be an int or float")
+    if c_end is not None and (
+        isinstance(c_end, bool) or not isinstance(c_end, (int, float))
+    ):
+        raise TypeError("c_end must be None, an int or float")
+    if not isinstance(c_mode, str):
+        raise TypeError("c_mode must be a str")
+    if c_mode not in ("linear", "cosine", "exponential"):
+        raise ValueError(
+            "c_mode must be one of linear, cosine, exponential"
+        )
     try:
         alpha = float(alpha)
         gamma = float(gamma)
         c = float(c)
+        if c_end is not None:
+            c_end = float(c_end)
     except OverflowError:
         raise ValueError(
             "parameter is too large to convert to float"
@@ -421,6 +443,13 @@ def ucb_q_learning(
         raise ValueError("gamma must be finite and in [0, 1)")
     if not math.isfinite(c) or c < 0:
         raise ValueError("c must be finite and in [0, +inf)")
+    if c_end is not None and (not math.isfinite(c_end) or c_end < 0):
+        raise ValueError("c_end must be finite and in [0, +inf)")
+    if c_mode == "exponential" and c_end is not None:
+        if c <= 0 or c_end <= 0:
+            raise ValueError(
+                "exponential c schedule endpoints must be in (0, +inf)"
+            )
 
     actions = tuple(_ACTIONS)  # U, R, D, L
     states = sorted(
@@ -431,7 +460,21 @@ def ucb_q_learning(
     q = {(state, action): 0.0 for state in states for action in actions}
     counts = {(state, action): 0 for state in states for action in actions}
 
-    for _ in range(episodes):
+    for episode in range(episodes):
+        if c_end is None or episodes == 1:
+            coefficient = c
+        else:
+            t = episode / (episodes - 1)
+            if c_mode == "linear":
+                coefficient = c + (c_end - c) * t
+            elif c_mode == "cosine":
+                coefficient = c_end + (c - c_end) * (
+                    1.0 + math.cos(math.pi * t)
+                ) / 2.0
+            else:
+                coefficient = c * (c_end / c) ** t
+        if not math.isfinite(coefficient):
+            raise ValueError("exploration coefficient must remain finite")
         state = env.reset()
         for _ in range(max_steps):
             action = None
@@ -441,12 +484,22 @@ def ucb_q_learning(
                     break
             if action is None:
                 total = sum(counts[(state, a)] for a in actions)
-                exploration = math.log(total)
-                action = max(
-                    actions,
-                    key=lambda a: q[(state, a)]
-                    + c * math.sqrt(exploration / counts[(state, a)]),
-                )
+                log_total = math.log(total)
+                best_action = actions[0]
+                best_score = None
+                for candidate in actions:
+                    fraction = log_total / counts[(state, candidate)]
+                    if not math.isfinite(fraction):
+                        raise ValueError("UCB fraction must be finite")
+                    score = q[(state, candidate)] + coefficient * math.sqrt(
+                        fraction
+                    )
+                    if not math.isfinite(score):
+                        raise ValueError("UCB score must be finite")
+                    if best_score is None or score > best_score:
+                        best_score = score
+                        best_action = candidate
+                action = best_action
             next_state, reward, done = env.step(action)
             if not math.isfinite(reward):
                 raise ValueError("reward must be finite")
