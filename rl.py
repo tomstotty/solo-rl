@@ -3,6 +3,7 @@
 import hashlib
 import json
 import math
+import os
 import random
 import sys
 
@@ -12082,6 +12083,186 @@ def ppo_trace_converge_many(
     }
 
 
+def _trace_converge_manifest_load(path):
+    """读取并严格校验 trace-converge 清单，返回传给
+    ppo_trace_converge_many 的 (runs, window, threshold, tolerance,
+    minimum)。
+
+    清单须为 UTF-8 JSON 文件：BOM、重复键、NaN/Infinity/-Infinity、
+    尾随内容均非法。根键序须恰为 runs、window、threshold、tolerance、
+    minimum；runs 为非空 list，项键序须恰为 seed、files；seed 为互异
+    非 bool int，files 为至少两个非空 str，相对路径基于清单目录按序
+    读取为 bytes，读取失败即非法。window 为非 bool 正 int；threshold、
+    tolerance 须恰为 JSON 浮点数且有限，分别属 [0, 1]、[0, +inf)；
+    minimum 为非 bool 数值且有限、属 [0, 1]。任何违约抛 ValueError
+    （错型同样以 ValueError 报告，供命令行统一为退出码 2）。
+    """
+    if not isinstance(path, str) or not path:
+        raise ValueError("manifest path must be a non-empty string")
+    try:
+        with open(path, "rb") as handle:
+            raw = handle.read()
+    except OSError as exc:
+        raise ValueError("cannot read manifest") from exc
+    if raw.startswith(_UTF8_BOM):
+        raise ValueError("manifest must not start with a BOM")
+    try:
+        text = raw.decode("utf-8")
+    except UnicodeDecodeError as exc:
+        raise ValueError("manifest must be valid UTF-8") from exc
+
+    def reject_constant(value):
+        raise ValueError(f"invalid JSON constant: {value}")
+
+    def reject_duplicate_keys(pairs):
+        result = {}
+        for key, value in pairs:
+            if key in result:
+                raise ValueError(f"duplicate object key: {key!r}")
+            result[key] = value
+        return result
+
+    decoder = json.JSONDecoder(
+        object_pairs_hook=reject_duplicate_keys,
+        parse_constant=reject_constant,
+    )
+    try:
+        data, end = decoder.raw_decode(text)
+    except RecursionError as exc:
+        raise ValueError("manifest nesting too deep") from exc
+    except json.JSONDecodeError as exc:
+        raise ValueError("manifest must be valid JSON") from exc
+    if end != len(text):
+        raise ValueError("manifest must not contain trailing content")
+    if not isinstance(data, dict):
+        raise ValueError("manifest root value must be a dict")
+    if list(data) != [
+        "runs",
+        "window",
+        "threshold",
+        "tolerance",
+        "minimum",
+    ]:
+        raise ValueError(
+            "manifest root keys must be exactly"
+            " ['runs', 'window', 'threshold', 'tolerance', 'minimum']"
+            " in order"
+        )
+
+    runs_raw = data["runs"]
+    if not isinstance(runs_raw, list):
+        raise ValueError("runs must be a list")
+    if not runs_raw:
+        raise ValueError("runs must not be empty")
+
+    base_dir = os.path.dirname(os.path.abspath(path))
+    runs = []
+    seen_seeds = set()
+    for index, run in enumerate(runs_raw):
+        if not isinstance(run, dict):
+            raise ValueError(f"runs[{index}] must be a dict")
+        if list(run) != ["seed", "files"]:
+            raise ValueError(
+                f"runs[{index}] keys must be exactly ['seed', 'files']"
+                " in order"
+            )
+        seed = run["seed"]
+        if isinstance(seed, bool) or not isinstance(seed, int):
+            raise ValueError(f"runs[{index}] seed must be a non-bool int")
+        if seed in seen_seeds:
+            raise ValueError(f"runs[{index}] seed must be unique")
+        seen_seeds.add(seed)
+        files = run["files"]
+        if not isinstance(files, list):
+            raise ValueError(f"runs[{index}] files must be a list")
+        if len(files) < 2:
+            raise ValueError(
+                f"runs[{index}] files must contain at least two entries"
+            )
+        items = []
+        for file_index, name in enumerate(files):
+            if not isinstance(name, str) or not name:
+                raise ValueError(
+                    f"runs[{index}] files[{file_index}] must be a"
+                    " non-empty string"
+                )
+            target = os.path.join(base_dir, name)
+            try:
+                with open(target, "rb") as handle:
+                    item = handle.read()
+            except OSError as exc:
+                raise ValueError(
+                    f"runs[{index}] files[{file_index}] cannot be read"
+                ) from exc
+            items.append(item)
+        runs.append({"seed": seed, "items": items})
+
+    window = data["window"]
+    if isinstance(window, bool) or not isinstance(window, int):
+        raise ValueError("window must be a non-bool int")
+    if window <= 0:
+        raise ValueError("window must be positive")
+
+    threshold = data["threshold"]
+    if not isinstance(threshold, float):
+        raise ValueError("threshold must be a JSON float")
+    if not math.isfinite(threshold):
+        raise ValueError("threshold must be finite")
+    if threshold < 0.0 or threshold > 1.0:
+        raise ValueError("threshold must be in [0, 1]")
+
+    tolerance = data["tolerance"]
+    if not isinstance(tolerance, float):
+        raise ValueError("tolerance must be a JSON float")
+    if not math.isfinite(tolerance):
+        raise ValueError("tolerance must be finite")
+    if tolerance < 0.0:
+        raise ValueError("tolerance must be >= 0.0")
+
+    minimum = data["minimum"]
+    if isinstance(minimum, bool) or not isinstance(minimum, (int, float)):
+        raise ValueError("minimum must be a non-bool number")
+    if not math.isfinite(float(minimum)):
+        raise ValueError("minimum must be finite")
+    if minimum < 0 or minimum > 1:
+        raise ValueError("minimum must be in [0, 1]")
+
+    return runs, window, threshold, tolerance, minimum
+
+
+def _trace_converge_manifest_run(path):
+    """trace-converge 子命令主体：校验清单、读取轨迹字节并按序调用
+    ppo_trace_converge_many，成功时向 stdout 写入紧凑 JSON 与单个 LF
+    并返回 0；任何清单、文件或轨迹错误返回 2（由入口统一写 error）。"""
+    try:
+        (
+            runs,
+            window,
+            threshold,
+            tolerance,
+            minimum,
+        ) = _trace_converge_manifest_load(path)
+        report = ppo_trace_converge_many(
+            runs,
+            window=window,
+            threshold=threshold,
+            tolerance=tolerance,
+            minimum=minimum,
+        )
+    except (TypeError, ValueError, OSError, OverflowError):
+        return 2
+    sys.stdout.write(
+        json.dumps(
+            report,
+            ensure_ascii=True,
+            allow_nan=False,
+            separators=(",", ":"),
+        )
+        + "\n"
+    )
+    return 0
+
+
 def _format_value(value):
     if abs(value) < 0.5e-12:
         value = 0.0
@@ -12119,6 +12300,8 @@ def _run(argv):
             return 2
         sys.stdout.write(json.dumps(out, separators=(",", ":")) + "\n")
         return 0
+    if command == "trace-converge" and len(argv) == 3:
+        return _trace_converge_manifest_run(argv[2])
     return 2
 
 
