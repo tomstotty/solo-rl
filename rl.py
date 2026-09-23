@@ -12919,6 +12919,78 @@ def ppo_trace_gate_consensus_compare(left, right) -> dict:
     }
 
 
+def ppo_trace_gate_consensus_history(items) -> dict:
+    """以第 0 项为基准比较多份门禁共识摘要。
+
+    items 须为至少两项的 list：非 list 抛 TypeError，少于两项抛
+    ValueError。各项须为 dict 且完整符合
+    ppo_trace_gate_consensus_compare 的单侧摘要契约：键序须恰为
+    fingerprint、consensus、passed、seeds，fingerprint 须为 64 位
+    小写十六进制 str，consensus、passed 须为 bool，seeds 须为非空
+    list，逐项恰为 [seed, lost, late] 且三项均为非 bool int，seed
+    唯一、计数非负。项本身或字段错型抛 TypeError；键序、摘要格式、
+    空 seed 表、行长、重复 seed 或负计数抛 ValueError。先按索引
+    完整校验全部项，再核对各项 seed 顺序与第 0 项一致，顺序不同亦
+    抛 ValueError；任一校验失败均不返回部分结果，不修改输入。
+
+    返回键序为 identical、comparisons、mismatches、seeds：
+    comparisons 与 items 等长，其 [0] 为
+    ppo_trace_gate_consensus_compare 对第 0 项自身的完整返回，第 i
+    项为其对第 0 项与 items[i] 的完整返回；mismatches 为其中
+    identical 为 False 的非零索引按升序组成的 list；seeds 按首项
+    seed 顺序逐行列 [seed, losts, lates, changes]，losts、lates 为
+    各项对应非负计数组成的 list，changes 为相邻项按后项减前项得到
+    的 [lost 差, late 差] 列表，差值均为 int；顶层 identical 当且
+    仅当 mismatches 为空。重复调用及深拷贝逐值一致，仅用标准库，
+    不新增命令行入口。
+    """
+    if not isinstance(items, list):
+        raise TypeError("items must be a list")
+    if len(items) < 2:
+        raise ValueError("items must contain at least two entries")
+
+    validated = []
+    for index, item in enumerate(items):
+        name = f"items[{index}]"
+        if not isinstance(item, dict):
+            raise TypeError(f"{name} must be a dict")
+        _, _, _, rows = _validate_consensus_summary(item, name)
+        validated.append(rows)
+
+    first_seed_order = [row[0] for row in validated[0]]
+    for index in range(1, len(validated)):
+        if [row[0] for row in validated[index]] != first_seed_order:
+            raise ValueError(f"items[{index}] seed order must match items[0]")
+
+    comparisons = [
+        ppo_trace_gate_consensus_compare(items[0], item) for item in items
+    ]
+    mismatches = [
+        index
+        for index, comparison in enumerate(comparisons)
+        if index != 0 and not comparison["identical"]
+    ]
+    seeds_out = []
+    for position, seed in enumerate(first_seed_order):
+        losts = [rows[position][1] for rows in validated]
+        lates = [rows[position][2] for rows in validated]
+        changes = [
+            [
+                losts[pair + 1] - losts[pair],
+                lates[pair + 1] - lates[pair],
+            ]
+            for pair in range(len(items) - 1)
+        ]
+        seeds_out.append([seed, losts, lates, changes])
+
+    return {
+        "identical": not mismatches,
+        "comparisons": comparisons,
+        "mismatches": mismatches,
+        "seeds": seeds_out,
+    }
+
+
 def _write_line(text):
     sys.stdout.buffer.write(text.encode("utf-8") + b"\n")
 
