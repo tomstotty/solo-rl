@@ -12305,13 +12305,13 @@ def _trace_converge_compare(base_path, new_path):
     )
 
 
-def _trace_converge_history(paths):
-    """加载多份 trace-converge 清单并按 M1 的 seed 顺序汇总历史。
+def _trace_converge_history_reports(paths):
+    """加载多份 trace-converge 清单并完成跨清单校验与汇总。
 
-    全部清单完整加载、轨迹全部读取、汇总完成后才生成输出字符串；
-    window 须相同，threshold/tolerance/minimum 转 float 后
-    float.hex() 须相同，seed 集合须相同（各清单内重复 seed 已由
-    清单契约拒绝）。任一违约抛 ValueError。
+    全部清单完整加载、轨迹全部读取、汇总完成后才返回；window 须相同，
+    threshold/tolerance/minimum 转 float 后 float.hex() 须相同，seed
+    集合须相同（各清单内重复 seed 已由清单契约拒绝）。任一违约抛
+    ValueError。返回与 paths 同序的 ppo_trace_converge_many 报告列表。
     """
     loaded = [_load_trace_converge_manifest(path) for path in paths]
     (
@@ -12335,7 +12335,7 @@ def _trace_converge_history(paths):
         if {run["seed"] for run in runs} != base_seed_set:
             raise ValueError("seed sets must match between manifests")
 
-    reports = [
+    return [
         ppo_trace_converge_many(
             runs,
             window=window,
@@ -12346,6 +12346,15 @@ def _trace_converge_history(paths):
         for runs, window, threshold, tolerance, minimum in loaded
     ]
 
+
+def _trace_converge_history(paths):
+    """加载多份 trace-converge 清单并按 M1 的 seed 顺序汇总历史。
+
+    清单/轨迹校验及跨清单 window、浮点参数、seed 集合规则与
+    trace-converge-history-gate 共用
+    _trace_converge_history_reports。
+    """
+    reports = _trace_converge_history_reports(paths)
     experiments = [
         [index, report["converged"], report["rate"], report["failed"]]
         for index, report in enumerate(reports)
@@ -12376,6 +12385,102 @@ def _trace_converge_history(paths):
         "experiments": experiments,
         "deltas": deltas,
         "trends": trends,
+    }
+    return json.dumps(
+        result,
+        ensure_ascii=True,
+        allow_nan=False,
+        separators=(",", ":"),
+    )
+
+
+def _parse_gate_json_number(text):
+    """严格解析命令行 JSON 标量参数：须为单个 JSON 数值且无尾随内容。
+
+    NaN/Infinity/-Infinity 等常量拒绝；bool（true/false）、null、字符串、
+    数组、对象及任何非数值或尾随内容均抛 ValueError。
+    """
+    try:
+        value, end = _MANIFEST_DECODER.raw_decode(text)
+    except (json.JSONDecodeError, RecursionError, ValueError) as exc:
+        raise ValueError("parameter must be a JSON number") from exc
+    if (
+        end != len(text)
+        or not isinstance(value, (int, float))
+        or isinstance(value, bool)
+    ):
+        raise ValueError("parameter must be a single JSON number")
+    return value
+
+
+def _trace_converge_history_gate(drop_text, delay_text, paths):
+    """加载多份 trace-converge 清单并按相邻实验门控汇总。
+
+    清单/轨迹校验及跨清单 window、threshold/tolerance/minimum 的
+    float.hex()、seed 集合规则沿用 _trace_converge_history_reports。
+    DROP 须为 JSON 非 bool 有限数且在 [0, 1]；DELAY 须为 JSON 非
+    bool 非负整数。任一违约抛 ValueError。
+
+    逐相邻实验令 d = 新 rate - 旧 rate；逐 seed 比较 episode：旧为
+    int 而新为 None 记 lost，均为 int 且新 - 旧 > DELAY 记 late。该对
+    仅在 d >= -DROP 且无 lost/late 时通过。输出键序恰为 passed、
+    comparisons、seeds。
+    """
+    drop = _parse_gate_json_number(drop_text)
+    if not isinstance(drop, (int, float)) or not math.isfinite(drop):
+        raise ValueError("DROP must be a finite number")
+    if drop < 0 or drop > 1:
+        raise ValueError("DROP must be in [0, 1]")
+    delay = _parse_gate_json_number(delay_text)
+    if not isinstance(delay, int):
+        raise ValueError("DELAY must be a non-bool integer")
+    if delay < 0:
+        raise ValueError("DELAY must be a non-negative integer")
+
+    reports = _trace_converge_history_reports(paths)
+
+    episodes_by_seed = [
+        {seed: group["episode"] for seed, group in report["groups"]}
+        for report in reports
+    ]
+
+    def _classify(old_episode, new_episode):
+        if old_episode is not None:
+            if new_episode is None:
+                return "lost"
+            if new_episode - old_episode > delay:
+                return "late"
+        return None
+
+    comparisons = []
+    pair_passed = []
+    for index in range(1, len(reports)):
+        d = reports[index]["rate"] - reports[index - 1]["rate"]
+        failures = 0
+        for seed, _ in reports[0]["groups"]:
+            if _classify(
+                episodes_by_seed[index - 1][seed],
+                episodes_by_seed[index][seed],
+            ) is not None:
+                failures += 1
+        passed = d >= -drop and failures == 0
+        comparisons.append([index - 1, index, d, passed])
+        pair_passed.append(passed)
+
+    seeds = []
+    for seed, _ in reports[0]["groups"]:
+        episodes = [per_seed[seed] for per_seed in episodes_by_seed]
+        failures = []
+        for index in range(1, len(episodes)):
+            kind = _classify(episodes[index - 1], episodes[index])
+            if kind is not None:
+                failures.append([index - 1, index, kind])
+        seeds.append([seed, episodes, failures])
+
+    result = {
+        "passed": all(pair_passed),
+        "comparisons": comparisons,
+        "seeds": seeds,
     }
     return json.dumps(
         result,
@@ -12456,6 +12561,13 @@ def _run(argv):
     if command == "trace-converge-history" and len(argv) >= 4:
         try:
             out = _trace_converge_history(argv[2:])
+        except (TypeError, ValueError):
+            return 2
+        _write_line(out)
+        return 0
+    if command == "trace-converge-history-gate" and len(argv) >= 6:
+        try:
+            out = _trace_converge_history_gate(argv[2], argv[3], argv[4:])
         except (TypeError, ValueError):
             return 2
         _write_line(out)
