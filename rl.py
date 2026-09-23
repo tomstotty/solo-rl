@@ -12217,6 +12217,94 @@ def _load_trace_converge_manifest(path):
     return converted, window, threshold, tolerance, minimum
 
 
+def _trace_converge_compare(base_path, new_path):
+    """加载两份 trace-converge 清单并按 BASE 顺序比较汇总结果。
+
+    两清单均完整加载、轨迹全部读取、汇总完成后才生成输出字符串；
+    window 须相同，threshold/tolerance/minimum 转 float 后
+    float.hex() 须相同，seed 集合须相同（各清单内重复 seed 已由
+    清单契约拒绝）。任一违约抛 ValueError。
+    """
+    (
+        base_runs,
+        base_window,
+        base_threshold,
+        base_tolerance,
+        base_minimum,
+    ) = _load_trace_converge_manifest(base_path)
+    (
+        new_runs,
+        new_window,
+        new_threshold,
+        new_tolerance,
+        new_minimum,
+    ) = _load_trace_converge_manifest(new_path)
+
+    if base_window != new_window:
+        raise ValueError("window must match between manifests")
+    for name, base_value, new_value in (
+        ("threshold", base_threshold, new_threshold),
+        ("tolerance", base_tolerance, new_tolerance),
+        ("minimum", base_minimum, new_minimum),
+    ):
+        if float.hex(float(base_value)) != float.hex(float(new_value)):
+            raise ValueError(f"{name} must match between manifests")
+
+    base_report = ppo_trace_converge_many(
+        base_runs,
+        window=base_window,
+        threshold=base_threshold,
+        tolerance=base_tolerance,
+        minimum=base_minimum,
+    )
+    new_report = ppo_trace_converge_many(
+        new_runs,
+        window=new_window,
+        threshold=new_threshold,
+        tolerance=new_tolerance,
+        minimum=new_minimum,
+    )
+
+    new_episodes = {
+        seed: group_report["episode"]
+        for seed, group_report in new_report["groups"]
+    }
+    base_seeds = [seed for seed, _ in base_report["groups"]]
+    if set(base_seeds) != set(new_episodes):
+        raise ValueError("seed sets must match between manifests")
+
+    episodes = []
+    for seed, base_group in base_report["groups"]:
+        base_episode = base_group["episode"]
+        new_episode = new_episodes[seed]
+        if base_episode is not None and new_episode is not None:
+            delta = new_episode - base_episode
+        else:
+            delta = None
+        episodes.append([seed, base_episode, new_episode, delta])
+
+    result = {
+        "base": {
+            "converged": base_report["converged"],
+            "rate": base_report["rate"],
+            "failed": base_report["failed"],
+        },
+        "new": {
+            "converged": new_report["converged"],
+            "rate": new_report["rate"],
+            "failed": new_report["failed"],
+        },
+        "rate_delta": new_report["rate"] - base_report["rate"],
+        "episodes": episodes,
+    }
+    return json.dumps(
+        result,
+        ensure_ascii=True,
+        allow_nan=False,
+        separators=(",", ":"),
+    )
+
+
 def _run(argv):
     if len(argv) < 2:
         return 2
@@ -12270,6 +12358,13 @@ def _run(argv):
                 allow_nan=False,
                 separators=(",", ":"),
             )
+        except (TypeError, ValueError):
+            return 2
+        sys.stdout.write(out + "\n")
+        return 0
+    if command == "trace-converge-compare" and len(argv) == 4:
+        try:
+            out = _trace_converge_compare(argv[2], argv[3])
         except (TypeError, ValueError):
             return 2
         sys.stdout.write(out + "\n")
