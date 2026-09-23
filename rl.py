@@ -10340,6 +10340,22 @@ def ppo_reproducibility_report(left, right) -> dict:
     }
 
 
+def _int_to_decimal(value):
+    """将任意大小的 int 转为十进制 str，不受 int 串转换位数限制。"""
+    if value == 0:
+        return "0"
+    negative = value < 0
+    remaining = -value if negative else value
+    chunks = []
+    while remaining:
+        remaining, chunk = divmod(remaining, 10**9)
+        chunks.append(chunk)
+    text = str(chunks[-1])
+    for chunk in reversed(chunks[:-1]):
+        text += str(chunk).rjust(9, "0")
+    return "-" + text if negative else text
+
+
 def _fingerprint_encode(value):
     """将 None/bool/int/float/str/list/dict 递归编码为确定性文本。"""
     if value is None:
@@ -10347,7 +10363,7 @@ def _fingerprint_encode(value):
     if isinstance(value, bool):
         return "B1;" if value else "B0;"
     if isinstance(value, int):
-        return "I" + str(value) + ";"
+        return "I" + _int_to_decimal(value) + ";"
     if isinstance(value, float):
         return "F" + float.hex(value) + ";"
     if isinstance(value, str):
@@ -12781,6 +12797,125 @@ def ppo_trace_gate_consensus(groups) -> dict:
         "consensus": consensus,
         "passed": passed,
         "seeds": seeds_out,
+    }
+
+
+def _validate_consensus_summary(data, name):
+    """校验一份 ppo_trace_gate_consensus 摘要。
+
+    键序须恰为 fingerprint、consensus、passed、seeds；fingerprint
+    须为 64 位小写十六进制 str，consensus、passed 须为 bool，
+    seeds 须为非空 list，逐项恰为 [seed, lost, late] 且三项均为
+    非 bool int，seed 唯一、计数非负。错型抛 TypeError，其余违约
+    抛 ValueError；不修改输入。返回
+    (fingerprint, consensus, passed, [(seed, lost, late), ...])。
+    """
+    if not isinstance(data, dict):
+        raise TypeError(f"{name} must be a dict")
+    if list(data) != ["fingerprint", "consensus", "passed", "seeds"]:
+        raise ValueError(
+            f"{name} keys must be exactly ['fingerprint', 'consensus',"
+            " 'passed', 'seeds'] in order"
+        )
+    fingerprint = data["fingerprint"]
+    if not isinstance(fingerprint, str):
+        raise TypeError(f"{name} fingerprint must be a str")
+    if len(fingerprint) != 64 or any(
+        char not in _HEX_DIGITS for char in fingerprint
+    ):
+        raise ValueError(
+            f"{name} fingerprint must be 64 lowercase hex characters"
+        )
+    consensus = data["consensus"]
+    if not isinstance(consensus, bool):
+        raise TypeError(f"{name} consensus must be a bool")
+    passed = data["passed"]
+    if not isinstance(passed, bool):
+        raise TypeError(f"{name} passed must be a bool")
+    seeds = data["seeds"]
+    if not isinstance(seeds, list):
+        raise TypeError(f"{name} seeds must be a list")
+    if not seeds:
+        raise ValueError(f"{name} seeds must be non-empty")
+    seen_seeds = set()
+    rows = []
+    for index, row in enumerate(seeds):
+        row_name = f"{name} seeds[{index}]"
+        if not isinstance(row, list):
+            raise TypeError(f"{row_name} must be a list")
+        if len(row) != 3:
+            raise ValueError(
+                f"{row_name} must contain exactly three fields"
+            )
+        seed, lost, late = row
+        for field, field_name in (
+            (seed, "seed"),
+            (lost, "lost"),
+            (late, "late"),
+        ):
+            if isinstance(field, bool) or not isinstance(field, int):
+                raise TypeError(
+                    f"{row_name} {field_name} must be a non-bool int"
+                )
+        if seed in seen_seeds:
+            raise ValueError(f"{row_name} seed must be unique")
+        seen_seeds.add(seed)
+        if lost < 0 or late < 0:
+            raise ValueError(f"{row_name} counts must be >= 0")
+        rows.append((seed, lost, late))
+    return fingerprint, consensus, passed, rows
+
+
+def ppo_trace_gate_consensus_compare(left, right) -> dict:
+    """比较两份 ppo_trace_gate_consensus 摘要的一致性。
+
+    left、right 均须为键序恰为 fingerprint、consensus、passed、
+    seeds 的 dict：fingerprint 须为 64 位小写十六进制 str，
+    consensus、passed 须为 bool，seeds 须为非空 list，逐项恰为
+    [seed, lost, late] 且三项均为非 bool int，seed 唯一、计数
+    非负。参数非 dict 或字段错型抛 TypeError；键序、摘要格式、
+    空表、行长、重复 seed、负计数或两侧 seed 顺序不同抛
+    ValueError。先全量校验，失败不产生部分结果；不修改输入。
+
+    返回键序 identical、fingerprint_equal、flags、seeds、
+    differences：fingerprint_equal 为两侧摘要是否相同；flags 为
+    [consensus 是否相同, passed 是否相同]；seeds 按原 seed 顺序列
+    [seed, 左 lost, 左 late, 右 lost, 右 late, 计数是否相同]；
+    differences 按原序列出计数不同的 seed；identical 仅当摘要、
+    标志与计数全同。结果确定，仅用标准库，不新增命令行入口。
+    """
+    left_fp, left_consensus, left_passed, left_rows = (
+        _validate_consensus_summary(left, "left")
+    )
+    right_fp, right_consensus, right_passed, right_rows = (
+        _validate_consensus_summary(right, "right")
+    )
+    if [row[0] for row in left_rows] != [row[0] for row in right_rows]:
+        raise ValueError("seed order must match between left and right")
+
+    fingerprint_equal = left_fp == right_fp
+    flags = [
+        left_consensus == right_consensus,
+        left_passed == right_passed,
+    ]
+    seeds_out = []
+    differences = []
+    for left_row, right_row in zip(left_rows, right_rows):
+        seed, left_lost, left_late = left_row
+        _, right_lost, right_late = right_row
+        equal = left_lost == right_lost and left_late == right_late
+        seeds_out.append(
+            [seed, left_lost, left_late, right_lost, right_late, equal]
+        )
+        if not equal:
+            differences.append(seed)
+    identical = fingerprint_equal and all(flags) and not differences
+    return {
+        "identical": identical,
+        "fingerprint_equal": fingerprint_equal,
+        "flags": flags,
+        "seeds": seeds_out,
+        "differences": differences,
     }
 
 
