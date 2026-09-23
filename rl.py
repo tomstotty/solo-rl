@@ -11651,6 +11651,183 @@ def ppo_trace_verify(env, data) -> dict:
     }
 
 
+def _canonical_hex_float(value, where):
+    """校验 value 为有限 float 的规范 float.hex() 字符串，返回其 float。"""
+    if not isinstance(value, str):
+        raise ValueError(f"{where} must be a float.hex() string")
+    try:
+        number = float.fromhex(value)
+    except ValueError as exc:
+        raise ValueError(
+            f"{where} must be a finite float.hex() string"
+        ) from exc
+    if not math.isfinite(number) or number.hex() != value:
+        raise ValueError(
+            f"{where} must be the canonical float.hex() form of a finite"
+            " float"
+        )
+    return number
+
+
+def ppo_train_trace_from_bytes(payload) -> dict:
+    """将 PPO 训练轨迹字节严格解析回轨迹结构。
+
+    payload 须恰为 bytes（bytearray、memoryview 等均拒绝），否则抛
+    TypeError；空字节、BOM、非严格 UTF-8 或非 ASCII 字节、JSON 语法
+    错误或尾随内容、重复对象键、NaN/Infinity/-Infinity 常量，或任何
+    结构/取值违约，均抛 ValueError。
+
+    仅接受规范单行紧凑 ASCII JSON：末尾恰一个 LF，无 BOM 或额外空白/
+    换行。顶层须恰有 episodes 键，值为非空 list；每行须为恰七项的
+    list [steps, reward, success, rate, objectives, h_delta,
+    v_delta]：steps 为非 bool 的正 int，reward 为非 bool 的 int，
+    success 为 bool；rate、h_delta、v_delta 及 objectives 的每项均须
+    为有限 float 的规范 float.hex() 字符串，rate 值须在 [0, 1] 内，
+    h_delta、v_delta 须不小于 0；objectives 须为非空 list。按生成器
+    规则（ensure_ascii、allow_nan=False、紧凑分隔符加末尾 LF）重编码
+    的字节须与输入逐字节相同。返回解析得到的独立新容器。仅用标准库，
+    不引入命令行入口。
+    """
+    if not isinstance(payload, bytes):
+        raise TypeError("payload must be bytes")
+    if not payload:
+        raise ValueError("payload must not be empty")
+    if payload.startswith(_UTF8_BOM):
+        raise ValueError("payload must not start with a BOM")
+    try:
+        text = payload.decode("utf-8")
+    except UnicodeDecodeError as exc:
+        raise ValueError("payload must be valid UTF-8") from exc
+    if not text.endswith("\n"):
+        raise ValueError("payload must end with exactly one LF")
+    if not payload.isascii():
+        raise ValueError("payload must be ASCII")
+    body = text[:-1]
+
+    def reject_constant(value):
+        raise ValueError(f"invalid JSON constant: {value}")
+
+    def reject_duplicate_keys(pairs):
+        result = {}
+        for key, value in pairs:
+            if key in result:
+                raise ValueError(f"duplicate object key: {key!r}")
+            result[key] = value
+        return result
+
+    decoder = json.JSONDecoder(
+        object_pairs_hook=reject_duplicate_keys,
+        parse_constant=reject_constant,
+    )
+    try:
+        data, end = decoder.raw_decode(body)
+    except RecursionError as exc:
+        raise ValueError("payload nesting too deep") from exc
+    except json.JSONDecodeError as exc:
+        raise ValueError("payload must be valid JSON") from exc
+    if end != len(body):
+        raise ValueError("payload must not contain trailing content")
+    if not isinstance(data, dict):
+        raise ValueError("payload root value must be a dict")
+    if list(data) != ["episodes"]:
+        raise ValueError("data must have exactly the key episodes")
+
+    episodes = data["episodes"]
+    if not isinstance(episodes, list) or not episodes:
+        raise ValueError("episodes must be a non-empty list")
+    for row_index, row in enumerate(episodes):
+        where = f"episodes[{row_index}]"
+        if not isinstance(row, list) or len(row) != 7:
+            raise ValueError(
+                f"{where} must be a list of exactly 7 items"
+            )
+        steps, reward, success, rate, objectives, h_delta, v_delta = row
+        if isinstance(steps, bool) or not isinstance(steps, int) or steps <= 0:
+            raise ValueError(
+                f"{where} steps must be a positive non-bool int"
+            )
+        if isinstance(reward, bool) or not isinstance(reward, int):
+            raise ValueError(f"{where} reward must be a non-bool int")
+        if not isinstance(success, bool):
+            raise ValueError(f"{where} success must be a bool")
+        rate_value = _canonical_hex_float(rate, f"{where} rate")
+        if rate_value < 0.0 or rate_value > 1.0:
+            raise ValueError(f"{where} rate must be in [0, 1]")
+        if not isinstance(objectives, list) or not objectives:
+            raise ValueError(
+                f"{where} objectives must be a non-empty list"
+            )
+        for obj_index, item in enumerate(objectives):
+            _canonical_hex_float(
+                item, f"{where} objectives[{obj_index}]"
+            )
+        h_value = _canonical_hex_float(h_delta, f"{where} h_delta")
+        v_value = _canonical_hex_float(v_delta, f"{where} v_delta")
+        if h_value < 0.0 or v_value < 0.0:
+            raise ValueError(f"{where} deltas must be non-negative")
+
+    canonical = (
+        json.dumps(
+            data,
+            ensure_ascii=True,
+            allow_nan=False,
+            separators=(",", ":"),
+        )
+        + "\n"
+    ).encode("utf-8")
+    if canonical != payload:
+        raise ValueError(
+            "payload must be canonical compact ASCII JSON with a"
+            " trailing LF"
+        )
+    return data
+
+
+def ppo_train_trace_verify(payload) -> dict:
+    """验证 PPO 训练轨迹字节并给出汇总指纹。
+
+    先调用 ppo_train_trace_from_bytes(payload) 严格解析，其 TypeError、
+    ValueError 原样透传。随后逐行校验：第 i 行（0 基）的 rate 须恰为
+    截至该行累计成功数除以 (i + 1) 所得 float 的 float.hex()；各行
+    objectives 长度须相等。任何违约均抛 ValueError。
+
+    返回键序恰为 episodes、steps、successes、success_rate、
+    fingerprint 的 dict，依次为回合数（int）、各行 steps 总和（int）、
+    成功数（int）、最终成功率 successes / len(episodes)（float）、输入
+    字节的 hashlib.sha256 小写 64 位十六进制 str。重复调用逐值一致。
+    仅用标准库，不引入命令行入口。
+    """
+    data = ppo_train_trace_from_bytes(payload)
+    episodes = data["episodes"]
+
+    steps = 0
+    successes = 0
+    objective_length = None
+    for row_index, row in enumerate(episodes):
+        row_steps, _, success, rate, objectives, _, _ = row
+        steps += row_steps
+        if success:
+            successes += 1
+        expected_rate = (successes / (row_index + 1)).hex()
+        if rate != expected_rate:
+            raise ValueError(
+                f"episodes[{row_index}] rate must equal the hex of"
+                " cumulative successes / (i + 1)"
+            )
+        if objective_length is None:
+            objective_length = len(objectives)
+        elif len(objectives) != objective_length:
+            raise ValueError("all rows objectives must have equal length")
+
+    return {
+        "episodes": len(episodes),
+        "steps": steps,
+        "successes": successes,
+        "success_rate": successes / len(episodes),
+        "fingerprint": hashlib.sha256(payload).hexdigest(),
+    }
+
+
 def _format_value(value):
     if abs(value) < 0.5e-12:
         value = 0.0
