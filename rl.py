@@ -2247,6 +2247,157 @@ def q_sigma(
     return q
 
 
+def nstep_q_sigma(
+    env,
+    episodes=500,
+    alpha=0.5,
+    gamma=0.9,
+    epsilon=0.1,
+    sigma=0.5,
+    n_steps=5,
+    seed=0,
+    max_steps=1000,
+) -> dict:
+    """n 步 Q(σ)，返回 {((row, col), action): float}。
+
+    Q 覆盖从 S 可达的非 G 格与 U/R/D/L 的全部组合，初始为 0.0。
+    每回合 reset、清空 FIFO 并先选动作；单回合最多 max_steps 步。
+    每次选动作时按选前 Q 保存 ε 贪心策略 π：URDL 中首个最大 Q 动作
+    概率为 1-epsilon+epsilon/4，其余各 epsilon/4。step 得
+    (s2, r, done)：done 时 a2、π2 均为 None，否则立即选 a2（步限
+    末步也选）并记其策略 π2；将 [s, a, r, done, s2, a2, π2] 入队。
+    队长达 n_steps 即更新队头并弹头；回合结束后冲刷，m 取当前队长。
+    取前 m 项，末项 done 时令 G=0.0，否则令 G=Q[s2,a2]，再从末项
+    逆推：done 项令 G=r，否则按 URDL 自 0.0 累加
+    S=Σ(b!=a2) π2[b]*Q[s2,b]，令
+    G=r+gamma*((1-sigma)*S+(sigma+(1-sigma)*π2[a2])*G)，Q 取本次
+    更新时值；sigma=1 时退化为 n 步 SARSA、sigma=0 时为 n 步
+    Tree Backup。仅作 Q[s,a]+=alpha*(G-Q[s,a])，G 或新 Q 非有限
+    抛 ValueError。全部随机性来自一个 random.Random(seed)。
+    """
+    if not isinstance(env, GridWorld):
+        raise TypeError("env must be a GridWorld")
+    if isinstance(episodes, bool) or not isinstance(episodes, int):
+        raise TypeError("episodes must be an int")
+    if isinstance(seed, bool) or not isinstance(seed, int):
+        raise TypeError("seed must be an int")
+    if isinstance(alpha, bool) or not isinstance(alpha, (int, float)):
+        raise TypeError("alpha must be an int or float")
+    if isinstance(gamma, bool) or not isinstance(gamma, (int, float)):
+        raise TypeError("gamma must be an int or float")
+    if isinstance(epsilon, bool) or not isinstance(epsilon, (int, float)):
+        raise TypeError("epsilon must be an int or float")
+    if isinstance(sigma, bool) or not isinstance(sigma, (int, float)):
+        raise TypeError("sigma must be an int or float")
+    if isinstance(n_steps, bool) or not isinstance(n_steps, int):
+        raise TypeError("n_steps must be an int")
+    if isinstance(max_steps, bool) or not isinstance(max_steps, int):
+        raise TypeError("max_steps must be an int")
+    if episodes <= 0:
+        raise ValueError("episodes must be positive")
+    if not _is_finite_number(alpha) or alpha <= 0 or alpha > 1:
+        raise ValueError("alpha must be finite and in (0, 1]")
+    if not _is_finite_number(gamma) or gamma < 0 or gamma >= 1:
+        raise ValueError("gamma must be finite and in [0, 1)")
+    if not _is_finite_number(epsilon) or epsilon < 0 or epsilon > 1:
+        raise ValueError("epsilon must be finite and in [0, 1]")
+    if not _is_finite_number(sigma) or sigma < 0 or sigma > 1:
+        raise ValueError("sigma must be finite and in [0, 1]")
+    if n_steps <= 0:
+        raise ValueError("n_steps must be positive")
+    if max_steps <= 0:
+        raise ValueError("max_steps must be positive")
+
+    actions = tuple(_ACTIONS)  # U, R, D, L
+    states = sorted(
+        state
+        for state in _reachable_cells(env)
+        if env._cell(state) != "G"
+    )
+    q = {(state, action): 0.0 for state in states for action in actions}
+    rng = random.Random(seed)
+
+    def policy_for(state):
+        """选前 Q 下的 ε 贪心策略概率，按 URDL 排列。"""
+        greedy = max(actions, key=lambda a: q[(state, a)])
+        greedy_prob = 1 - epsilon + epsilon / 4
+        other_prob = epsilon / 4
+        return tuple(
+            greedy_prob if a == greedy else other_prob for a in actions
+        )
+
+    def choose_action(state):
+        if rng.random() < epsilon:
+            action = actions[rng.randrange(4)]
+        else:
+            action = max(actions, key=lambda a: q[(state, a)])
+        return action, policy_for(state)
+
+    def update(queue, m):
+        """以队头起 m 项逆推 Q(σ) 回报，仅更新队头的 (s, a)。"""
+        tail = queue[m - 1]
+        if tail[3]:
+            g = 0.0
+        else:
+            g = q[(tail[4], tail[5])]
+        for k in range(m - 1, -1, -1):
+            s, a, reward, done, next_state, next_action, next_policy = (
+                queue[k]
+            )
+            if done:
+                g = reward
+            else:
+                a2_index = actions.index(next_action)
+                expected = 0.0
+                for j, b in enumerate(actions):
+                    if b != next_action:
+                        expected += next_policy[j] * q[(next_state, b)]
+                g = reward + gamma * (
+                    (1 - sigma) * expected
+                    + (sigma + (1 - sigma) * next_policy[a2_index]) * g
+                )
+        if not math.isfinite(g):
+            raise ValueError("return must remain finite")
+        key = (queue[0][0], queue[0][1])
+        new_value = q[key] + alpha * (g - q[key])
+        if not math.isfinite(new_value):
+            raise ValueError("Q value must remain finite")
+        q[key] = new_value
+
+    for _ in range(episodes):
+        state = env.reset()
+        queue = []
+        action, _policy = choose_action(state)
+        for _ in range(max_steps):
+            next_state, reward, done = env.step(action)
+            if done:
+                next_action = None
+                next_policy = None
+            else:
+                next_action, next_policy = choose_action(next_state)
+            queue.append(
+                [
+                    state,
+                    action,
+                    reward,
+                    done,
+                    next_state,
+                    next_action,
+                    next_policy,
+                ]
+            )
+            if len(queue) == n_steps:
+                update(queue, n_steps)
+                queue.pop(0)
+            if done:
+                break
+            state, action = next_state, next_action
+        while queue:
+            update(queue, len(queue))
+            queue.pop(0)
+    return q
+
+
 def double_q_learning(
     env,
     episodes=500,
