@@ -5003,6 +5003,235 @@ def ppo_update(logits, batch, lr=0.05, c=0.2, epochs=4) -> dict:
     }
 
 
+def natural_gradient(
+    logits, batch, lr=0.05, damping=0.001, tol=1e-10, max_iter=100
+) -> dict:
+    """自然梯度 logits 更新（状态块对角 Fisher 矩阵 + 共轭梯度），返回键 logits 的 dict。
+
+    logits、lr 沿用 ppo_update 契约：logits 须为非空矩形 list，每行
+    为非空 list 且元素为有限 float；lr 为有限 float 且属于 (0, 1]。
+    batch 须为非空 list，每项恰为三项 list [s, a, A]，s、a 为非 bool
+    的 int 且分别为有效行、列索引，A 为有限 float；容器或字段错型抛
+    TypeError，空表、行长、索引越界、非有限抛 ValueError。damping、
+    tol 须为非 bool 的 int/float，转换为 float 后有限且大于 0；
+    max_iter 须为非 bool 的正 int。错型抛 TypeError，转换溢出或取值
+    非法抛 ValueError。先复制 logits 冻结，各行以稳定 softmax 求 p。
+    按 batch、列序从 0.0 累加 g[s,j]=ΣA(I[j==a]-p[s,j])/N；状态 s
+    的 Fisher 块为 F_s=damping*I+n_s/N*(diag(p_s)-p_s*p_s^T)，n_s
+    为该状态样本数。行列展平后以共轭梯度求解 Fx=g：置 x=0、r=g、
+    d=r，||r||≤tol 时不迭代；否则每轮令 ρ=r·r、q=F(d)、
+    a=ρ/(d·q)、x+=a*d、r-=a*q，残差达阈值即停，否则
+    d=r+(r·r/ρ)*d。max_iter 轮仍未达阈值抛 RuntimeError；分母不
+    大于 0 或任一运算结果非有限抛 ValueError。返回
+    {"logits": 旧值+lr*x}，数值均为 float；不修改输入，同输入逐值
+    一致。
+    """
+    if not isinstance(logits, list):
+        raise TypeError("logits must be a list")
+    if not logits:
+        raise ValueError("logits must be non-empty")
+    width = None
+    for row in logits:
+        if not isinstance(row, list):
+            raise TypeError("every row of logits must be a list")
+        if not row:
+            raise ValueError("every row of logits must be non-empty")
+        if width is None:
+            width = len(row)
+        elif len(row) != width:
+            raise ValueError("logits must be rectangular")
+        for item in row:
+            if not isinstance(item, float):
+                raise TypeError("logits must contain only float")
+            if not math.isfinite(item):
+                raise ValueError("logits must contain only finite float")
+    n_rows = len(logits)
+    n_cols = width
+
+    if not isinstance(batch, list):
+        raise TypeError("batch must be a list")
+    if not batch:
+        raise ValueError("batch must be non-empty")
+    samples = []
+    for item in batch:
+        if not isinstance(item, list):
+            raise TypeError("every batch item must be a list")
+        if len(item) != 3:
+            raise ValueError("every batch item must have exactly three elements")
+        s, a, adv = item
+        if isinstance(s, bool) or not isinstance(s, int):
+            raise TypeError("state index must be a non-bool int")
+        if isinstance(a, bool) or not isinstance(a, int):
+            raise TypeError("action index must be a non-bool int")
+        if not 0 <= s < n_rows:
+            raise ValueError("state index out of range")
+        if not 0 <= a < n_cols:
+            raise ValueError("action index out of range")
+        if not isinstance(adv, float):
+            raise TypeError("advantage must be a float")
+        if not math.isfinite(adv):
+            raise ValueError("advantage must be finite")
+        samples.append((s, a, adv))
+
+    if not isinstance(lr, float):
+        raise TypeError("lr must be a float")
+    if not math.isfinite(lr):
+        raise ValueError("lr must be finite")
+    if lr <= 0.0 or lr > 1.0:
+        raise ValueError("lr must be in (0, 1]")
+    if isinstance(damping, bool) or not isinstance(damping, (int, float)):
+        raise TypeError("damping must be a non-bool int or float")
+    try:
+        damping = float(damping)
+    except OverflowError:
+        raise ValueError("damping must convert to a finite float")
+    if not math.isfinite(damping) or damping <= 0.0:
+        raise ValueError("damping must be finite and positive")
+    if isinstance(tol, bool) or not isinstance(tol, (int, float)):
+        raise TypeError("tol must be a non-bool int or float")
+    try:
+        tol = float(tol)
+    except OverflowError:
+        raise ValueError("tol must convert to a finite float")
+    if not math.isfinite(tol) or tol <= 0.0:
+        raise ValueError("tol must be finite and positive")
+    if isinstance(max_iter, bool) or not isinstance(max_iter, int):
+        raise TypeError("max_iter must be a non-bool int")
+    if max_iter <= 0:
+        raise ValueError("max_iter must be positive")
+
+    def _softmax(row):
+        m = max(row)
+        exps = []
+        total = 0.0
+        for value in row:
+            term = math.exp(value - m)
+            if not math.isfinite(term):
+                raise ValueError("softmax terms must be finite")
+            exps.append(term)
+            total += term
+        if not math.isfinite(total) or total <= 0.0:
+            raise ValueError("softmax normalizer must be finite and positive")
+        p = []
+        for term in exps:
+            p_j = term / total
+            if not math.isfinite(p_j):
+                raise ValueError("probabilities must be finite")
+            p.append(p_j)
+        return p
+
+    L = [list(row) for row in logits]
+    n_batch = len(samples)
+    ps = [_softmax(row) for row in L]
+
+    g = [[0.0] * n_cols for _ in range(n_rows)]
+    counts = [0] * n_rows
+    for s, a, adv in samples:
+        counts[s] += 1
+        row_g = g[s]
+        p_row = ps[s]
+        for j in range(n_cols):
+            term = adv * ((1.0 if j == a else 0.0) - p_row[j])
+            row_g[j] += term
+            if not math.isfinite(row_g[j]):
+                raise ValueError("gradient must be finite")
+    for i in range(n_rows):
+        for j in range(n_cols):
+            g[i][j] /= n_batch
+            if not math.isfinite(g[i][j]):
+                raise ValueError("gradient must be finite")
+
+    dim = n_rows * n_cols
+    g_flat = [0.0] * dim
+    for s in range(n_rows):
+        base = s * n_cols
+        for j in range(n_cols):
+            g_flat[base + j] = g[s][j]
+
+    def _dot(u, v):
+        total = 0.0
+        for i in range(dim):
+            total += u[i] * v[i]
+            if not math.isfinite(total):
+                raise ValueError("dot product must be finite")
+        return total
+
+    def _norm(v):
+        norm_v = math.sqrt(_dot(v, v))
+        if not math.isfinite(norm_v):
+            raise ValueError("residual norm must be finite")
+        return norm_v
+
+    def _apply_F(vec):
+        out = [0.0] * dim
+        for s in range(n_rows):
+            base = s * n_cols
+            p_row = ps[s]
+            pd = 0.0
+            for j in range(n_cols):
+                pd += p_row[j] * vec[base + j]
+            if not math.isfinite(pd):
+                raise ValueError("Fisher product must be finite")
+            scale = counts[s] / n_batch
+            for j in range(n_cols):
+                v = vec[base + j]
+                q_j = damping * v + scale * (p_row[j] * v - p_row[j] * pd)
+                if not math.isfinite(q_j):
+                    raise ValueError("Fisher product must be finite")
+                out[base + j] = q_j
+        return out
+
+    x = [0.0] * dim
+    r = list(g_flat)
+    d = list(r)
+    if _norm(r) > tol:
+        converged = False
+        for _ in range(max_iter):
+            rho = _dot(r, r)
+            if rho <= 0.0:
+                raise ValueError("CG denominator must be positive")
+            q = _apply_F(d)
+            denom = _dot(d, q)
+            if not math.isfinite(denom) or denom <= 0.0:
+                raise ValueError("CG denominator must be positive and finite")
+            alpha = rho / denom
+            if not math.isfinite(alpha):
+                raise ValueError("CG step must be finite")
+            for i in range(dim):
+                new_x = x[i] + alpha * d[i]
+                new_r = r[i] - alpha * q[i]
+                if not math.isfinite(new_x) or not math.isfinite(new_r):
+                    raise ValueError("CG state must be finite")
+                x[i] = new_x
+                r[i] = new_r
+            if _norm(r) <= tol:
+                converged = True
+                break
+            rr = _dot(r, r)
+            beta = rr / rho
+            if not math.isfinite(beta):
+                raise ValueError("CG coefficient must be finite")
+            for i in range(dim):
+                new_d = r[i] + beta * d[i]
+                if not math.isfinite(new_d):
+                    raise ValueError("CG direction must be finite")
+                d[i] = new_d
+        if not converged:
+            raise RuntimeError("natural gradient did not converge")
+
+    updated = []
+    for s in range(n_rows):
+        base = s * n_cols
+        row = []
+        for j in range(n_cols):
+            value = L[s][j] + lr * x[base + j]
+            if not math.isfinite(value):
+                raise ValueError("updated logits must be finite")
+            row.append(value)
+        updated.append(row)
+    return {"logits": updated}
+
+
 def ppo_kl_penalty_update(logits, batch, lr=0.05, beta=1.0, epochs=4) -> dict:
     """PPO KL 惩罚多轮 logits 更新，返回固定键序 logits、objectives、kls 的 dict。
 
