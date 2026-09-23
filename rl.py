@@ -12217,6 +12217,95 @@ def _load_trace_converge_manifest(path):
     return converted, window, threshold, tolerance, minimum
 
 
+def _trace_converge_compare(base_path, new_path):
+    """加载两份 trace-converge 清单并汇总对比，返回输出 dict。
+
+    两份清单沿用 _load_trace_converge_manifest 的全部契约，相对路
+    径各相对本清单所在目录；全部加载、汇总完成后才返回，不产生部分
+    输出。两清单 window 须相同；threshold/tolerance/minimum 转 float
+    后须以 float.hex() 逐位相同；seed 集合须相同（清单加载已拒绝
+    重复 seed），按 BASE 清单顺序对齐。任一违约抛 ValueError。
+
+    返回键序恰为 base、new、rate_delta、episodes 的 dict；base、new
+    键序均为 converged、rate、failed（bool、float、int 列表）；
+    rate_delta 为 new.rate - base.rate；episodes 项为
+    [seed, base_episode, new_episode, delta]，两侧 episode 均为 int
+    时 delta 为 new - base，否则为 None。
+    """
+    (
+        base_runs,
+        base_window,
+        base_threshold,
+        base_tolerance,
+        base_minimum,
+    ) = _load_trace_converge_manifest(base_path)
+    (
+        new_runs,
+        new_window,
+        new_threshold,
+        new_tolerance,
+        new_minimum,
+    ) = _load_trace_converge_manifest(new_path)
+
+    if base_window != new_window:
+        raise ValueError("window must match between manifests")
+    if float.hex(base_threshold) != float.hex(new_threshold):
+        raise ValueError("threshold must match between manifests")
+    if float.hex(base_tolerance) != float.hex(new_tolerance):
+        raise ValueError("tolerance must match between manifests")
+    if float.hex(base_minimum) != float.hex(new_minimum):
+        raise ValueError("minimum must match between manifests")
+
+    base_report = ppo_trace_converge_many(
+        base_runs,
+        window=base_window,
+        threshold=base_threshold,
+        tolerance=base_tolerance,
+        minimum=base_minimum,
+    )
+    new_report = ppo_trace_converge_many(
+        new_runs,
+        window=new_window,
+        threshold=new_threshold,
+        tolerance=new_tolerance,
+        minimum=new_minimum,
+    )
+
+    new_groups = {
+        seed: group_report for seed, group_report in new_report["groups"]
+    }
+    base_groups = [
+        (seed, group_report) for seed, group_report in base_report["groups"]
+    ]
+    if set(new_groups) != {seed for seed, _ in base_groups}:
+        raise ValueError("seed sets must match between manifests")
+
+    episodes = []
+    for seed, base_group in base_groups:
+        base_episode = base_group["episode"]
+        new_episode = new_groups[seed]["episode"]
+        if base_episode is not None and new_episode is not None:
+            delta = new_episode - base_episode
+        else:
+            delta = None
+        episodes.append([seed, base_episode, new_episode, delta])
+
+    return {
+        "base": {
+            "converged": base_report["converged"],
+            "rate": base_report["rate"],
+            "failed": base_report["failed"],
+        },
+        "new": {
+            "converged": new_report["converged"],
+            "rate": new_report["rate"],
+            "failed": new_report["failed"],
+        },
+        "rate_delta": new_report["rate"] - base_report["rate"],
+        "episodes": episodes,
+    }
+
+
 def _run(argv):
     if len(argv) < 2:
         return 2
@@ -12264,6 +12353,19 @@ def _run(argv):
                 tolerance=tolerance,
                 minimum=minimum,
             )
+            out = json.dumps(
+                report,
+                ensure_ascii=True,
+                allow_nan=False,
+                separators=(",", ":"),
+            )
+        except (TypeError, ValueError):
+            return 2
+        sys.stdout.write(out + "\n")
+        return 0
+    if command == "trace-converge-compare" and len(argv) == 4:
+        try:
+            report = _trace_converge_compare(argv[2], argv[3])
             out = json.dumps(
                 report,
                 ensure_ascii=True,
