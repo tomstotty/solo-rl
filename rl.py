@@ -596,45 +596,21 @@ def q_learning_trace_bytes(env, data) -> bytes:
     ).encode("utf-8")
 
 
-def q_learning_trace_replay(env, payload, alpha=0.5, gamma=0.9) -> dict:
-    """重放 q_learning_trace_bytes 产物中的轨迹并核对最终 Q 表。
+def _load_q_learning_trace_payload(env, payload):
+    """严格解析 q_learning_trace_bytes 产物。
 
-    env 须为 GridWorld、payload 须恰为 bytes（bytearray、memoryview 等
-    均拒绝）、alpha/gamma 须为非 bool 的 int/float，否则抛 TypeError。
-    alpha 须有限且属 (0, 1]、gamma 须有限且属 [0, 1)，否则抛
-    ValueError。
+    返回 (states, actions, episodes, recorded_q)：states 为坐标升序的
+    可达非 G 格列表，actions 为 (U, R, D, L)，episodes 为原轨迹，
+    recorded_q 为 {((row, col), action): float}。
 
-    payload 须逐字节符合 q_learning_trace_bytes 的产物：空字节、严格
-    UTF-8 解码失败、BOM、JSON 语法错误或尾随内容、重复对象键、
-    NaN/Infinity/-Infinity、根值非 dict、键序非 q、episodes、结构或
-    取值违约、重编码后字节不一致均抛 ValueError。将 q 行还原为以
-    ((row, col), action) 为键的 dict 后，q 与 episodes 须通过
-    q_learning_trace_bytes 的完整 data 校验（覆盖域、步字段、状态链、
-    env.transition 一致性、done 仅可末步等）。
-
-    Q 同覆盖域置 0.0，严格按记录逐步重放，全程只用 env.transition
-    查询而不修改 env；done 时目标为 reward，否则为
-    reward + gamma * max_a Q[next, a]，再作
-    Q += alpha * (目标 - Q)，新值非有限抛 ValueError。以 float.hex()
-    逐项比较记录 Q 与重放 Q。
-
-    返回键序恰为 matched、differences：matched 仅在无任何差异时为
-    True；differences 按 Q 序（坐标升序 × URDL）列出每项差异
-    [r, c, action, recorded, replayed]，末两项为 float。仅用标准库，
-    不引入命令行入口。
+    payload 须恰为 bytes（bytearray、memoryview 等均拒绝），且逐字节
+    符合 q_learning_trace_bytes 的规范产物；空字节、非 UTF-8、BOM、
+    JSON 语法错误或尾随内容、重复对象键、NaN/Infinity/-Infinity、根值
+    非 dict、键序非 q、episodes、结构或取值违约、重编码后字节不一致
+    均抛 ValueError。
     """
-    if not isinstance(env, GridWorld):
-        raise TypeError("env must be a GridWorld")
     if not isinstance(payload, bytes):
         raise TypeError("payload must be bytes")
-    if isinstance(alpha, bool) or not isinstance(alpha, (int, float)):
-        raise TypeError("alpha must be an int or float")
-    if isinstance(gamma, bool) or not isinstance(gamma, (int, float)):
-        raise TypeError("gamma must be an int or float")
-    if not _is_finite_number(alpha) or alpha <= 0 or alpha > 1:
-        raise ValueError("alpha must be finite and in (0, 1]")
-    if not _is_finite_number(gamma) or gamma < 0 or gamma >= 1:
-        raise ValueError("gamma must be finite and in [0, 1)")
 
     if not payload:
         raise ValueError("payload must not be empty")
@@ -721,6 +697,55 @@ def q_learning_trace_replay(env, payload, alpha=0.5, gamma=0.9) -> dict:
         raise ValueError(
             "payload must be canonical q_learning_trace_bytes output"
         )
+    return states, actions, episodes, recorded_q
+
+
+def q_learning_trace_replay(env, payload, alpha=0.5, gamma=0.9) -> dict:
+    """重放 q_learning_trace_bytes 产物中的轨迹并核对最终 Q 表。
+
+    env 须为 GridWorld、payload 须恰为 bytes（bytearray、memoryview 等
+    均拒绝）、alpha/gamma 须为非 bool 的 int/float，否则抛 TypeError。
+    alpha 须有限且属 (0, 1]、gamma 须有限且属 [0, 1)，否则抛
+    ValueError。
+
+    payload 须逐字节符合 q_learning_trace_bytes 的产物：空字节、严格
+    UTF-8 解码失败、BOM、JSON 语法错误或尾随内容、重复对象键、
+    NaN/Infinity/-Infinity、根值非 dict、键序非 q、episodes、结构或
+    取值违约、重编码后字节不一致均抛 ValueError。将 q 行还原为以
+    ((row, col), action) 为键的 dict 后，q 与 episodes 须通过
+    q_learning_trace_bytes 的完整 data 校验（覆盖域、步字段、状态链、
+    env.transition 一致性、done 仅可末步等）。
+
+    Q 同覆盖域置 0.0，严格按记录逐步重放，全程只用 env.transition
+    查询而不修改 env；done 时目标为 reward，否则为
+    reward + gamma * max_a Q[next, a]，再作
+    Q += alpha * (目标 - Q)，新值非有限抛 ValueError。以 float.hex()
+    逐项比较记录 Q 与重放 Q。
+
+    返回键序恰为 matched、differences：matched 仅在无任何差异时为
+    True；differences 按 Q 序（坐标升序 × URDL）列出每项差异
+    [r, c, action, recorded, replayed]，末两项为 float。仅用标准库，
+    不引入命令行入口。
+    """
+    if not isinstance(env, GridWorld):
+        raise TypeError("env must be a GridWorld")
+    if not isinstance(payload, bytes):
+        raise TypeError("payload must be bytes")
+    if isinstance(alpha, bool) or not isinstance(alpha, (int, float)):
+        raise TypeError("alpha must be an int or float")
+    if isinstance(gamma, bool) or not isinstance(gamma, (int, float)):
+        raise TypeError("gamma must be an int or float")
+    if not _is_finite_number(alpha) or alpha <= 0 or alpha > 1:
+        raise ValueError("alpha must be finite and in (0, 1]")
+    if not _is_finite_number(gamma) or gamma < 0 or gamma >= 1:
+        raise ValueError("gamma must be finite and in [0, 1)")
+
+    states, actions, episodes, recorded_q = (
+        _load_q_learning_trace_payload(env, payload)
+    )
+    expected_keys = {
+        (state, action) for state in states for action in actions
+    }
 
     q = {key: 0.0 for key in expected_keys}
     for episode in episodes:
@@ -748,6 +773,133 @@ def q_learning_trace_replay(env, payload, alpha=0.5, gamma=0.9) -> dict:
                     [state[0], state[1], action, recorded, replayed]
                 )
     return {"matched": not differences, "differences": differences}
+
+
+def q_learning_trace_convergence(
+    env,
+    payload,
+    alpha=0.5,
+    gamma=0.9,
+    window=20,
+    tolerance=0.01,
+    patience=3,
+) -> dict:
+    """按回合重放 q_learning_trace_bytes 轨迹并判定 Q 表是否收敛。
+
+    env、payload、alpha、gamma 的合法域及 TypeError/ValueError 分类
+    与 q_learning_trace_replay 一致；payload 须为规范产物且 q 覆盖域
+    与 env 匹配，否则抛 ValueError。window、patience 须为非 bool 的
+    正 int，否则类型违约抛 TypeError、非正抛 ValueError。tolerance
+    须为非 bool 且可转为有限 float 的非负 int/float，否则类型违约抛
+    TypeError，其余（NaN/Infinity、负数、超出 float 范围的大整数等）
+    抛 ValueError。
+
+    Q 同覆盖域置 0.0，严格按记录逐回合重放，更新式与
+    q_learning_trace_replay 相同，全程只用 env.transition 查询而不
+    修改 env；新 Q 非有限抛 ValueError。每回合记录
+    delta = max(各次更新 |new-old|)，保回合序。
+
+    以每个可能起点生成完整滑窗 [start, end, max_delta, passed]：
+    start、end 为 1 基 int，end=start+window-1，max_delta 为窗内
+    delta 的最大值，passed 等价于 max_delta <= float(tolerance)；
+    window 大于回合数时合法，此时无任何窗。episode 取首个连续
+    patience 个 passed 窗末窗的 end，不存在则为 None。
+
+    返回键序恰为 converged、episode、deltas、windows：
+    converged = (episode is not None)，deltas 保回合序。仅用标准库，
+    不引入命令行入口。
+    """
+    if not isinstance(env, GridWorld):
+        raise TypeError("env must be a GridWorld")
+    if not isinstance(payload, bytes):
+        raise TypeError("payload must be bytes")
+    if isinstance(alpha, bool) or not isinstance(alpha, (int, float)):
+        raise TypeError("alpha must be an int or float")
+    if isinstance(gamma, bool) or not isinstance(gamma, (int, float)):
+        raise TypeError("gamma must be an int or float")
+    if isinstance(window, bool) or not isinstance(window, int):
+        raise TypeError("window must be an int")
+    if isinstance(patience, bool) or not isinstance(patience, int):
+        raise TypeError("patience must be an int")
+    if isinstance(tolerance, bool) or not isinstance(
+        tolerance, (int, float)
+    ):
+        raise TypeError("tolerance must be an int or float")
+    if not _is_finite_number(alpha) or alpha <= 0 or alpha > 1:
+        raise ValueError("alpha must be finite and in (0, 1]")
+    if not _is_finite_number(gamma) or gamma < 0 or gamma >= 1:
+        raise ValueError("gamma must be finite and in [0, 1)")
+    if window <= 0:
+        raise ValueError("window must be positive")
+    if patience <= 0:
+        raise ValueError("patience must be positive")
+    try:
+        tol = float(tolerance)
+    except OverflowError as exc:
+        raise ValueError(
+            "tolerance must be convertible to a finite float"
+        ) from exc
+    if not math.isfinite(tol) or tol < 0:
+        raise ValueError(
+            "tolerance must be a finite non-negative number"
+        )
+
+    states, actions, episodes, _recorded_q = (
+        _load_q_learning_trace_payload(env, payload)
+    )
+
+    q = {
+        (state, action): 0.0
+        for state in states
+        for action in actions
+    }
+    deltas = []
+    for episode in episodes:
+        episode_delta = 0.0
+        for r, c, action, next_r, next_c, reward, done in episode:
+            key = ((r, c), action)
+            if done:
+                target = reward
+            else:
+                target = reward + gamma * max(
+                    q[((next_r, next_c), a)] for a in actions
+                )
+            old_value = q[key]
+            new_value = old_value + alpha * (target - old_value)
+            if not math.isfinite(new_value):
+                raise ValueError("Q value must remain finite")
+            q[key] = new_value
+            change = abs(new_value - old_value)
+            if change > episode_delta:
+                episode_delta = change
+        deltas.append(episode_delta)
+
+    windows = []
+    count = len(deltas)
+    for start in range(1, count - window + 2):
+        end = start + window - 1
+        max_delta = max(deltas[start - 1:end])
+        windows.append(
+            [start, end, max_delta, max_delta <= tol]
+        )
+
+    episode = None
+    streak = 0
+    for entry in windows:
+        if entry[3]:
+            streak += 1
+            if streak >= patience:
+                episode = entry[1]
+                break
+        else:
+            streak = 0
+
+    return {
+        "converged": episode is not None,
+        "episode": episode,
+        "deltas": deltas,
+        "windows": windows,
+    }
 
 
 def dueling_q_learning(
