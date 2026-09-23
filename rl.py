@@ -6981,6 +6981,125 @@ def ppo_train_trace_verify(payload) -> dict:
     }
 
 
+def ppo_trace_converge(items, window=20, threshold=.9, tolerance=.01) -> dict:
+    """对多份 PPO 训练追踪字节做完整滑窗收敛判定。
+
+    items 须为 list 且每项恰为 bytes（bytearray、memoryview 等均
+    拒绝），否则抛 TypeError；items 长度小于 2 抛 ValueError。window
+    须为非 bool 的正 int，类型不符抛 TypeError，非正抛 ValueError。
+    threshold、tolerance 须恰为 float 且有限（int、bool、NaN、Infinity
+    均拒绝），错型抛 TypeError，非有限抛 ValueError；threshold 还须在
+    [0, 1]，tolerance 须在 [0, +∞)，越界抛 ValueError。
+
+    各项须通过 ppo_train_trace_verify（其 TypeError/ValueError 原样
+    透传），各追踪的回合数须相等，否则抛 ValueError。不修改输入。
+
+    按窗终点升序枚举所有完整滑窗，每项为 [end, rate, change]：end 为
+    1 基终点回合序号；rate 自 0.0 起按 items 序、回合序累加窗内各行的
+    success 后再除以 len(items)*window；各回合目标取
+    float.fromhex(objectives[-1])（非有限抛 ValueError），change 为
+    窗内同一追踪相邻回合目标绝对差的最大值（跨所有 items），window=1
+    时为 0.0。
+
+    返回键依次为 reproducible、episode、windows：reproducible 为各项
+    字节是否全等；episode 为可复现且 rate>=threshold、
+    change<=tolerance 的首个 end，否则 None。同输入逐值一致，仅用标准
+    库，不引入命令行入口。
+    """
+    if not isinstance(items, list):
+        raise TypeError("items must be a list")
+    for index, item in enumerate(items):
+        if not isinstance(item, bytes):
+            raise TypeError(f"items[{index}] must be bytes")
+    if len(items) < 2:
+        raise ValueError("items must contain at least 2 traces")
+    if isinstance(window, bool) or not isinstance(window, int):
+        raise TypeError("window must be a non-bool int")
+    if window <= 0:
+        raise ValueError("window must be positive")
+    if isinstance(threshold, bool) or not isinstance(threshold, float):
+        raise TypeError("threshold must be a float")
+    if not math.isfinite(threshold):
+        raise ValueError("threshold must be finite")
+    if threshold < 0.0 or threshold > 1.0:
+        raise ValueError("threshold must be in [0, 1]")
+    if isinstance(tolerance, bool) or not isinstance(tolerance, float):
+        raise TypeError("tolerance must be a float")
+    if not math.isfinite(tolerance):
+        raise ValueError("tolerance must be finite")
+    if tolerance < 0.0:
+        raise ValueError("tolerance must be >= 0.0")
+
+    for item in items:
+        ppo_train_trace_verify(item)
+
+    trace_episodes = []
+    for index, item in enumerate(items):
+        episodes = ppo_train_trace_from_bytes(item)["episodes"]
+        if trace_episodes and len(episodes) != len(trace_episodes[0]):
+            raise ValueError(
+                f"items[{index}] episodes length must equal the first"
+                f" trace's ({len(trace_episodes[0])})"
+            )
+        trace_episodes.append(episodes)
+
+    episode_count = len(trace_episodes[0])
+    success_table = []
+    target_table = []
+    for item_index, episodes in enumerate(trace_episodes):
+        successes = []
+        targets = []
+        for ep_index, row in enumerate(episodes):
+            successes.append(row[2])
+            target = float.fromhex(row[4][-1])
+            if not math.isfinite(target):
+                raise ValueError(
+                    f"items[{item_index}] episodes[{ep_index}] last"
+                    " objective must be finite"
+                )
+            targets.append(target)
+        success_table.append(successes)
+        target_table.append(targets)
+
+    reproducible = all(item == items[0] for item in items[1:])
+    item_count = len(items)
+    windows = []
+    converged_episode = None
+    for end in range(window, episode_count + 1):
+        first = end - window
+        accumulated = 0.0
+        for item_index in range(item_count):
+            for ep_index in range(first, end):
+                accumulated += success_table[item_index][ep_index]
+        rate = accumulated / (item_count * window)
+
+        change = 0.0
+        if window > 1:
+            for item_index in range(item_count):
+                targets = target_table[item_index]
+                for ep_index in range(first + 1, end):
+                    difference = abs(
+                        targets[ep_index] - targets[ep_index - 1]
+                    )
+                    if difference > change:
+                        change = difference
+
+        windows.append([end, rate, change])
+        if (
+            converged_episode is None
+            and reproducible
+            and rate >= threshold
+            and change <= tolerance
+        ):
+            converged_episode = end
+
+    return {
+        "reproducible": reproducible,
+        "episode": converged_episode,
+        "windows": windows,
+    }
+
+
 def ppo_train_adaptive_kl(
     env,
     episodes=100,
