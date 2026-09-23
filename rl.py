@@ -596,6 +596,159 @@ def q_learning_trace_bytes(env, data) -> bytes:
     ).encode("utf-8")
 
 
+def q_learning_trace_replay(env, payload, alpha=0.5, gamma=0.9) -> dict:
+    """重放轨迹字节载荷并核对最终 Q 表。
+
+    env 须为 GridWorld、payload 须为 bytes，alpha/gamma 须为非 bool
+    的 int/float，否则抛 TypeError；alpha 须有限且属 (0, 1]、gamma 须
+    有限且属 [0, 1)，否则抛 ValueError。
+
+    payload 须逐字节符合 q_learning_trace_bytes 的产物：须以 UTF-8
+    编码、无 BOM、恰以单个 LF 结尾，JSON 解析失败、出现重复键或
+    NaN/Infinity 常量均抛 ValueError。顶层须为键序 q、episodes 的
+    对象；q 行 [r, c, action, value] 还原为 ((r, c), action) 元组键
+    字典（坐标为非 bool int、action 属 U/R/D/L、value 为有限
+    float、行不重复）后，q 与 episodes 还须通过
+    q_learning_trace_bytes 的完整 data 校验，且重新规范编码须与
+    payload 逐字节一致，否则抛 ValueError。
+
+    校验通过后不调用 env.reset/step（env 不被修改），Q 以同域（从 S
+    可达的非 G 格 × URDL）0.0 初始化，按记录逐步重放：done 时目标
+    为 reward，否则为 reward+gamma*max_a Q[next,a]，再作
+    Q+=alpha*(目标-Q)，新值非有限抛 ValueError。记录 Q 以
+    float.hex() 与重放值逐位比较（可区分 -0.0）。
+
+    返回键依次为 matched、differences：matched 仅在无差异时为
+    True；differences 按坐标升序 × URDL 的 Q 序列出
+    [r, c, action, recorded, replayed]，recorded、replayed 均为
+    float。
+    """
+    if not isinstance(env, GridWorld):
+        raise TypeError("env must be a GridWorld")
+    if not isinstance(payload, bytes):
+        raise TypeError("payload must be bytes")
+    if isinstance(alpha, bool) or not isinstance(alpha, (int, float)):
+        raise TypeError("alpha must be an int or float")
+    if isinstance(gamma, bool) or not isinstance(gamma, (int, float)):
+        raise TypeError("gamma must be an int or float")
+    if not _is_finite_number(alpha) or alpha <= 0 or alpha > 1:
+        raise ValueError("alpha must be finite and in (0, 1]")
+    if not _is_finite_number(gamma) or gamma < 0 or gamma >= 1:
+        raise ValueError("gamma must be finite and in [0, 1)")
+
+    if not payload.endswith(b"\n") or payload.endswith(b"\n\n"):
+        raise ValueError("payload must end with exactly one LF")
+    body = payload[:-1]
+    if body.startswith(b"\xef\xbb\xbf"):
+        raise ValueError("payload must not start with a BOM")
+    try:
+        text = body.decode("utf-8")
+    except UnicodeDecodeError as exc:
+        raise ValueError("payload must be valid UTF-8") from exc
+
+    def _reject_duplicate_keys(pairs):
+        obj = {}
+        for key, value in pairs:
+            if key in obj:
+                raise ValueError(f"duplicate JSON key: {key!r}")
+            obj[key] = value
+        return obj
+
+    def _reject_constant(constant):
+        raise ValueError(f"non-finite JSON constant not allowed: {constant}")
+
+    try:
+        decoded = json.loads(
+            text,
+            object_pairs_hook=_reject_duplicate_keys,
+            parse_constant=_reject_constant,
+        )
+    except ValueError as exc:
+        raise ValueError("payload must be valid JSON") from exc
+
+    if not isinstance(decoded, dict) or list(decoded) != ["q", "episodes"]:
+        raise ValueError(
+            "payload must be an object with exactly the keys q, episodes"
+            " in order"
+        )
+    rows = decoded["q"]
+    episodes = decoded["episodes"]
+    if not isinstance(rows, list):
+        raise ValueError("q must be a list of [r, c, action, value] rows")
+
+    recorded = {}
+    for index, row in enumerate(rows):
+        if not isinstance(row, list) or len(row) != 4:
+            raise ValueError(f"q[{index}] must be [r, c, action, value]")
+        r, c, action, value = row
+        if isinstance(r, bool) or not isinstance(r, int):
+            raise ValueError(f"q[{index}] r must be a non-bool int")
+        if isinstance(c, bool) or not isinstance(c, int):
+            raise ValueError(f"q[{index}] c must be a non-bool int")
+        if not isinstance(action, str) or action not in _ACTIONS:
+            raise ValueError(
+                f"q[{index}] action must be one of U, R, D, L"
+            )
+        if not isinstance(value, float) or not math.isfinite(value):
+            raise ValueError(f"q[{index}] value must be a finite float")
+        key = ((r, c), action)
+        if key in recorded:
+            raise ValueError(f"q[{index}] duplicates a Q entry")
+        recorded[key] = value
+
+    data = {"q": recorded, "episodes": episodes}
+    # q_learning_trace_bytes 执行完整 data 校验并规范重编码；
+    # 逐字节比对同时约束键序、空白、数字拼写与行序等一切编码细节。
+    if q_learning_trace_bytes(env, data) != payload:
+        raise ValueError(
+            "payload is not a canonical q_learning_trace_bytes encoding"
+        )
+
+    actions = tuple(_ACTIONS)  # U, R, D, L
+    states = [
+        state
+        for state in sorted(_reachable_cells(env))
+        if env._cell(state) != "G"
+    ]
+    q = {
+        (state, action): 0.0
+        for state in states
+        for action in actions
+    }
+    for episode in episodes:
+        for r, c, action, next_r, next_c, reward, done in episode:
+            if done:
+                target = reward
+            else:
+                next_state = (next_r, next_c)
+                target = reward + gamma * max(
+                    q[(next_state, a)] for a in actions
+                )
+            key = ((r, c), action)
+            new_value = q[key] + alpha * (target - q[key])
+            if not math.isfinite(new_value):
+                raise ValueError("replayed Q value must remain finite")
+            q[key] = new_value
+
+    differences = []
+    for state in states:
+        for action in actions:
+            key = (state, action)
+            replayed_value = q[key]
+            recorded_value = recorded[key]
+            if recorded_value.hex() != replayed_value.hex():
+                differences.append(
+                    [
+                        state[0],
+                        state[1],
+                        action,
+                        recorded_value,
+                        replayed_value,
+                    ]
+                )
+    return {"matched": not differences, "differences": differences}
+
+
 def dueling_q_learning(
     env,
     episodes=500,
