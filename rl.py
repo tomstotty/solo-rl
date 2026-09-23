@@ -11962,6 +11962,119 @@ def ppo_trace_converge(
     }
 
 
+def ppo_trace_converge_many(
+    runs, window=20, threshold=0.9, tolerance=0.01, minimum=0.8
+) -> dict:
+    """对多组 PPO 训练追踪批量判定收敛，返回跨 seed 汇总字典。
+
+    runs 须为非空 list：非 list 抛 TypeError，空表抛 ValueError。每
+    项须为 dict 且键序恰为 seed、items：非 dict 抛 TypeError，键序不
+    符抛 ValueError。seed 为互异的非 bool int：bool 或非 int 抛
+    TypeError，重复抛 ValueError。items 须为至少两项的 list，每项恰
+    为 bytes：items 非 list 或成员非 bytes 抛 TypeError，长度小于 2
+    抛 ValueError。window、threshold、tolerance 的校验与异常沿用
+    ppo_trace_converge。minimum 须为非 bool 的 int/float：错型抛
+    TypeError，转 float 溢出、非有限或越出 [0, 1] 抛 ValueError。
+
+    全部参数先完成全量校验，再按 runs 序逐项调用
+    ppo_trace_converge(items, window, threshold, tolerance)；各项追踪
+    自身的校验异常及回合数不一致异常原样透传，失败时不返回部分结果，
+    且不修改输入。
+
+    返回键序恰为 converged、rate、earliest、latest、groups、failed：
+    groups 与 runs 同序，每项为 [seed, report]，report 为对应
+    ppo_trace_converge 的完整返回；failed 按 runs 序收集 report 的
+    episode 为 None 的 seed；rate 为 episode 非 None 的组数除以总组
+    数所得 float；earliest、latest 分别为非 None episode 的最小值、
+    最大值 int，无则均为 None；converged 当且仅当
+    rate >= float(minimum)。重复调用逐值一致，仅用标准库，不引入命令
+    行入口。
+    """
+    if not isinstance(runs, list):
+        raise TypeError("runs must be a list")
+    if not runs:
+        raise ValueError("runs must be non-empty")
+
+    seen_seeds = set()
+    for index, item in enumerate(runs):
+        if not isinstance(item, dict):
+            raise TypeError(f"runs[{index}] must be a dict")
+        if list(item.keys()) != ["seed", "items"]:
+            raise ValueError(
+                f"runs[{index}] must have exactly the keys seed, items"
+            )
+        seed = item["seed"]
+        if isinstance(seed, bool) or not isinstance(seed, int):
+            raise TypeError(f"runs[{index}] seed must be a non-bool int")
+        if seed in seen_seeds:
+            raise ValueError(f"runs[{index}] seed must be distinct")
+        seen_seeds.add(seed)
+        items = item["items"]
+        if not isinstance(items, list):
+            raise TypeError(f"runs[{index}] items must be a list")
+        for item_index, entry in enumerate(items):
+            if not isinstance(entry, bytes):
+                raise TypeError(
+                    f"runs[{index}] items[{item_index}] must be bytes"
+                )
+        if len(items) < 2:
+            raise ValueError(
+                f"runs[{index}] items must contain at least two entries"
+            )
+
+    if isinstance(window, bool) or not isinstance(window, int):
+        raise TypeError("window must be a non-bool int")
+    if window <= 0:
+        raise ValueError("window must be positive")
+    if not isinstance(threshold, float):
+        raise TypeError("threshold must be a float")
+    if not math.isfinite(threshold):
+        raise ValueError("threshold must be finite")
+    if threshold < 0.0 or threshold > 1.0:
+        raise ValueError("threshold must be in [0, 1]")
+    if not isinstance(tolerance, float):
+        raise TypeError("tolerance must be a float")
+    if not math.isfinite(tolerance):
+        raise ValueError("tolerance must be finite")
+    if tolerance < 0.0:
+        raise ValueError("tolerance must be >= 0.0")
+
+    if isinstance(minimum, bool) or not isinstance(minimum, (int, float)):
+        raise TypeError("minimum must be an int or float")
+    try:
+        minimum_value = float(minimum)
+    except OverflowError:
+        raise ValueError("minimum must be finite and in [0, 1]")
+    if not math.isfinite(minimum_value):
+        raise ValueError("minimum must be finite and in [0, 1]")
+    if minimum_value < 0.0 or minimum_value > 1.0:
+        raise ValueError("minimum must be finite and in [0, 1]")
+
+    groups = []
+    for item in runs:
+        report = ppo_trace_converge(
+            item["items"], window, threshold, tolerance
+        )
+        groups.append([item["seed"], report])
+
+    episodes = [
+        report["episode"] for _, report in groups if report["episode"] is not None
+    ]
+    failed = [seed for seed, report in groups if report["episode"] is None]
+    rate = len(episodes) / len(groups)
+    earliest = min(episodes) if episodes else None
+    latest = max(episodes) if episodes else None
+
+    return {
+        "converged": rate >= minimum_value,
+        "rate": rate,
+        "earliest": earliest,
+        "latest": latest,
+        "groups": groups,
+        "failed": failed,
+    }
+
+
 def _format_value(value):
     if abs(value) < 0.5e-12:
         value = 0.0
