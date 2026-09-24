@@ -9614,6 +9614,197 @@ def advantage_weighted_train(
     }
 
 
+def awr_until(
+    env,
+    max_episodes=100,
+    seed=0,
+    max_steps=1000,
+    window=20,
+    threshold=.9,
+    patience=3,
+) -> dict:
+    """优势加权训练至成功序列收敛或达回合上限，返回 h 表、逐回合步表、
+    目标值、权重与收敛报告。
+
+    env、seed、max_steps 的校验与异常沿用 advantage_weighted_train；
+    max_episodes 按其 episodes 契约（非 bool 正 int）；window、
+    patience 须为非 bool 正 int；threshold 须为非 bool 的 int/float，
+    类型错抛 TypeError，转 float 溢出、非有限或越出 [0, 1] 抛
+    ValueError。全部校验在首次 reset 前完成。
+
+    以 advantage_weighted_train 默认训练超参（alpha=0.05、gamma=0.9、
+    lambda_=0.95、temp=1.0、cap=20.0、epochs=4）及给定 seed、
+    max_steps 连续训练：采样、GAE、advantage_weighted_update、H/V 更新、
+    随机数消费及终止/截断处理与该函数逐值一致，全部随机性来自一个
+    random.Random(seed)。
+
+    每回合更新后以该回合末步 done 为成功标记（步限截断记 False），
+    追加进累计成功序列并调用 ppo_success_streak(successes, window,
+    threshold, patience)；首次 converged 为真即停止，否则训练
+    max_episodes 回合。
+
+    返回键依次为 h、episodes、objectives、weights、report；实际完成 k
+    回合时，前四项逐值等于 advantage_weighted_train(env, episodes=k,
+    seed=seed, max_steps=max_steps) 的对应返回，report 为成功序列的
+    完整 ppo_success_streak 结果。不额外消费随机数；更新器异常原样
+    透传且不返回部分结果，同参同 seed 逐值一致。仅用标准库。
+    """
+    if not isinstance(env, GridWorld):
+        raise TypeError("env must be a GridWorld")
+    if isinstance(max_episodes, bool) or not isinstance(max_episodes, int):
+        raise TypeError("max_episodes must be an int")
+    if isinstance(seed, bool) or not isinstance(seed, int):
+        raise TypeError("seed must be an int")
+    if isinstance(max_steps, bool) or not isinstance(max_steps, int):
+        raise TypeError("max_steps must be an int")
+    if isinstance(window, bool) or not isinstance(window, int):
+        raise TypeError("window must be a non-bool int")
+    if isinstance(patience, bool) or not isinstance(patience, int):
+        raise TypeError("patience must be a non-bool int")
+    if isinstance(threshold, bool) or not isinstance(
+        threshold, (int, float)
+    ):
+        raise TypeError("threshold must be an int or float")
+    if max_episodes <= 0:
+        raise ValueError("max_episodes must be positive")
+    if max_steps <= 0:
+        raise ValueError("max_steps must be positive")
+    if window <= 0:
+        raise ValueError("window must be positive")
+    if patience <= 0:
+        raise ValueError("patience must be positive")
+    try:
+        float(threshold)
+    except OverflowError:
+        raise ValueError("threshold must convert to a finite float")
+    if not math.isfinite(float(threshold)):
+        raise ValueError("threshold must be finite")
+    if float(threshold) < 0.0 or float(threshold) > 1.0:
+        raise ValueError("threshold must be in [0, 1]")
+
+    alpha = 0.05
+    gamma = 0.9
+    lambda_ = 0.95
+    temp = 1.0
+    cap = 20.0
+    epochs = 4
+
+    actions, states, state_index, h, values, rng = _ppo_training_setup(
+        env, seed
+    )
+    all_episodes = []
+    all_objectives = []
+    all_weights = []
+    successes = []
+    report = None
+
+    for _ in range(max_episodes):
+        state = env.reset()
+        trajectory = []
+        step_records = []
+        for _ in range(max_steps):
+            s = state_index[state]
+            row = h[s]
+            m = max(row)
+            softmax_weights = [
+                math.exp(logit - m) for logit in row
+            ]
+            total = sum(softmax_weights)
+            if not math.isfinite(total) or total <= 0.0:
+                raise ValueError(
+                    "softmax normalizer must be finite and positive"
+                )
+            probs = [weight / total for weight in softmax_weights]
+            log_total = math.log(total)
+            u = rng.random()
+            cumulative = 0.0
+            a = 3
+            for k, p_k in enumerate(probs):
+                cumulative += p_k
+                if cumulative > u:
+                    a = k
+                    break
+            action = actions[a]
+            value = values[s]
+            next_state, reward, done = env.step(action)
+            value_next = (
+                0.0 if done else values[state_index[next_state]]
+            )
+            trajectory.append(
+                (s, a, reward, value, value_next, done)
+            )
+            step_records.append(
+                [state[0], state[1], action, reward, done]
+            )
+            if done:
+                break
+            state = next_state
+
+        advantages = [0.0] * len(trajectory)
+        a_t = 0.0
+        for t in range(len(trajectory) - 1, -1, -1):
+            (
+                _s,
+                _a,
+                reward,
+                value,
+                value_next,
+                _done,
+            ) = trajectory[t]
+            delta = reward + gamma * value_next - value
+            if not math.isfinite(delta):
+                raise ValueError("GAE delta must be finite")
+            a_t = delta + gamma * lambda_ * a_t
+            if not math.isfinite(a_t):
+                raise ValueError("GAE advantage must be finite")
+            advantages[t] = a_t
+
+        batch = [
+            [s, a, float(adv)]
+            for (s, a, _r, _v, _v2, _done), adv in zip(
+                trajectory, advantages
+            )
+        ]
+        result = advantage_weighted_update(
+            h,
+            batch,
+            float(alpha),
+            float(temp),
+            float(cap),
+            epochs,
+        )
+        h = result["logits"]
+        all_objectives.append(result["objectives"])
+        all_weights.append(result["weights"])
+
+        for (s, _a, _r, value, _v2, _done), adv in zip(
+            trajectory, advantages
+        ):
+            new_value = values[s] + alpha * (
+                adv + value - values[s]
+            )
+            if not math.isfinite(new_value):
+                raise ValueError("updated value must be finite")
+            values[s] = new_value
+
+        all_episodes.append(step_records)
+
+        successes.append(step_records[-1][4])
+        report = ppo_success_streak(
+            successes, window, threshold, patience
+        )
+        if report["converged"]:
+            break
+
+    return {
+        "h": _ppo_h_table(h, states),
+        "episodes": all_episodes,
+        "objectives": all_objectives,
+        "weights": all_weights,
+        "report": report,
+    }
+
+
 def ppo_converge(
     env,
     episodes=100,
