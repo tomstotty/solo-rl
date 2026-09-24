@@ -9465,6 +9465,138 @@ def segmented_gae(r, v, n, term, trunc, gamma=0.9, lambda_=0.95) -> dict:
     }
 
 
+def segmented_gae_batch(
+    segments, gamma=0.9, lambda_=0.95, epsilon=1e-8
+) -> dict:
+    """多段轨迹的广义优势估计并跨段标准化优势。
+
+    segments 须为非空 list，每项须为键序严格为 r、v、n、term、trunc
+    的 dict；容器或项类型不符抛 TypeError，空表或键序不符抛
+    ValueError。五个字段及 gamma、lambda_ 的类型、长度、标记、有限
+    性、值域与异常全部沿用 segmented_gae：结构校验通过后按段序逐段
+    调用原函数，其异常原样抛出，不修改输入。epsilon 须为非 bool 的
+    int/float，类型不符抛 TypeError，转 float 溢出、非有限或 <=0
+    抛 ValueError。全部参数先校验完毕再计算。
+
+    将各段 advantages 按段序、段内步序展平，从 0.0 顺序累加求均值
+    m，再从 0.0 顺序累加 (A-m)**2，除以总步数后开方得总体标准差
+    s。s==0.0 时标准化值均为正 0.0，否则取 (A-m)/(s+epsilon)；
+    上述任一运算溢出或中间量、输出非有限均抛 ValueError。
+
+    返回固定键序 segments、mean、std 的新 dict：segments 与输入同
+    序，每项为键序 deltas、advantages、returns、normalized 的新
+    dict，四个值均为 float 新 list；mean、std 为 float。同输入逐
+    值一致。
+    """
+    if not isinstance(segments, list):
+        raise TypeError("segments must be a list")
+    if len(segments) == 0:
+        raise ValueError("segments must be non-empty")
+    expected_keys = ["r", "v", "n", "term", "trunc"]
+    for seg in segments:
+        if not isinstance(seg, dict):
+            raise TypeError("every segment must be a dict")
+        if list(seg.keys()) != expected_keys:
+            raise ValueError(
+                "every segment must have exactly the keys "
+                "r, v, n, term, trunc in that order"
+            )
+    if isinstance(epsilon, bool) or not isinstance(
+        epsilon, (int, float)
+    ):
+        raise TypeError("epsilon must be an int or float")
+    try:
+        e = float(epsilon)
+    except OverflowError:
+        raise ValueError("epsilon must convert to a finite float")
+    if not math.isfinite(e) or e <= 0.0:
+        raise ValueError("epsilon must be finite and > 0")
+
+    results = [
+        segmented_gae(
+            seg["r"],
+            seg["v"],
+            seg["n"],
+            seg["term"],
+            seg["trunc"],
+            gamma,
+            lambda_,
+        )
+        for seg in segments
+    ]
+
+    total_steps = sum(len(result["advantages"]) for result in results)
+    total = 0.0
+    for result in results:
+        for adv in result["advantages"]:
+            total += adv
+            if not math.isfinite(total):
+                raise ValueError("advantage sum must be finite")
+    m = total / total_steps
+    if not math.isfinite(m):
+        raise ValueError("advantage mean must be finite")
+    squared = 0.0
+    for result in results:
+        for adv in result["advantages"]:
+            diff = adv - m
+            if not math.isfinite(diff):
+                raise ValueError("centered advantage must be finite")
+            try:
+                term = diff ** 2
+            except OverflowError:
+                raise ValueError("squared advantage must be finite")
+            if not math.isfinite(term):
+                raise ValueError("squared advantage must be finite")
+            squared += term
+            if not math.isfinite(squared):
+                raise ValueError("variance sum must be finite")
+    variance = squared / total_steps
+    if not math.isfinite(variance):
+        raise ValueError("advantage variance must be finite")
+    s = math.sqrt(variance)
+    if not math.isfinite(s):
+        raise ValueError("advantage std must be finite")
+
+    if s == 0.0:
+        output_segments = [
+            {
+                "deltas": list(result["deltas"]),
+                "advantages": list(result["advantages"]),
+                "returns": list(result["returns"]),
+                "normalized": [0.0] * len(result["advantages"]),
+            }
+            for result in results
+        ]
+    else:
+        denom = s + e
+        if not math.isfinite(denom):
+            raise ValueError("normalization denominator must be finite")
+        output_segments = []
+        for result in results:
+            normalized = []
+            for adv in result["advantages"]:
+                diff = adv - m
+                if not math.isfinite(diff):
+                    raise ValueError("centered advantage must be finite")
+                value = diff / denom
+                if not math.isfinite(value):
+                    raise ValueError("normalized advantage must be finite")
+                normalized.append(value)
+            output_segments.append(
+                {
+                    "deltas": list(result["deltas"]),
+                    "advantages": list(result["advantages"]),
+                    "returns": list(result["returns"]),
+                    "normalized": normalized,
+                }
+            )
+    return {
+        "segments": output_segments,
+        "mean": m,
+        "std": s,
+    }
+
+
 def segmented_vtrace(
     r, v, n, b, p, term, trunc, gamma=0.9, rho_clip=1.0, c_clip=1.0
 ) -> dict:
