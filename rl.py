@@ -9588,6 +9588,188 @@ def ppo_line_search(
     }
 
 
+def trpo(logits, batch, max_kl=0.01, steps=10) -> dict:
+    """TRPO 回溯线搜索：沿自然梯度方向按几何衰减倍率取候选，返回固定
+    键序 logits、objectives、kls、accepted、step 的 dict。
+
+    logits、batch 契约沿用 natural_gradient：logits 须为非空矩形
+    list，每行为非空 list 且元素为有限 float；batch 须为非空 list，
+    每项恰为三项 list [s, a, A]，s、a 为非 bool 的 int 且分别为有效
+    行、列索引，A 为有限 float。max_kl 须为非 bool 的 int/float，
+    类型不符抛 TypeError，转 float 溢出、非有限或 <=0 抛 ValueError；
+    steps 须为非 bool 的 int 且属于 [1, 61]，类型不符抛 TypeError，
+    越界抛 ValueError。全部参数先校验完毕且不修改输入。
+
+    先以 natural_gradient(logits, batch, 1.0)["logits"] 取满步长目标
+    D，方向 d=D-logits；对原 logits 作稳定 log-softmax 得 q0，基线
+    J0=sum(A, 0.0)/len(batch)。依 i=0..steps-1，每次均从原 logits 造
+    X=logits+(2.0**-i)*d，候选之间不串接；对 X 作稳定 log-softmax
+    得 qX，目标
+    J(X)=sum(A*exp(qX[s,a]-q0[s,a]), 0.0)/len(batch)，并以
+    ppo_policy_kl(logits, X)["mean"] 取旧策略到新策略的 mean KL 记为
+    K(X)，将该次的 J、K float 依序加入 objectives、kls。首个满足
+    K<=max_kl 且 J>=J0 的候选即接受并停止，列表截止于命中项；全部
+    拒绝时两列表各含 steps 项。exp 向下溢出为 0 合法，向上溢出或任
+    一中间结果非有限抛 ValueError。成功时 logits 取命中候选矩阵、
+    accepted 为 True、step 为对应倍率 2.0**-i；全部拒绝时 logits 为
+    原矩阵的新副本、accepted 为 False、step 为 None。同输入逐值
+    一致。
+    """
+    if not isinstance(logits, list):
+        raise TypeError("logits must be a list")
+    if not logits:
+        raise ValueError("logits must be non-empty")
+    width = None
+    for row in logits:
+        if not isinstance(row, list):
+            raise TypeError("every row of logits must be a list")
+        if not row:
+            raise ValueError("every row of logits must be non-empty")
+        if width is None:
+            width = len(row)
+        elif len(row) != width:
+            raise ValueError("logits must be rectangular")
+        for item in row:
+            if not isinstance(item, float):
+                raise TypeError("logits must contain only float")
+            if not math.isfinite(item):
+                raise ValueError("logits must contain only finite float")
+    n_rows = len(logits)
+    n_cols = width
+
+    if not isinstance(batch, list):
+        raise TypeError("batch must be a list")
+    if not batch:
+        raise ValueError("batch must be non-empty")
+    samples = []
+    for item in batch:
+        if not isinstance(item, list):
+            raise TypeError("every batch item must be a list")
+        if len(item) != 3:
+            raise ValueError("every batch item must have exactly three elements")
+        s, a, adv = item
+        if isinstance(s, bool) or not isinstance(s, int):
+            raise TypeError("state index must be a non-bool int")
+        if isinstance(a, bool) or not isinstance(a, int):
+            raise TypeError("action index must be a non-bool int")
+        if not 0 <= s < n_rows:
+            raise ValueError("state index out of range")
+        if not 0 <= a < n_cols:
+            raise ValueError("action index out of range")
+        if not isinstance(adv, float):
+            raise TypeError("advantage must be a float")
+        if not math.isfinite(adv):
+            raise ValueError("advantage must be finite")
+        samples.append((s, a, adv))
+
+    if isinstance(max_kl, bool) or not isinstance(max_kl, (int, float)):
+        raise TypeError("max_kl must be a non-bool int or float")
+    try:
+        max_kl = float(max_kl)
+    except OverflowError:
+        raise ValueError("max_kl must convert to a finite float")
+    if not math.isfinite(max_kl) or max_kl <= 0.0:
+        raise ValueError("max_kl must be finite and > 0")
+    if isinstance(steps, bool) or not isinstance(steps, int):
+        raise TypeError("steps must be a non-bool int")
+    if steps < 1 or steps > 61:
+        raise ValueError("steps must be in [1, 61]")
+
+    def _log_softmax(matrix_row):
+        m = max(matrix_row)
+        if not math.isfinite(m):
+            raise ValueError("row maximum must be finite")
+        z = sum((math.exp(x - m) for x in matrix_row), 0.0)
+        if not math.isfinite(z):
+            raise ValueError("softmax normalizer must be finite")
+        if z <= 0.0:
+            raise ValueError("softmax normalizer must be positive")
+        log_z = math.log(z)
+        q_row = []
+        for x in matrix_row:
+            value = x - m - log_z
+            if not math.isfinite(value):
+                raise ValueError("log-probabilities must be finite")
+            q_row.append(value)
+        return q_row
+
+    n_batch = len(samples)
+    target = natural_gradient(logits, batch, 1.0)["logits"]
+    direction = [
+        [target[s][j] - logits[s][j] for j in range(n_cols)]
+        for s in range(n_rows)
+    ]
+    q0 = [_log_softmax(row) for row in logits]
+    baseline = sum((adv for _s, _a, adv in samples), 0.0) / n_batch
+    if not math.isfinite(baseline):
+        raise ValueError("baseline objective must be finite")
+
+    objectives = []
+    kls = []
+    accepted_logits = None
+    accepted_step = None
+    for i in range(steps):
+        factor = 2.0 ** -i
+        if not math.isfinite(factor) or factor <= 0.0:
+            raise ValueError("step factor must be finite and positive")
+        candidate = []
+        for s in range(n_rows):
+            row = []
+            for j in range(n_cols):
+                value = logits[s][j] + factor * direction[s][j]
+                if not math.isfinite(value):
+                    raise ValueError("candidate logits must be finite")
+                row.append(value)
+            candidate.append(row)
+        qx = [_log_softmax(row) for row in candidate]
+
+        objective = 0.0
+        for s, a, adv in samples:
+            delta = qx[s][a] - q0[s][a]
+            try:
+                ratio = math.exp(delta)
+            except OverflowError:
+                raise ValueError("importance ratio must be finite")
+            if not math.isfinite(ratio):
+                raise ValueError("importance ratio must be finite")
+            term = adv * ratio
+            if not math.isfinite(term):
+                raise ValueError("objective term must be finite")
+            objective += term
+            if not math.isfinite(objective):
+                raise ValueError("objective sum must be finite")
+        objective /= n_batch
+        if not math.isfinite(objective):
+            raise ValueError("objective must be finite")
+
+        kl = ppo_policy_kl(logits, candidate)["mean"]
+        if not math.isfinite(kl):
+            raise ValueError("KL must be finite")
+
+        objectives.append(objective)
+        kls.append(kl)
+        if kl <= max_kl and objective >= baseline:
+            accepted_logits = candidate
+            accepted_step = factor
+            break
+
+    if accepted_logits is None:
+        return {
+            "logits": [list(row) for row in logits],
+            "objectives": objectives,
+            "kls": kls,
+            "accepted": False,
+            "step": None,
+        }
+    return {
+        "logits": accepted_logits,
+        "objectives": objectives,
+        "kls": kls,
+        "accepted": True,
+        "step": accepted_step,
+    }
+
+
 def _ppo_training_setup(env, seed):
     """初始化共享 PPO 训练状态：URDL 状态编号、零 logits/值表与随机源。"""
     actions = tuple(_ACTIONS)  # U, R, D, L
