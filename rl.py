@@ -5052,6 +5052,243 @@ def off_policy_mc_prediction(
     return {"values": v, "weights": c, "episodes": history}
 
 
+def dr_evaluate(
+    env,
+    behavior,
+    target,
+    q,
+    episodes=100,
+    gamma=0.9,
+    seed=0,
+    max_steps=1000,
+) -> dict:
+    """按行为策略采样，用给定 Q 表做离策略双鲁棒（Doubly Robust）评估。
+
+    env、behavior、target 及 episodes、gamma、seed、max_steps 的校验
+    与异常均同 off_policy_mc_prediction。q 须为 dict，恰含从 S 可达的
+    非 G 格 × U/R/D/L 的全部 ((row, col), action) 键，值须为非 bool
+    的有限 int/float；容器、键或值类型违约抛 TypeError，键域不符、
+    float 转换溢出或值非有限抛 ValueError。q 复制为 float，不修改
+    输入。
+
+    令 V(s)=Σ_a target[s][a]*q[(s,a)]，按 U、R、D、L 自 0.0 累加。
+    策略采样、单一 random.Random(seed) 随机流及每步恰消费一次
+    random() 的方式均沿用 off_policy_mc_prediction。每回合 reset，
+    置 E=V(S)、W=1.0、D=1.0；每个 step 后依次作
+    W*=target[s][a]/behavior[s][a]、
+    δ=r+gamma*(0.0 if done else V(s2))-q[(s,a)]、E+=D*W*δ、
+    D*=gamma。done 即停；到达步限且未终止时末步仍自举。重要性比率、
+    任一中间量或结果非有限即抛 ValueError。
+
+    返回键序 episodes、mean：episodes 为每回合
+    [steps, total_reward, done, E]，依次为 int/int/bool/float，
+    total_reward 从 0 按步累加；mean 为各回合 E 自 0.0 按序累加后
+    除以回合数。同参同 seed 逐值一致。仅用标准库，不引入命令行入口。
+    """
+    if not isinstance(env, GridWorld):
+        raise TypeError("env must be a GridWorld")
+    if isinstance(episodes, bool) or not isinstance(episodes, int):
+        raise TypeError("episodes must be an int")
+    if isinstance(seed, bool) or not isinstance(seed, int):
+        raise TypeError("seed must be an int")
+    if isinstance(max_steps, bool) or not isinstance(max_steps, int):
+        raise TypeError("max_steps must be an int")
+    if isinstance(gamma, bool) or not isinstance(gamma, (int, float)):
+        raise TypeError("gamma must be an int or float")
+    if episodes <= 0:
+        raise ValueError("episodes must be positive")
+    if max_steps <= 0:
+        raise ValueError("max_steps must be positive")
+    if not _is_finite_number(gamma) or gamma < 0 or gamma >= 1:
+        raise ValueError("gamma must be finite and in [0, 1)")
+
+    actions = tuple(_ACTIONS)  # U, R, D, L
+    states = sorted(
+        state
+        for state in _reachable_cells(env)
+        if env._cell(state) != "G"
+    )
+
+    def _validate_policy(policy, name):
+        if not isinstance(policy, dict):
+            raise TypeError(name + " must be a dict")
+        for key in policy:
+            if (
+                not isinstance(key, tuple)
+                or len(key) != 2
+                or any(
+                    isinstance(v, bool) or not isinstance(v, int)
+                    for v in key
+                )
+            ):
+                raise TypeError(
+                    name + " keys must be tuples of two non-bool ints"
+                )
+        if set(policy) != set(states):
+            raise ValueError(
+                name
+                + " keys must exactly be the reachable non-goal cells"
+            )
+        for cell in states:
+            row = policy[cell]
+            if not isinstance(row, list):
+                raise TypeError(name + " rows must be lists")
+            if len(row) != 4:
+                raise ValueError(
+                    name
+                    + " rows must have four entries in U, R, D, L order"
+                )
+            for probability in row:
+                if isinstance(probability, bool) or not isinstance(
+                    probability, float
+                ):
+                    raise TypeError(name + " probabilities must be floats")
+            for probability in row:
+                if not math.isfinite(probability):
+                    raise ValueError(
+                        name + " probabilities must be finite"
+                    )
+                if probability < 0:
+                    raise ValueError(
+                        name + " probabilities must be non-negative"
+                    )
+            if sum(row, 0.0) != 1.0:
+                raise ValueError(name + " rows must sum to 1.0")
+
+    _validate_policy(behavior, "behavior policy")
+    _validate_policy(target, "target policy")
+    for cell in states:
+        for index in range(4):
+            if target[cell][index] > 0.0 and behavior[cell][index] <= 0.0:
+                raise ValueError(
+                    "behavior policy must have positive probability wherever "
+                    "target policy does"
+                )
+
+    if not isinstance(q, dict):
+        raise TypeError("q must be a dict")
+    expected_keys = {
+        (state, action) for state in states for action in actions
+    }
+    for key, value in q.items():
+        if (
+            not isinstance(key, tuple)
+            or len(key) != 2
+            or not isinstance(key[0], tuple)
+            or len(key[0]) != 2
+            or any(
+                isinstance(v, bool) or not isinstance(v, int)
+                for v in key[0]
+            )
+            or not isinstance(key[1], str)
+        ):
+            raise TypeError(
+                "q keys must be ((row, col), action) tuples with action"
+                " one of U, R, D, L"
+            )
+        if key[1] not in _ACTIONS:
+            raise ValueError(
+                "q action must be one of U, R, D, L"
+            )
+        if isinstance(value, bool) or not isinstance(value, (int, float)):
+            raise TypeError("q values must be non-bool ints or floats")
+    if set(q) != expected_keys:
+        raise ValueError(
+            "q must cover exactly the reachable non-G cells times"
+            " U, R, D, L"
+        )
+
+    q_float = {}
+    for state in states:
+        for action in actions:
+            value = q[(state, action)]
+            try:
+                converted = float(value)
+            except OverflowError:
+                raise ValueError("q values must convert to finite floats")
+            if not math.isfinite(converted):
+                raise ValueError("q values must be finite")
+            q_float[(state, action)] = converted
+
+    v = {}
+    for state in states:
+        estimate = 0.0
+        for index, action in enumerate(actions):
+            estimate += target[state][index] * q_float[(state, action)]
+        if not math.isfinite(estimate):
+            raise ValueError("V value must remain finite")
+        v[state] = estimate
+
+    history = []
+    rng = random.Random(seed)
+    total_e = 0.0
+
+    for _ in range(episodes):
+        state = env.reset()
+        e_return = v[state]
+        weight = 1.0
+        discount = 1.0
+        steps = 0
+        total_reward = 0
+        done = False
+        for _ in range(max_steps):
+            sample = rng.random()
+            cumulative = 0.0
+            action_index = -1
+            for index, probability in enumerate(behavior[state]):
+                cumulative += probability
+                if cumulative > sample:
+                    action_index = index
+                    break
+            if action_index < 0:
+                for index in range(3, -1, -1):
+                    if behavior[state][index] > 0.0:
+                        action_index = index
+                        break
+            action = actions[action_index]
+            ratio = (
+                target[state][action_index]
+                / behavior[state][action_index]
+            )
+            if not math.isfinite(ratio):
+                raise ValueError("importance ratio must remain finite")
+            next_state, reward, done = env.step(action)
+            steps += 1
+            total_reward += reward
+            weight *= ratio
+            if not math.isfinite(weight):
+                raise ValueError("weight must remain finite")
+            if done:
+                bootstrap = 0.0
+            else:
+                bootstrap = v[next_state]
+            delta = (
+                reward
+                + gamma * bootstrap
+                - q_float[(state, action)]
+            )
+            if not math.isfinite(delta):
+                raise ValueError("delta must remain finite")
+            e_return += discount * weight * delta
+            if not math.isfinite(e_return):
+                raise ValueError("E value must remain finite")
+            discount *= gamma
+            if not math.isfinite(discount):
+                raise ValueError("discount must remain finite")
+            if done:
+                break
+            state = next_state
+        history.append([steps, total_reward, done, e_return])
+        total_e += e_return
+        if not math.isfinite(total_e):
+            raise ValueError("E sum must remain finite")
+
+    mean = total_e / episodes
+    if not math.isfinite(mean):
+        raise ValueError("mean must be finite")
+    return {"episodes": history, "mean": mean}
+
+
 def off_policy_mc_converge(
     env,
     behavior,
