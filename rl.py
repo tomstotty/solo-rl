@@ -5308,6 +5308,206 @@ def td_lambda_prediction(
     return v
 
 
+def lstd(
+    env,
+    policy,
+    episodes=500,
+    gamma=0.9,
+    lambda_=0.9,
+    ridge=1e-8,
+    seed=0,
+    max_steps=1000,
+) -> dict:
+    """按给定策略做 LSTD(λ) 最小二乘策略评估，返回 V 表与转移数。
+
+    除 ridge 外，参数校验、policy 格式、采样随机序及 reset/done/max_steps
+    边界均同 td_lambda_prediction：每步仅调用一次 random()，按 URDL 累计
+    概率取首个严格大于样本的动作，未命中取 L；截断末步仍自举。ridge 须为
+    非 bool 的 int/float，错型抛 TypeError；转 float 溢出、非有限或 ≤0
+    抛 ValueError，全部校验先于首次 reset。
+
+    将从 S 可达的非 G 格按坐标升序编号 0..n-1，A 为 n×n、b 与 z 为 n 项
+    0.0；每回合 reset 后 z 清零。每步 step 得 (s2, r, done) 后按序作
+    z[i]*=gamma*lambda_、z[s]+=1，再按 i/j 序累加
+    A[i][j]+=z[i]*(I[j=s]-gamma*(0 if done else I[j=s2]))、
+    b[i]+=z[i]*r；终止（done）不自举，截断仍自举。随后 A 对角加 ridge，
+    用 Gauss-Jordan 消元解 Aw=b：第 k 列自第 k 行起选绝对值最大者（平局
+    取首行）为主元，零主元抛 RuntimeError，交换后按列归一化、按行消元。
+    迹、A、b 或消元中出现非有限值即抛 ValueError。返回 {"values",
+    "steps"}：values 为覆盖全部可达格（含 G，G 恒 0.0）、按坐标升序的
+    float 字典；steps 为 env.step 调用总数。不改 policy，仅用标准库。
+    """
+    if not isinstance(env, GridWorld):
+        raise TypeError("env must be a GridWorld")
+    if isinstance(episodes, bool) or not isinstance(episodes, int):
+        raise TypeError("episodes must be an int")
+    if isinstance(seed, bool) or not isinstance(seed, int):
+        raise TypeError("seed must be an int")
+    if isinstance(max_steps, bool) or not isinstance(max_steps, int):
+        raise TypeError("max_steps must be an int")
+    if isinstance(gamma, bool) or not isinstance(gamma, (int, float)):
+        raise TypeError("gamma must be an int or float")
+    if isinstance(lambda_, bool) or not isinstance(lambda_, (int, float)):
+        raise TypeError("lambda_ must be an int or float")
+    if isinstance(ridge, bool) or not isinstance(ridge, (int, float)):
+        raise TypeError("ridge must be an int or float")
+    if episodes <= 0:
+        raise ValueError("episodes must be positive")
+    if max_steps <= 0:
+        raise ValueError("max_steps must be positive")
+    if not _is_finite_number(gamma) or gamma < 0 or gamma >= 1:
+        raise ValueError("gamma must be finite and in [0, 1)")
+    if not _is_finite_number(lambda_) or lambda_ < 0 or lambda_ > 1:
+        raise ValueError("lambda_ must be finite and in [0, 1]")
+    try:
+        ridge_value = float(ridge)
+    except OverflowError:
+        raise ValueError("ridge must convert to a finite float")
+    if not math.isfinite(ridge_value) or ridge_value <= 0.0:
+        raise ValueError("ridge must be finite and positive")
+
+    actions = tuple(_ACTIONS)  # U, R, D, L
+    states = sorted(
+        state
+        for state in _reachable_cells(env)
+        if env._cell(state) != "G"
+    )
+    all_states = sorted(_reachable_cells(env))
+    if not isinstance(policy, dict):
+        raise TypeError("policy must be a dict")
+    for key in policy:
+        if (
+            not isinstance(key, tuple)
+            or len(key) != 2
+            or any(
+                isinstance(v, bool) or not isinstance(v, int) for v in key
+            )
+        ):
+            raise TypeError(
+                "policy keys must be tuples of two non-bool ints"
+            )
+    if set(policy) != set(states):
+        raise ValueError(
+            "policy keys must exactly be the reachable non-goal cells"
+        )
+    for state in states:
+        row = policy[state]
+        if not isinstance(row, list):
+            raise TypeError("policy rows must be lists")
+        if len(row) != 4:
+            raise ValueError(
+                "policy rows must have four entries in U, R, D, L order"
+            )
+        for probability in row:
+            if isinstance(probability, bool) or not isinstance(
+                probability, float
+            ):
+                raise TypeError("policy probabilities must be floats")
+        for probability in row:
+            if not math.isfinite(probability):
+                raise ValueError("policy probabilities must be finite")
+            if probability < 0:
+                raise ValueError("policy probabilities must be non-negative")
+        if sum(row, 0.0) != 1.0:
+            raise ValueError("policy rows must sum to 1.0")
+
+    n = len(states)
+    index = {state: i for i, state in enumerate(states)}
+    matrix_a = [[0.0 for _ in range(n)] for _ in range(n)]
+    vector_b = [0.0 for _ in range(n)]
+    trace = [0.0 for _ in range(n)]
+    rng = random.Random(seed)
+    steps = 0
+    decay = gamma * lambda_
+
+    for _ in range(episodes):
+        state = env.reset()
+        for i in range(n):
+            trace[i] = 0.0
+        for _ in range(max_steps):
+            sample = rng.random()
+            cumulative = 0.0
+            action = "L"
+            for candidate, probability in zip(actions, policy[state]):
+                cumulative += probability
+                if cumulative > sample:
+                    action = candidate
+                    break
+            next_state, reward, done = env.step(action)
+            steps += 1
+            if not math.isfinite(reward):
+                raise ValueError("reward must remain finite")
+            for i in range(n):
+                trace[i] *= decay
+            s = index[state]
+            trace[s] += 1.0
+            for i in range(n):
+                if not math.isfinite(trace[i]):
+                    raise ValueError("eligibility trace must remain finite")
+            s2 = -1 if done else index[next_state]
+            for i in range(n):
+                zi = trace[i]
+                for j in range(n):
+                    on_state = 1.0 if j == s else 0.0
+                    if done:
+                        bootstrap = 0.0
+                    else:
+                        bootstrap = 1.0 if j == s2 else 0.0
+                    matrix_a[i][j] += zi * (on_state - gamma * bootstrap)
+                    if not math.isfinite(matrix_a[i][j]):
+                        raise ValueError("A matrix must remain finite")
+                vector_b[i] += zi * reward
+                if not math.isfinite(vector_b[i]):
+                    raise ValueError("b vector must remain finite")
+            if done:
+                break
+            state = next_state
+
+    for i in range(n):
+        matrix_a[i][i] += ridge_value
+        if not math.isfinite(matrix_a[i][i]):
+            raise ValueError("A matrix must remain finite")
+
+    augmented = [matrix_a[i] + [vector_b[i]] for i in range(n)]
+    for k in range(n):
+        pivot = k
+        best = abs(augmented[k][k])
+        for i in range(k + 1, n):
+            candidate = abs(augmented[i][k])
+            if candidate > best:
+                best = candidate
+                pivot = i
+        if best == 0.0:
+            raise RuntimeError("singular matrix: zero pivot encountered")
+        if pivot != k:
+            augmented[k], augmented[pivot] = (
+                augmented[pivot],
+                augmented[k],
+            )
+        pivot_value = augmented[k][k]
+        for j in range(k, n + 1):
+            augmented[k][j] /= pivot_value
+            if not math.isfinite(augmented[k][j]):
+                raise ValueError("matrix entries must remain finite")
+        for i in range(n):
+            if i == k:
+                continue
+            factor = augmented[i][k]
+            for j in range(k, n + 1):
+                augmented[i][j] -= factor * augmented[k][j]
+                if not math.isfinite(augmented[i][j]):
+                    raise ValueError("matrix entries must remain finite")
+    weights = [augmented[i][n] for i in range(n)]
+
+    values = {}
+    for cell in all_states:
+        if env._cell(cell) == "G":
+            values[cell] = 0.0
+        else:
+            values[cell] = float(weights[index[cell]])
+    return {"values": values, "steps": steps}
+
+
 def off_policy_td(
     env,
     behavior,
