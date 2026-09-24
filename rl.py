@@ -19106,6 +19106,136 @@ def ppo_trace_gate_consensus_history(items) -> dict:
     }
 
 
+def weighted_doubly_robust(trajectories, gamma=.9) -> dict:
+    """加权双重稳健估计，返回估计值与逐步贡献。
+
+    trajectories 须为非空 list，每项恰为 [v0, steps]；steps 为非空
+    list，每项恰为 [reward, q, next_v, rho, done]。v0 与步项前四个
+    字段为非 bool 的 int/float 且可转为有限 float，rho >= 0；done
+    为 bool 且仅末步可为 True。gamma 为非 bool 的 int/float 且属于
+    [0, 1)。类型错误抛 TypeError；空、长度、done 位置、转 float
+    溢出、非有限或越界抛 ValueError；输入不被修改。
+
+    每条轨迹置 W = 1.0，逐步作 W *= rho、
+    d = reward + gamma * (0.0 if done else next_v) - q。对零基 t
+    升序直至最长轨迹，仅取有第 t 步的轨迹，按输入序从 0.0 累加
+    Z = ΣW；Z == 0 时 C = 0.0，否则 C = Σ(W*d)/Z。baseline 为 v0
+    从 0.0 顺序累加的均值；estimate 从 baseline 按 t 升序累加
+    gamma**t * C。运算溢出或非有限抛 ValueError。
+
+    返回新 dict，键序为 estimate、contributions；estimate 为
+    float，contributions 为按 t 排列的 [t, count, Z, C] 列表，行
+    类型依次为 int、int、float、float。结果确定。
+    """
+    if not isinstance(trajectories, list):
+        raise TypeError("trajectories must be a list")
+    if isinstance(gamma, bool) or not isinstance(gamma, (int, float)):
+        raise TypeError("gamma must be an int or float")
+    if not trajectories:
+        raise ValueError("trajectories must be non-empty")
+    try:
+        gamma_float = float(gamma)
+    except OverflowError:
+        raise ValueError("gamma must convert to a finite float")
+    if not math.isfinite(gamma_float):
+        raise ValueError("gamma must be finite")
+    if not 0.0 <= gamma_float < 1.0:
+        raise ValueError("gamma must be in [0, 1)")
+
+    def _to_scalar(item, name):
+        if isinstance(item, bool) or not isinstance(item, (int, float)):
+            raise TypeError(f"{name} must be an int or float")
+        try:
+            result = float(item)
+        except OverflowError:
+            raise ValueError(f"{name} must convert to a finite float")
+        if not math.isfinite(result):
+            raise ValueError(f"{name} must be finite")
+        return result
+
+    prepared = []
+    for item in trajectories:
+        if not isinstance(item, list):
+            raise TypeError("every trajectory must be a list")
+        if len(item) != 2:
+            raise ValueError("every trajectory must have 2 fields")
+        v0, steps = item
+        v0_float = _to_scalar(v0, "v0")
+        if not isinstance(steps, list):
+            raise TypeError("steps must be a list")
+        if not steps:
+            raise ValueError("steps must be non-empty")
+        rows = []
+        for index, step in enumerate(steps):
+            if not isinstance(step, list):
+                raise TypeError("every step must be a list")
+            if len(step) != 5:
+                raise ValueError("every step must have 5 fields")
+            reward, q, next_v, rho, done = step
+            reward_float = _to_scalar(reward, "reward")
+            q_float = _to_scalar(q, "q")
+            next_v_float = _to_scalar(next_v, "next_v")
+            rho_float = _to_scalar(rho, "rho")
+            if rho_float < 0.0:
+                raise ValueError("rho must be >= 0")
+            if not isinstance(done, bool):
+                raise TypeError("done must be a bool")
+            if done and index != len(steps) - 1:
+                raise ValueError("done may be True only at the last step")
+            rows.append((reward_float, q_float, next_v_float,
+                         rho_float, done))
+        prepared.append((v0_float, rows))
+
+    weighted = []
+    for _, rows in prepared:
+        w = 1.0
+        pairs = []
+        for reward_float, q_float, next_v_float, rho_float, done in rows:
+            w = w * rho_float
+            if not math.isfinite(w):
+                raise ValueError("importance weight must stay finite")
+            d = reward_float + gamma_float * (
+                0.0 if done else next_v_float
+            ) - q_float
+            if not math.isfinite(d):
+                raise ValueError("td residual must stay finite")
+            pairs.append((w, d))
+        weighted.append(pairs)
+
+    baseline = 0.0
+    for v0_float, _ in prepared:
+        baseline += v0_float
+        if not math.isfinite(baseline):
+            raise ValueError("baseline must stay finite")
+    baseline /= len(prepared)
+
+    contributions = []
+    for t in range(max(len(pairs) for pairs in weighted)):
+        z = 0.0
+        wd_sum = 0.0
+        count = 0
+        for pairs in weighted:
+            if t < len(pairs):
+                w, d = pairs[t]
+                z += w
+                wd_sum += w * d
+                count += 1
+                if not math.isfinite(z) or not math.isfinite(wd_sum):
+                    raise ValueError("contribution sums must stay finite")
+        c = 0.0 if z == 0.0 else wd_sum / z
+        if not math.isfinite(c):
+            raise ValueError("contribution must stay finite")
+        contributions.append([t, count, z, c])
+
+    estimate = baseline
+    for t, _, _, c in contributions:
+        estimate += (gamma_float ** t) * c
+        if not math.isfinite(estimate):
+            raise ValueError("estimate must stay finite")
+
+    return {"estimate": estimate, "contributions": contributions}
+
+
 def _write_line(text):
     sys.stdout.buffer.write(text.encode("utf-8") + b"\n")
 
