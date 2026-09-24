@@ -4181,6 +4181,113 @@ def retrace(transitions, gamma=0.9, lambda_=0.9) -> dict:
     return {"targets": targets, "advantages": advantages}
 
 
+def segmented_gae(r, v, n, term, trunc, gamma=0.9, lambda_=0.95) -> dict:
+    """分段轨迹的广义优势估计，区分真正终止与时间截断。
+
+    返回固定键序 deltas、advantages、returns 的 dict。r（奖励）、
+    v（当前值）、n（后继值）、term（终止标记）、trunc（截断标记）
+    须为等长非空的 list/tuple；r、v、n 各元素为非 bool 的
+    int/float，term、trunc 各元素为 bool，且同一位置不得两个标记
+    同时为 True。gamma、lambda_ 为非 bool 的 int/float 标量且须在
+    [0, 1]。数值输入先复制并转换为 float（转换溢出或结果非有限均
+    抛 ValueError），不修改原序列。按 t 逆序计算
+    delta=r[t]+gamma*(0.0 if term[t] else n[t])-v[t]（真正终止不
+    自举，时间截断仍以 n[t] 自举）；令后继优势初值 0.0，
+    A[t]=delta+gamma*lambda_*(0.0 if term[t] or trunc[t] else
+    A[t+1])，终止与截断两类边界均切断优势递推。returns[t]=A[t]
+    +v[t]；中间量或输出非有限均抛 ValueError。三个列表均按原时序
+    排列为 float 新 list。
+    """
+    for name, seq in (
+        ("r", r),
+        ("v", v),
+        ("n", n),
+        ("term", term),
+        ("trunc", trunc),
+    ):
+        if not isinstance(seq, (list, tuple)):
+            raise TypeError(f"{name} must be a list or tuple")
+    if len(r) == 0:
+        raise ValueError("r, v, n, term and trunc must be non-empty")
+    if not (len(r) == len(v) == len(n) == len(term) == len(trunc)):
+        raise ValueError(
+            "r, v, n, term and trunc must have equal length"
+        )
+
+    def _to_float(item, name):
+        if isinstance(item, bool) or not isinstance(item, (int, float)):
+            raise TypeError(f"{name} must contain only int or float")
+        try:
+            result = float(item)
+        except OverflowError:
+            raise ValueError(f"{name} must convert to a finite float")
+        if not math.isfinite(result):
+            raise ValueError(f"{name} must contain only finite numbers")
+        return result
+
+    rewards = [_to_float(item, "r") for item in r]
+    values = [_to_float(item, "v") for item in v]
+    next_values = [_to_float(item, "n") for item in n]
+    for name, seq in (("term", term), ("trunc", trunc)):
+        for item in seq:
+            if not isinstance(item, bool):
+                raise TypeError(f"{name} must contain only bool")
+    for t in range(len(term)):
+        if term[t] and trunc[t]:
+            raise ValueError(
+                "term and trunc must not both be True at the same index"
+            )
+
+    def _to_scalar(item, name):
+        if isinstance(item, bool) or not isinstance(item, (int, float)):
+            raise TypeError(f"{name} must be an int or float")
+        try:
+            result = float(item)
+        except OverflowError:
+            raise ValueError(f"{name} must convert to a finite float")
+        if not math.isfinite(result):
+            raise ValueError(f"{name} must be finite")
+        return result
+
+    g = _to_scalar(gamma, "gamma")
+    l = _to_scalar(lambda_, "lambda_")
+    if g < 0.0 or g > 1.0:
+        raise ValueError("gamma must be in [0, 1]")
+    if l < 0.0 or l > 1.0:
+        raise ValueError("lambda_ must be in [0, 1]")
+
+    T = len(rewards)
+    deltas = [0.0] * T
+    advantages = [0.0] * T
+    next_advantage = 0.0
+    for t in range(T - 1, -1, -1):
+        delta = rewards[t] + g * (
+            0.0 if term[t] else next_values[t]
+        ) - values[t]
+        if not math.isfinite(delta):
+            raise ValueError("segmented gae delta must be finite")
+        if term[t] or trunc[t]:
+            advantage = delta
+        else:
+            advantage = delta + g * l * next_advantage
+        if not math.isfinite(advantage):
+            raise ValueError("advantage must be finite")
+        deltas[t] = delta
+        advantages[t] = advantage
+        next_advantage = advantage
+    returns = [0.0] * T
+    for t in range(T):
+        ret = advantages[t] + values[t]
+        if not math.isfinite(ret):
+            raise ValueError("return must be finite")
+        returns[t] = ret
+    return {
+        "deltas": deltas,
+        "advantages": advantages,
+        "returns": returns,
+    }
+
+
 def categorical_projection(
     rewards, dones, next_probs, gamma=0.99, v_min=-10.0, v_max=10.0, atoms=51
 ) -> dict:
