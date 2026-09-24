@@ -519,6 +519,165 @@ def ucb_q_learning(
     return {"q": q, "counts": counts}
 
 
+def qr_q(
+    env,
+    episodes=500,
+    alpha=0.05,
+    gamma=0.99,
+    epsilon=0.1,
+    n_quantiles=51,
+    kappa=1.0,
+    seed=0,
+    max_steps=1000,
+) -> dict:
+    """分位 Q-learning（quantile regression），返回键序 q、z 的 dict。
+
+    Z 覆盖从 S 可达的非 G 格与 U/R/D/L 的全部组合，键序为坐标升序
+    × URDL，每项为 n_quantiles 个 0.0 的列表，分位点
+    tau_i=(i+0.5)/n_quantiles。每回合 reset，单回合最多 max_steps
+    步；全部随机性来自一个 random.Random(seed)。
+
+    每步按 Z 均值对动作做 epsilon 贪心：每步调用 rng.random() 一次，
+    仅探索时调用 rng.randrange(4)，贪心按 URDL 顺序取首个最大均值。
+    step 后 done 时各分位目标 y_j=reward，否则按更新前的均值取
+    next 的贪心动作 b，令 y_j=reward+gamma*Z[next,b][j]；到达步限
+    截断时末步 done=False，仍照常自举。令 d=y_j-x_i，G_i 按 j 序
+    从 0.0 累加 abs(tau_i-(d<0))*min(max(d,-kappa),kappa)，并同步
+    取新值 x_i+alpha*G_i/n_quantiles。中间量或新值非有限时抛
+    ValueError。
+
+    返回的 q、z 键序相同；z 的值是独立的 float 列表，
+    q[key]=sum(z[key], 0.0)/n_quantiles。
+    """
+    if not isinstance(env, GridWorld):
+        raise TypeError("env must be a GridWorld")
+    if isinstance(episodes, bool) or not isinstance(episodes, int):
+        raise TypeError("episodes must be an int")
+    if isinstance(n_quantiles, bool) or not isinstance(n_quantiles, int):
+        raise TypeError("n_quantiles must be an int")
+    if isinstance(seed, bool) or not isinstance(seed, int):
+        raise TypeError("seed must be an int")
+    if isinstance(max_steps, bool) or not isinstance(max_steps, int):
+        raise TypeError("max_steps must be an int")
+    if isinstance(alpha, bool) or not isinstance(alpha, (int, float)):
+        raise TypeError("alpha must be an int or float")
+    if isinstance(gamma, bool) or not isinstance(gamma, (int, float)):
+        raise TypeError("gamma must be an int or float")
+    if isinstance(epsilon, bool) or not isinstance(epsilon, (int, float)):
+        raise TypeError("epsilon must be an int or float")
+    if isinstance(kappa, bool) or not isinstance(kappa, (int, float)):
+        raise TypeError("kappa must be an int or float")
+    try:
+        alpha = float(alpha)
+        gamma = float(gamma)
+        epsilon = float(epsilon)
+        kappa = float(kappa)
+    except OverflowError:
+        raise ValueError(
+            "parameter is too large to convert to float"
+        )
+    if episodes <= 0:
+        raise ValueError("episodes must be positive")
+    if max_steps <= 0:
+        raise ValueError("max_steps must be positive")
+    if n_quantiles < 2:
+        raise ValueError("n_quantiles must be at least 2")
+    if not math.isfinite(alpha) or alpha <= 0 or alpha > 1:
+        raise ValueError("alpha must be finite and in (0, 1]")
+    if not math.isfinite(gamma) or gamma < 0 or gamma >= 1:
+        raise ValueError("gamma must be finite and in [0, 1)")
+    if not math.isfinite(epsilon) or epsilon < 0 or epsilon > 1:
+        raise ValueError("epsilon must be finite and in [0, 1]")
+    if not math.isfinite(kappa) or kappa <= 0:
+        raise ValueError("kappa must be finite and in (0, +inf)")
+
+    actions = tuple(_ACTIONS)  # U, R, D, L
+    states = sorted(
+        state
+        for state in _reachable_cells(env)
+        if env._cell(state) != "G"
+    )
+    z = {
+        (state, action): [0.0] * n_quantiles
+        for state in states
+        for action in actions
+    }
+    taus = tuple(
+        (i + 0.5) / n_quantiles for i in range(n_quantiles)
+    )
+    rng = random.Random(seed)
+
+    for _episode in range(episodes):
+        state = env.reset()
+        for _step in range(max_steps):
+            if rng.random() < epsilon:
+                action = actions[rng.randrange(4)]
+            else:
+                best_action = None
+                best_mean = None
+                for candidate in actions:
+                    mean = sum(z[(state, candidate)], 0.0) / n_quantiles
+                    if not math.isfinite(mean):
+                        raise ValueError("quantile mean must be finite")
+                    if best_action is None or mean > best_mean:
+                        best_action = candidate
+                        best_mean = mean
+                action = best_action
+            next_state, reward, done = env.step(action)
+            if not math.isfinite(reward):
+                raise ValueError("reward must be finite")
+            if done:
+                targets = [reward] * n_quantiles
+            else:
+                best_next = None
+                best_next_mean = None
+                for candidate in actions:
+                    mean = (
+                        sum(z[(next_state, candidate)], 0.0)
+                        / n_quantiles
+                    )
+                    if not math.isfinite(mean):
+                        raise ValueError("quantile mean must be finite")
+                    if best_next is None or mean > best_next_mean:
+                        best_next = candidate
+                        best_next_mean = mean
+                targets = [
+                    reward + gamma * value
+                    for value in z[(next_state, best_next)]
+                ]
+            for target in targets:
+                if not math.isfinite(target):
+                    raise ValueError("quantile target must be finite")
+            x = z[(state, action)]
+            for i in range(n_quantiles):
+                tau = taus[i]
+                x_i = x[i]
+                gradient = 0.0
+                for j in range(n_quantiles):
+                    d = targets[j] - x_i
+                    if not math.isfinite(d):
+                        raise ValueError(
+                            "quantile difference must be finite"
+                        )
+                    gradient += abs(tau - (1.0 if d < 0 else 0.0)) * min(
+                        max(d, -kappa), kappa
+                    )
+                if not math.isfinite(gradient):
+                    raise ValueError("quantile gradient must be finite")
+                new_value = x_i + alpha * gradient / n_quantiles
+                if not math.isfinite(new_value):
+                    raise ValueError("quantile value must remain finite")
+                x[i] = new_value
+            if done:
+                break
+            state = next_state
+
+    q = {
+        key: sum(values, 0.0) / n_quantiles for key, values in z.items()
+    }
+    return {"q": q, "z": z}
+
+
 def q_learning_trace(
     env,
     episodes=500,
