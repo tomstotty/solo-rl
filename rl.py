@@ -12701,13 +12701,27 @@ def return_plateau_many(
         if seed in seen_seeds:
             raise ValueError(f"runs[{index}] seed must be distinct")
         seen_seeds.add(seed)
-        # 完整沿用 return_plateau 的 returns 契约，先全量校验。
-        return_plateau(
-            returns,
-            window=window,
-            tol=tol,
-            min_episodes=min_episodes,
-        )
+        # 完整沿用 return_plateau 的 returns 契约，先全量校验；
+        # 校验阶段不调用 return_plateau，保证每项恰调用一次。
+        if not isinstance(returns, (list, tuple)):
+            raise TypeError("returns must be a list or tuple")
+        if not returns:
+            raise ValueError("returns must be non-empty")
+        for value in returns:
+            if isinstance(value, bool) or not isinstance(
+                value, (int, float)
+            ):
+                raise TypeError(
+                    "every return must be a non-bool int or float"
+                )
+            try:
+                converted = float(value)
+            except OverflowError:
+                raise ValueError(
+                    "every return must be convertible to a finite float"
+                )
+            if not math.isfinite(converted):
+                raise ValueError("every return must be a finite number")
         validated.append((seed, returns))
 
     groups = []
@@ -12733,6 +12747,163 @@ def return_plateau_many(
         "rate": rate,
         "groups": groups,
         "failed": failed,
+    }
+
+
+def _validate_plateau_runs(runs, name):
+    """按 return_plateau_many 的 runs 契约校验，返回 (seed, returns) 列表。
+
+    异常类型与 return_plateau_many 的 runs 校验一致，消息中的
+    参数名由 name 给出；不修改输入。
+    """
+    if not isinstance(runs, list):
+        raise TypeError(f"{name} must be a list")
+    if not runs:
+        raise ValueError(f"{name} must not be empty")
+    validated = []
+    seen_seeds = set()
+    for index, item in enumerate(runs):
+        if not isinstance(item, list):
+            raise TypeError(f"{name}[{index}] must be a list")
+        if len(item) != 2:
+            raise ValueError(
+                f"{name}[{index}] must have exactly two elements"
+            )
+        seed, returns = item
+        if isinstance(seed, bool) or not isinstance(seed, int):
+            raise TypeError(f"{name}[{index}] seed must be a non-bool int")
+        if seed in seen_seeds:
+            raise ValueError(f"{name}[{index}] seed must be distinct")
+        seen_seeds.add(seed)
+        if not isinstance(returns, (list, tuple)):
+            raise TypeError("returns must be a list or tuple")
+        if not returns:
+            raise ValueError("returns must be non-empty")
+        for value in returns:
+            if isinstance(value, bool) or not isinstance(
+                value, (int, float)
+            ):
+                raise TypeError(
+                    "every return must be a non-bool int or float"
+                )
+            try:
+                converted = float(value)
+            except OverflowError:
+                raise ValueError(
+                    "every return must be convertible to a finite float"
+                )
+            if not math.isfinite(converted):
+                raise ValueError("every return must be a finite number")
+        validated.append((seed, returns))
+    return validated
+
+
+def return_plateau_regression(
+    base, new, window=20, tol=0.01, min_episodes=40, max_delay=0
+) -> dict:
+    """比较两组多种子平台期结果，按 seed 对齐判定回归，返回比较报告。
+
+    base、new 均须满足 return_plateau_many 的 runs 契约（非空
+    list，每项为恰含 [seed, returns] 的 list，seed 为互异的非
+    bool int，returns 沿用 return_plateau 契约），且两侧 seed
+    集合必须相同、顺序可异，不同抛 ValueError。window、tol、
+    min_episodes 的校验与异常完全沿用 return_plateau；max_delay
+    须为非 bool 的非负 int，错型抛 TypeError，负值抛 ValueError。
+    先完整校验全部输入，任一失败都不返回部分结果，且不修改输入；
+    验毕分别以 return_plateau_many(runs, window, tol,
+    min_episodes, minimum=1.0) 求得 base、new 两报告。
+
+    按 base 的 runs 序生成 rows，每行为 [seed, b, n, d, status]：
+    b、n 分别为 base、new 报告中该 seed 的 episode；仅当 b、n
+    均为 int 时 d = n - b，否则 d 为 None。status 判定：n 为
+    int 且（b 为 None 或 n < b）记 "improved"；b、n 均为 int 且
+    0 <= d <= max_delay 记 "stable"；d > max_delay 记 "late"；
+    仅 b 为 int 记 "lost"；其余记 "pending"。
+
+    返回键序为 passed、base、new、rows、regressed：base、new
+    为两份 return_plateau_many 的原样报告；regressed 按 rows
+    序列出 status 为 "late" 或 "lost" 的 seed；passed 当且仅当
+    regressed 为空。相同输入逐值一致，仅用标准库，不引入命令行
+    入口。
+    """
+    if isinstance(window, bool) or not isinstance(window, int):
+        raise TypeError("window must be an int")
+    if isinstance(min_episodes, bool) or not isinstance(min_episodes, int):
+        raise TypeError("min_episodes must be an int")
+    if isinstance(tol, bool) or not isinstance(tol, (int, float)):
+        raise TypeError("tol must be an int or float")
+    if window <= 0:
+        raise ValueError("window must be positive")
+    if min_episodes <= 0:
+        raise ValueError("min_episodes must be positive")
+    try:
+        tolerance = float(tol)
+    except OverflowError:
+        raise ValueError("tol must be convertible to a finite float")
+    if not math.isfinite(tolerance) or tolerance < 0:
+        raise ValueError("tol must be finite and >= 0")
+
+    if isinstance(max_delay, bool) or not isinstance(max_delay, int):
+        raise TypeError("max_delay must be an int")
+    if max_delay < 0:
+        raise ValueError("max_delay must be non-negative")
+
+    base_validated = _validate_plateau_runs(base, "base")
+    new_validated = _validate_plateau_runs(new, "new")
+    if {seed for seed, _ in base_validated} != {
+        seed for seed, _ in new_validated
+    }:
+        raise ValueError("base and new must have the same seeds")
+
+    base_report = return_plateau_many(
+        base,
+        window=window,
+        tol=tol,
+        min_episodes=min_episodes,
+        minimum=1.0,
+    )
+    new_report = return_plateau_many(
+        new,
+        window=window,
+        tol=tol,
+        min_episodes=min_episodes,
+        minimum=1.0,
+    )
+
+    new_episodes = {
+        group["seed"]: group["report"]["episode"]
+        for group in new_report["groups"]
+    }
+    rows = []
+    regressed = []
+    for group in base_report["groups"]:
+        seed = group["seed"]
+        b = group["report"]["episode"]
+        n = new_episodes[seed]
+        if isinstance(b, int) and isinstance(n, int):
+            d = n - b
+        else:
+            d = None
+        if isinstance(n, int) and (b is None or n < b):
+            status = "improved"
+        elif d is not None and 0 <= d <= max_delay:
+            status = "stable"
+        elif d is not None:
+            status = "late"
+        elif isinstance(b, int):
+            status = "lost"
+        else:
+            status = "pending"
+        rows.append([seed, b, n, d, status])
+        if status in ("late", "lost"):
+            regressed.append(seed)
+
+    return {
+        "passed": not regressed,
+        "base": base_report,
+        "new": new_report,
+        "rows": rows,
+        "regressed": regressed,
     }
 
 
