@@ -2756,8 +2756,9 @@ def annealed_boltzmann_q(
     decay_episodes=500,
     seed=0,
     max_steps=1000,
+    mode="linear",
 ) -> dict:
-    """温度线性退火的 Boltzmann(softmax) 探索 Q-learning，返回
+    """温度退火的 Boltzmann(softmax) 探索 Q-learning，返回
     {((row, col), action): float}。
 
     Q 覆盖从 S 可达的非 G 格与 U/R/D/L 的全部组合，初始为 0.0。
@@ -2765,7 +2766,10 @@ def annealed_boltzmann_q(
     全部随机性来自一个 random.Random(seed)。
 
     第 e 回合（0 起）的温度 T：e>=decay_episodes 时 T=temp_end，
-    否则令 t=e/decay_episodes、T=temp_start+(temp_end-temp_start)*t。
+    否则令 t=e/decay_episodes；mode="linear" 时
+    T=temp_start+(temp_end-temp_start)*t，mode="cosine" 时
+    T=temp_end+(temp_start-temp_end)*(1+cos(pi*t))/2。调度运算
+    溢出或 T 非有限抛 ValueError，且该回合不 reset、不 step。
     每步按 URDL 令 m=max_a Q[s,a]、w[a]=exp((Q[s,a]-m)/T)、
     z=sum(w,0.0)，取 u=rng.random()*z，从 0.0 按 URDL 累加 w 并
     选择首个累计值严格大于 u 的动作，未命中取 L。step 后 done 时
@@ -2794,6 +2798,8 @@ def annealed_boltzmann_q(
         raise TypeError("decay_episodes must be an int")
     if isinstance(max_steps, bool) or not isinstance(max_steps, int):
         raise TypeError("max_steps must be an int")
+    if not isinstance(mode, str):
+        raise TypeError("mode must be a str")
     if episodes <= 0:
         raise ValueError("episodes must be positive")
     if not _is_finite_number(alpha) or alpha <= 0 or alpha > 1:
@@ -2816,6 +2822,8 @@ def annealed_boltzmann_q(
         raise ValueError("decay_episodes must be positive")
     if max_steps <= 0:
         raise ValueError("max_steps must be positive")
+    if mode not in ("linear", "cosine"):
+        raise ValueError("mode must be 'linear' or 'cosine'")
 
     actions = tuple(_ACTIONS)  # U, R, D, L
     q = {
@@ -2831,7 +2839,17 @@ def annealed_boltzmann_q(
             temp = temp_end
         else:
             t = episode / decay_episodes
-            temp = temp_start + (temp_end - temp_start) * t
+            try:
+                if mode == "linear":
+                    temp = temp_start + (temp_end - temp_start) * t
+                else:
+                    temp = temp_end + (temp_start - temp_end) * (
+                        1.0 + math.cos(math.pi * t)
+                    ) / 2.0
+            except OverflowError:
+                raise ValueError("temperature schedule must not overflow")
+            if not math.isfinite(temp):
+                raise ValueError("temperature must remain finite")
         state = env.reset()
         for _ in range(max_steps):
             m = max(q[(state, a)] for a in actions)
