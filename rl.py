@@ -7466,6 +7466,151 @@ def retrace(transitions, gamma=0.9, lambda_=0.9) -> dict:
     return {"targets": targets, "advantages": advantages}
 
 
+def weighted_doubly_robust(trajectories, gamma=0.9) -> dict:
+    """加权双重鲁棒离线评估，按步对齐多条轨迹的重要性权重。
+
+    trajectories 须为非空 list，每项恰为二元 list [v0, steps]；
+    steps 须为非空 list，每步恰为五元 list
+    [reward, q, next_v, rho, done]。v0 与 reward、q、next_v、rho
+    为非 bool 的 int/float，rho 须 >= 0；done 为 bool 且仅末步
+    可为 True。gamma 为非 bool 的 int/float 且须在 [0, 1)。错型
+    抛 TypeError；空、长度、done 位置、转 float 溢出、非有限或
+    越界抛 ValueError。所有数值先复制并转换为 float，不修改输入。
+
+    每轨迹自 W=1.0 逐步作 W*=rho、
+    d=reward+gamma*(0.0 if done else next_v)-q。对零基 t 升序
+    直至最长轨迹，仅取有第 t 步的轨迹，按输入序自 0.0 累加
+    Z=ΣW 与 Σ(W*d)；Z==0.0 时 C=0.0，否则 C=Σ(W*d)/Z。baseline
+    为各 v0 自 0.0 按序累加后除以轨迹数；estimate 自 baseline
+    按 t 升序累加 gamma**t*C。中间量或输出非有限均抛
+    ValueError。
+
+    返回新 dict，键序 estimate、contributions：estimate 为
+    float；contributions 为按 t 排列的 [t, count, Z, C] 新
+    list，行类型依次 int、int、float、float。同参结果逐值一致。
+    """
+    if not isinstance(trajectories, list):
+        raise TypeError("trajectories must be a list")
+    if len(trajectories) == 0:
+        raise ValueError("trajectories must be non-empty")
+
+    def _to_float(item, name):
+        if isinstance(item, bool) or not isinstance(item, (int, float)):
+            raise TypeError(f"{name} must be an int or float")
+        try:
+            result = float(item)
+        except OverflowError:
+            raise ValueError(f"{name} must convert to a finite float")
+        if not math.isfinite(result):
+            raise ValueError(f"{name} must be finite")
+        return result
+
+    v0_values = []
+    episodes = []
+    for item in trajectories:
+        if not isinstance(item, list):
+            raise TypeError("every trajectory must be a list")
+        if len(item) != 2:
+            raise ValueError(
+                "every trajectory must be exactly [v0, steps]"
+            )
+        v0 = _to_float(item[0], "v0")
+        steps = item[1]
+        if not isinstance(steps, list):
+            raise TypeError("steps must be a list")
+        if len(steps) == 0:
+            raise ValueError("steps must be non-empty")
+        rows = []
+        last = len(steps) - 1
+        for index, step in enumerate(steps):
+            if not isinstance(step, list):
+                raise TypeError("every step must be a list")
+            if len(step) != 5:
+                raise ValueError(
+                    "every step must be exactly "
+                    "[reward, q, next_v, rho, done]"
+                )
+            reward = _to_float(step[0], "reward")
+            q = _to_float(step[1], "q")
+            next_v = _to_float(step[2], "next_v")
+            rho = _to_float(step[3], "rho")
+            if rho < 0.0:
+                raise ValueError("rho must be >= 0")
+            done = step[4]
+            if not isinstance(done, bool):
+                raise TypeError("done must be a bool")
+            if done and index != last:
+                raise ValueError(
+                    "done may be True only at the last step"
+                )
+            rows.append((reward, q, next_v, rho, done))
+        v0_values.append(v0)
+        episodes.append(rows)
+
+    if isinstance(gamma, bool) or not isinstance(gamma, (int, float)):
+        raise TypeError("gamma must be an int or float")
+    try:
+        g = float(gamma)
+    except OverflowError:
+        raise ValueError("gamma must convert to a finite float")
+    if not math.isfinite(g):
+        raise ValueError("gamma must be finite")
+    if g < 0.0 or g >= 1.0:
+        raise ValueError("gamma must be in [0, 1)")
+
+    weighted = []
+    for rows in episodes:
+        pairs = []
+        w = 1.0
+        for reward, q, next_v, rho, done in rows:
+            w *= rho
+            if not math.isfinite(w):
+                raise ValueError("importance weight must remain finite")
+            delta = reward + g * (0.0 if done else next_v) - q
+            if not math.isfinite(delta):
+                raise ValueError("TD delta must remain finite")
+            pairs.append((w, delta))
+        weighted.append(pairs)
+
+    baseline = 0.0
+    for v0 in v0_values:
+        baseline += v0
+        if not math.isfinite(baseline):
+            raise ValueError("baseline sum must remain finite")
+    baseline /= len(v0_values)
+    if not math.isfinite(baseline):
+        raise ValueError("baseline must remain finite")
+
+    max_length = max(len(pairs) for pairs in weighted)
+    contributions = []
+    estimate = baseline
+    for t in range(max_length):
+        z = 0.0
+        weighted_delta = 0.0
+        count = 0
+        for pairs in weighted:
+            if t < len(pairs):
+                w, delta = pairs[t]
+                z += w
+                if not math.isfinite(z):
+                    raise ValueError("weight sum must remain finite")
+                weighted_delta += w * delta
+                if not math.isfinite(weighted_delta):
+                    raise ValueError(
+                        "weighted delta sum must remain finite"
+                    )
+                count += 1
+        c = 0.0 if z == 0.0 else weighted_delta / z
+        if not math.isfinite(c):
+            raise ValueError("contribution must remain finite")
+        contributions.append([t, count, z, c])
+        estimate += g**t * c
+        if not math.isfinite(estimate):
+            raise ValueError("estimate must remain finite")
+
+    return {"estimate": estimate, "contributions": contributions}
+
+
 def segmented_gae(r, v, n, term, trunc, gamma=0.9, lambda_=0.95) -> dict:
     """分段轨迹的广义优势估计，区分真正终止与时间截断。
 
