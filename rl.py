@@ -12629,6 +12629,87 @@ def return_plateau(returns, window=20, tol=0.01, min_episodes=40) -> dict:
     }
 
 
+def return_plateau_many(
+    runs, window=20, tol=0.01, min_episodes=40, minimum=1.0
+) -> dict:
+    """对多组带 seed 的逐回合 return 批量判定平台期并汇总。
+
+    runs 须为非空 list，每项须为恰含两个元素的 list [seed, returns]：
+    runs 非 list 或项非 list、seed 类型错抛 TypeError；runs 为空、项
+    长度不为 2、seed 重复抛 ValueError。seed 须为互异的非 bool int。
+    returns 及 window、tol、min_episodes 的校验与异常完全沿用
+    return_plateau；校验阶段即逐项调用原函数，任一失败都不返回部分
+    结果。minimum 须为非 bool 的 int/float，错型抛 TypeError；转 float
+    溢出、非有限或越出 [0, 1] 抛 ValueError。
+
+    全量校验通过且不修改输入后，按 runs 序逐项调用
+    return_plateau(returns, window, tol, min_episodes)。返回键序恰为
+    converged、count、rate、groups、failed：count 为收敛数，rate 为
+    count 除以项数的 float，converged 仅当 rate >= float(minimum)；
+    groups 与 runs 同序，每项为键序 seed、report 的 dict，report 为
+    return_plateau 的原样结果；failed 按 runs 序列出未收敛的 seed。
+    重复调用逐值一致，仅用标准库，不引入命令行入口。
+    """
+    if not isinstance(runs, list):
+        raise TypeError("runs must be a list")
+    if not runs:
+        raise ValueError("runs must not be empty")
+
+    seen_seeds = set()
+    for index, item in enumerate(runs):
+        if not isinstance(item, list):
+            raise TypeError(f"runs[{index}] must be a list")
+        if len(item) != 2:
+            raise ValueError(
+                f"runs[{index}] must be exactly [seed, returns]"
+            )
+        seed, returns = item
+        if isinstance(seed, bool) or not isinstance(seed, int):
+            raise TypeError(f"runs[{index}] seed must be a non-bool int")
+        if seed in seen_seeds:
+            raise ValueError(f"runs[{index}] seed must be unique")
+        seen_seeds.add(seed)
+        # 完整沿用 return_plateau 的入参与成员契约，先全量校验。
+        return_plateau(
+            returns, window=window, tol=tol, min_episodes=min_episodes
+        )
+
+    if isinstance(minimum, bool) or not isinstance(minimum, (int, float)):
+        raise TypeError("minimum must be a non-bool int or float")
+    try:
+        minimum_rate = float(minimum)
+    except OverflowError:
+        raise ValueError(
+            "minimum must be convertible to float"
+        ) from None
+    if not math.isfinite(minimum_rate):
+        raise ValueError("minimum must be finite")
+    if minimum_rate < 0.0 or minimum_rate > 1.0:
+        raise ValueError("minimum must be in [0, 1]")
+
+    groups = []
+    failed = []
+    count = 0
+    for seed, returns in runs:
+        report = return_plateau(
+            returns, window=window, tol=tol, min_episodes=min_episodes
+        )
+        groups.append({"seed": seed, "report": report})
+        if report["converged"]:
+            count += 1
+        else:
+            failed.append(seed)
+
+    rate = count / len(runs)
+    return {
+        "converged": rate >= minimum_rate,
+        "count": count,
+        "rate": rate,
+        "groups": groups,
+        "failed": failed,
+    }
+
+
 def ppo_seed_convergence_report(
     runs, window=20, tolerance=0.01, patience=3
 ) -> dict:
