@@ -2328,6 +2328,124 @@ def boltzmann_q(
     return q
 
 
+def soft_q_learning(
+    env,
+    episodes=500,
+    alpha=0.5,
+    gamma=0.9,
+    temp=1.0,
+    seed=0,
+    max_steps=1000,
+) -> dict:
+    """软 Q-learning：以软最大值自举的最大熵表格控制。
+
+    返回 {"q": Q, "policy": 最终软策略}，键序为 q、policy。
+
+    Q 覆盖从 S 可达的非 G 格与 U/R/D/L 的全部组合，初始为 0.0。
+    每回合 reset，单回合最多 max_steps 步，末步未终止仍自举。
+    全部随机性来自一个 random.Random(seed)。
+
+    每步按 URDL 令 m=max_a Q[s,a]、w[a]=exp((Q[s,a]-m)/temp)、
+    z=sum(w,0.0)，取 u=rng.random()*z，从 0.0 按 URDL 累加 w 并
+    选择首个累计值严格大于 u 的动作，未命中取 L。step 后 done 时
+    目标为 r，否则在下一状态按 URDL 令 m=max_a Q[s2,a]、
+    z=sum(exp((Q[s2,a]-m)/temp),0.0)、soft=m+temp*log(z)，
+    目标为 r+gamma*soft，作 Q[s,a]+=alpha*(目标-Q[s,a])；
+    exp 下溢为 0.0 合法，m、z、soft、目标或新 Q 溢出/非有限
+    抛 ValueError。policy 为与 Q 同键序的独立 dict，各值为最终
+    Q 按该温度稳定 softmax 得到的 float 概率。
+    """
+    if not isinstance(env, GridWorld):
+        raise TypeError("env must be a GridWorld")
+    if isinstance(episodes, bool) or not isinstance(episodes, int):
+        raise TypeError("episodes must be an int")
+    if isinstance(seed, bool) or not isinstance(seed, int):
+        raise TypeError("seed must be an int")
+    if isinstance(alpha, bool) or not isinstance(alpha, (int, float)):
+        raise TypeError("alpha must be an int or float")
+    if isinstance(gamma, bool) or not isinstance(gamma, (int, float)):
+        raise TypeError("gamma must be an int or float")
+    if isinstance(temp, bool) or not isinstance(temp, (int, float)):
+        raise TypeError("temp must be an int or float")
+    if isinstance(max_steps, bool) or not isinstance(max_steps, int):
+        raise TypeError("max_steps must be an int")
+    if episodes <= 0:
+        raise ValueError("episodes must be positive")
+    if not _is_finite_number(alpha) or alpha <= 0 or alpha > 1:
+        raise ValueError("alpha must be finite and in (0, 1]")
+    if not _is_finite_number(gamma) or gamma < 0 or gamma >= 1:
+        raise ValueError("gamma must be finite and in [0, 1)")
+    try:
+        temp = float(temp)
+    except OverflowError:
+        raise ValueError("temp must convert to a finite float")
+    if not math.isfinite(temp) or temp <= 0:
+        raise ValueError("temp must be finite and > 0")
+    if max_steps <= 0:
+        raise ValueError("max_steps must be positive")
+
+    actions = tuple(_ACTIONS)  # U, R, D, L
+    states = [
+        state
+        for state in sorted(_reachable_cells(env))
+        if env._cell(state) != "G"
+    ]
+    q = {(state, action): 0.0 for state in states for action in actions}
+    rng = random.Random(seed)
+
+    for _ in range(episodes):
+        state = env.reset()
+        for _ in range(max_steps):
+            m = max(q[(state, a)] for a in actions)
+            w = [math.exp((q[(state, a)] - m) / temp) for a in actions]
+            z = sum(w, 0.0)
+            u = rng.random() * z
+            cumulative = 0.0
+            action = "L"
+            for a, weight in zip(actions, w):
+                cumulative += weight
+                if cumulative > u:
+                    action = a
+                    break
+            next_state, reward, done = env.step(action)
+            if done:
+                target = reward
+            else:
+                m = max(q[(next_state, a)] for a in actions)
+                if not math.isfinite(m):
+                    raise ValueError("soft max must remain finite")
+                z = sum(
+                    (math.exp((q[(next_state, a)] - m) / temp) for a in actions),
+                    0.0,
+                )
+                if not math.isfinite(z):
+                    raise ValueError("soft partition must remain finite")
+                soft = m + temp * math.log(z)
+                if not math.isfinite(soft):
+                    raise ValueError("soft value must remain finite")
+                target = reward + gamma * soft
+                if not math.isfinite(target):
+                    raise ValueError("target must remain finite")
+            key = (state, action)
+            new_value = q[key] + alpha * (target - q[key])
+            if not math.isfinite(new_value):
+                raise ValueError("Q value must remain finite")
+            q[key] = new_value
+            if done:
+                break
+            state = next_state
+
+    policy = {}
+    for state in states:
+        m = max(q[(state, a)] for a in actions)
+        z = sum(
+            (math.exp((q[(state, a)] - m) / temp) for a in actions), 0.0
+        )
+        for a in actions:
+            policy[(state, a)] = math.exp((q[(state, a)] - m) / temp) / z
+    return {"q": q, "policy": policy}
+
+
 def annealed_boltzmann_q(
     env,
     episodes=500,
