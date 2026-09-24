@@ -3941,6 +3941,116 @@ def generalized_advantage_estimate(
     return {"advantages": A, "returns": returns}
 
 
+def segmented_gae(r, v, n, term, trunc, gamma=0.9, lambda_=0.95) -> dict:
+    """分段轨迹的 GAE，区分真正终止与时间截断，返回固定键序
+    deltas、advantages、returns 的 dict。
+
+    r（奖励）、v（价值）、n（后继价值）须为等长非空的 list/tuple，
+    各元素为非 bool 的 int/float；term（终止）、trunc（截断）须为
+    等长非空的 list/tuple，各元素仅为 bool，且同一位置不得同时为
+    True。gamma、lambda_ 为非 bool 的 int/float 标量，须在 [0, 1]。
+    所有数值输入先复制并转换为 float（转换溢出或结果非有限均抛
+    ValueError），不修改原序列。逆序递推
+    delta[t]=r[t]+gamma*(0.0 if term[t] else n[t])-v[t]（终止不再
+    自举，截断仍以 n[t] 自举）；后继优势初值为 0.0，
+    A[t]=delta[t]+gamma*lambda_*(0.0 if term[t] or trunc[t] else
+    A[t+1])，终止与截断两类边界均切断递推。returns[t]=A[t]+v[t]；
+    三个列表均按原时序排列。中间量或输出非有限均抛 ValueError。
+    """
+    for name, seq in (
+        ("r", r),
+        ("v", v),
+        ("n", n),
+        ("term", term),
+        ("trunc", trunc),
+    ):
+        if not isinstance(seq, (list, tuple)):
+            raise TypeError(f"{name} must be a list or tuple")
+    if (
+        len(r) == 0
+        or len(v) == 0
+        or len(n) == 0
+        or len(term) == 0
+        or len(trunc) == 0
+    ):
+        raise ValueError("r, v, n, term and trunc must be non-empty")
+    if not len(r) == len(v) == len(n) == len(term) == len(trunc):
+        raise ValueError("r, v, n, term and trunc must have equal length")
+
+    def _to_float(item, name):
+        if isinstance(item, bool) or not isinstance(item, (int, float)):
+            raise TypeError(f"{name} must contain only int or float")
+        try:
+            result = float(item)
+        except OverflowError:
+            raise ValueError(f"{name} must convert to a finite float")
+        if not math.isfinite(result):
+            raise ValueError(f"{name} must contain only finite numbers")
+        return result
+
+    rewards = [_to_float(item, "r") for item in r]
+    values = [_to_float(item, "v") for item in v]
+    next_values = [_to_float(item, "n") for item in n]
+
+    terminated = []
+    for item in term:
+        if not isinstance(item, bool):
+            raise TypeError("term must contain only bool")
+        terminated.append(item)
+    truncated = []
+    for item in trunc:
+        if not isinstance(item, bool):
+            raise TypeError("trunc must contain only bool")
+        truncated.append(item)
+    for t in range(len(terminated)):
+        if terminated[t] and truncated[t]:
+            raise ValueError("term and trunc must not both be True at an index")
+
+    def _to_scalar(item, name):
+        if isinstance(item, bool) or not isinstance(item, (int, float)):
+            raise TypeError(f"{name} must be an int or float")
+        try:
+            result = float(item)
+        except OverflowError:
+            raise ValueError(f"{name} must convert to a finite float")
+        if not math.isfinite(result):
+            raise ValueError(f"{name} must be finite")
+        return result
+
+    g = _to_scalar(gamma, "gamma")
+    l = _to_scalar(lambda_, "lambda_")
+    if g < 0.0 or g > 1.0:
+        raise ValueError("gamma must be in [0, 1]")
+    if l < 0.0 or l > 1.0:
+        raise ValueError("lambda_ must be in [0, 1]")
+
+    T = len(rewards)
+    deltas = [0.0] * T
+    advantages = [0.0] * T
+    next_adv = 0.0
+    for t in range(T - 1, -1, -1):
+        bootstrap = 0.0 if terminated[t] else next_values[t]
+        d = rewards[t] + g * bootstrap - values[t]
+        if not math.isfinite(d):
+            raise ValueError("delta must be finite")
+        deltas[t] = d
+        successor_adv = (
+            0.0 if (terminated[t] or truncated[t]) else next_adv
+        )
+        a = d + g * l * successor_adv
+        if not math.isfinite(a):
+            raise ValueError("advantage must be finite")
+        advantages[t] = a
+        next_adv = a
+    returns = []
+    for t in range(T):
+        ret = advantages[t] + values[t]
+        if not math.isfinite(ret):
+            raise ValueError("return must be finite")
+        returns.append(ret)
+    return {"deltas": deltas, "advantages": advantages, "returns": returns}
+
+
 def vtrace(
     rewards,
     values,
