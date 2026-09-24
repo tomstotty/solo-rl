@@ -5077,10 +5077,11 @@ def off_policy_mc_converge(
     每逢 check_every 回合（1 基，即第 check_every、2*check_every、…
     回合完成后）及最终回合完成后作一次检查，检查只读取 V 表、不消费
     任何随机数：D 为全部可达格（含 G）上 V 与上次快照各键最大绝对差，
-    首次检查时快照为全 0.0 的同键 dict，随后以当前 V 更新快照；D 非
-    有限抛 ValueError。checks 追加 [episode, D, D<=tolerance]，三项
-    依次为 int、float、bool，episode 为 1 基回合号。连续 patience 行
-    末项为真即在该回合后停止训练，否则跑满 episodes 回合。
+    首次检查时快照为全 0.0 的同键 dict；任一格差非有限即在写入 checks
+    或更新快照前抛 ValueError，随后以当前 V 更新快照。checks 追加
+    [episode, D, D<=tolerance]，三项依次为 int、float、bool，episode
+    为 1 基回合号。连续 patience 行末项为真即在该回合后停止训练，
+    否则跑满 episodes 回合。
 
     episodes 为实际运行的回合记录，结构同 off_policy_mc_prediction；
     converged 表示是否命中早停；实际运行 k 回合时 values、weights、
@@ -5258,10 +5259,10 @@ def off_policy_mc_converge(
             delta = 0.0
             for cell in all_states:
                 change = abs(v[cell] - snapshot[cell])
+                if not math.isfinite(change):
+                    raise ValueError("convergence delta must be finite")
                 if change > delta:
                     delta = change
-            if not math.isfinite(delta):
-                raise ValueError("convergence delta must be finite")
             passed = delta <= tolerance
             checks.append([ran, delta, passed])
             snapshot = dict(v)
@@ -5279,6 +5280,110 @@ def off_policy_mc_converge(
         "episodes": history,
         "checks": checks,
         "converged": converged,
+    }
+
+
+def off_policy_mc_converge_many(
+    env,
+    behavior,
+    target,
+    seeds,
+    episodes=500,
+    minimum=0.8,
+    spread=0.01,
+) -> dict:
+    """按多种子顺序独立运行 off_policy_mc_converge 并汇总跨种子离散度。
+
+    seeds 须为非空 list/tuple，成员为非 bool 的 int，允许重复，全程
+    不修改 seeds 及其成员，也不修改 behavior、target；容器或成员类型
+    不符抛 TypeError，空 seeds 抛 ValueError。minimum、spread 须为非
+    bool 的 int/float，类型不符抛 TypeError；转 float 溢出、非有限，
+    或 minimum 越出 [0, 1]、spread 越出 [0, +∞) 抛 ValueError。env、
+    behavior、target 及 episodes 等训练参数的校验与异常分类沿用
+    off_policy_mc_converge，全部校验在首次 reset 前完成。
+
+    随后按 seeds 顺序逐项独立调用 off_policy_mc_converge，每项仅替换
+    seed（各自独立的随机流），gamma、max_steps、check_every、
+    tolerance、patience 固定沿用单次接口默认值，env 无需恢复。
+
+    返回键依次为 results、rate、spreads、converged：results 与 seeds
+    同序，每项为 [seed, report] 行，report 为 off_policy_mc_converge
+    的完整返回值。rate 为 report.converged 为真的项数除以项数所得
+    float。spreads 按可达格坐标升序排列（含 G），每行
+    [r, c, min, max, gap]，后三项依次取各 report.values 同格值转
+    float 后的最小值、最大值与最大减最小之差；汇总值非有限抛
+    ValueError。converged 仅当 rate >= minimum 且所有 gap <= spread。
+    相同输入逐值一致。仅用标准库，不引入命令行入口。
+    """
+    if not isinstance(seeds, (list, tuple)):
+        raise TypeError("seeds must be a list or tuple")
+    if not seeds:
+        raise ValueError("seeds must be non-empty")
+    for seed in seeds:
+        if isinstance(seed, bool) or not isinstance(seed, int):
+            raise TypeError("every seed must be a non-bool int")
+
+    if isinstance(minimum, bool) or not isinstance(minimum, (int, float)):
+        raise TypeError("minimum must be an int or float")
+    try:
+        minimum_threshold = float(minimum)
+    except OverflowError:
+        raise ValueError("minimum must be finite")
+    if not math.isfinite(minimum_threshold):
+        raise ValueError("minimum must be finite and in [0, 1]")
+    if minimum_threshold < 0.0 or minimum_threshold > 1.0:
+        raise ValueError("minimum must be finite and in [0, 1]")
+
+    if isinstance(spread, bool) or not isinstance(spread, (int, float)):
+        raise TypeError("spread must be an int or float")
+    try:
+        spread_threshold = float(spread)
+    except OverflowError:
+        raise ValueError("spread must be finite")
+    if not math.isfinite(spread_threshold):
+        raise ValueError("spread must be finite and non-negative")
+    if spread_threshold < 0.0:
+        raise ValueError("spread must be finite and non-negative")
+
+    results = []
+    for seed in seeds:
+        report = off_policy_mc_converge(
+            env,
+            behavior,
+            target,
+            episodes=episodes,
+            seed=seed,
+        )
+        results.append([seed, report])
+
+    rate = sum(1 for item in results if item[1]["converged"]) / len(seeds)
+
+    cells = sorted(results[0][1]["values"])
+    spreads = []
+    all_within = True
+    for cell in cells:
+        values = []
+        for item in results:
+            value = float(item[1]["values"][cell])
+            if not math.isfinite(value):
+                raise ValueError("aggregated value must be finite")
+            values.append(value)
+        lo = min(values)
+        hi = max(values)
+        gap = hi - lo
+        if not math.isfinite(lo) or not math.isfinite(hi):
+            raise ValueError("spread bounds must be finite")
+        if not math.isfinite(gap):
+            raise ValueError("spread gap must be finite")
+        if gap > spread_threshold:
+            all_within = False
+        spreads.append([cell[0], cell[1], lo, hi, gap])
+
+    return {
+        "results": results,
+        "rate": rate,
+        "spreads": spreads,
+        "converged": rate >= minimum_threshold and all_within,
     }
 
 
