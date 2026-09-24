@@ -21169,6 +21169,218 @@ def ppo_trace_gate_consensus_history(items) -> dict:
     }
 
 
+def _validate_actor_critic_snapshot(data, name):
+    """校验一份 actor-critic 快照。
+
+    data 须为键序恰为 h、v 的 dict；h 行恰为
+    [r, c, hU, hR, hD, hL]，v 行恰为 [r, c, V]，元素均为有限
+    float；两表均非空，坐标各自升序唯一，且 h、v 坐标序列相同。
+    容器或元素错型抛 TypeError，其余违约抛 ValueError；不修改
+    输入。返回 (coords, h_logits, v_values)：coords 为 (r, c)
+    元组列表，h_logits 为四元组列表，v_values 为 float 列表。
+    """
+    if not isinstance(data, dict):
+        raise TypeError(f"{name} must be a dict")
+    if list(data) != ["h", "v"]:
+        raise ValueError(
+            f"{name} keys must be exactly ['h', 'v'] in order"
+        )
+    h = data["h"]
+    v = data["v"]
+    if not isinstance(h, list):
+        raise TypeError(f"{name} h must be a list")
+    if not isinstance(v, list):
+        raise TypeError(f"{name} v must be a list")
+    if not h:
+        raise ValueError(f"{name} h must be non-empty")
+    if not v:
+        raise ValueError(f"{name} v must be non-empty")
+    coords = []
+    h_logits = []
+    for index, row in enumerate(h):
+        row_name = f"{name} h[{index}]"
+        if not isinstance(row, list):
+            raise TypeError(f"{row_name} must be a list")
+        if len(row) != 6:
+            raise ValueError(
+                f"{row_name} must contain exactly six fields"
+            )
+        for item in row:
+            if not isinstance(item, float):
+                raise TypeError(f"{row_name} must contain only float")
+            if not math.isfinite(item):
+                raise ValueError(
+                    f"{row_name} must contain only finite float"
+                )
+        coord = (row[0], row[1])
+        if coords and coord <= coords[-1]:
+            raise ValueError(
+                f"{name} h coordinates must be ascending and unique"
+            )
+        coords.append(coord)
+        h_logits.append((row[2], row[3], row[4], row[5]))
+    v_coords = []
+    v_values = []
+    for index, row in enumerate(v):
+        row_name = f"{name} v[{index}]"
+        if not isinstance(row, list):
+            raise TypeError(f"{row_name} must be a list")
+        if len(row) != 3:
+            raise ValueError(
+                f"{row_name} must contain exactly three fields"
+            )
+        for item in row:
+            if not isinstance(item, float):
+                raise TypeError(f"{row_name} must contain only float")
+            if not math.isfinite(item):
+                raise ValueError(
+                    f"{row_name} must contain only finite float"
+                )
+        coord = (row[0], row[1])
+        if v_coords and coord <= v_coords[-1]:
+            raise ValueError(
+                f"{name} v coordinates must be ascending and unique"
+            )
+        v_coords.append(coord)
+        v_values.append(row[2])
+    if v_coords != coords:
+        raise ValueError(f"{name} h and v coordinates must match")
+    return coords, h_logits, v_values
+
+
+def actor_critic_convergence(
+    snapshots, policy_tol=1e-4, value_tol=1e-3, patience=3
+) -> dict:
+    """比较相邻 actor-critic 快照的策略/值差异，判定收敛。
+
+    snapshots 须为至少两项的 list；每项为键序恰为 h、v 的 dict，
+    h 行恰为 [r, c, hU, hR, hD, hL]、v 行恰为 [r, c, V]，元素
+    均为有限 float；两表均非空，坐标各自升序唯一，同一快照的
+    h、v 坐标序列相同，且全部快照间坐标序列相同。容器或元素错
+    型抛 TypeError；余项数、键序、行长、空表、坐标顺序或一致
+    性、有限性错误抛 ValueError。policy_tol、value_tol 须为非
+    bool 的 int/float，patience 须为非 bool int；错型抛
+    TypeError，转 float 溢出、非有限、容差 < 0 或
+    patience <= 0 抛 ValueError。先全量校验再计算，不修改输入。
+
+    对 i 从 0 起的每对相邻快照，逐状态取旧行 URDL logits x，
+    令 m=max(x)、z=sum(exp(x-m), 0.0)、l=x-m-log(z)、p=exp(l)；
+    新行同式得 q，K 从 0.0 按 URDL 累加 p*(l-q)，P 为各状态
+    K 的最大值，D 为各状态对应 V 绝对差的最大值；K 或 V 差非
+    有限抛 ValueError。检查行为 [i+1, P, D, P<=policy_tol and
+    D<=value_tol]；snapshot 为首个连续 patience 行均通过的序
+    列末行首项，不存在则为 None。
+
+    返回键序 converged、snapshot、checks：converged 等价于
+    snapshot is not None；checks 按 i 升序。结果确定，仅用标准
+    库，不新增命令行入口。
+    """
+    if not isinstance(snapshots, list):
+        raise TypeError("snapshots must be a list")
+    if isinstance(policy_tol, bool) or not isinstance(
+        policy_tol, (int, float)
+    ):
+        raise TypeError("policy_tol must be an int or float")
+    if isinstance(value_tol, bool) or not isinstance(
+        value_tol, (int, float)
+    ):
+        raise TypeError("value_tol must be an int or float")
+    if isinstance(patience, bool) or not isinstance(patience, int):
+        raise TypeError("patience must be an int")
+    if len(snapshots) < 2:
+        raise ValueError("snapshots must contain at least two entries")
+    try:
+        policy_tolerance = float(policy_tol)
+    except OverflowError:
+        raise ValueError(
+            "policy_tol must be convertible to a finite float"
+        )
+    if not math.isfinite(policy_tolerance) or policy_tolerance < 0:
+        raise ValueError("policy_tol must be finite and >= 0")
+    try:
+        value_tolerance = float(value_tol)
+    except OverflowError:
+        raise ValueError(
+            "value_tol must be convertible to a finite float"
+        )
+    if not math.isfinite(value_tolerance) or value_tolerance < 0:
+        raise ValueError("value_tol must be finite and >= 0")
+    if patience <= 0:
+        raise ValueError("patience must be positive")
+
+    validated = []
+    for index, snapshot in enumerate(snapshots):
+        validated.append(
+            _validate_actor_critic_snapshot(
+                snapshot, f"snapshots[{index}]"
+            )
+        )
+    base_coords = validated[0][0]
+    for coords, _logits, _values in validated[1:]:
+        if coords != base_coords:
+            raise ValueError("coordinates must match between snapshots")
+
+    checks = []
+    for i in range(len(validated) - 1):
+        _, old_logits, old_values = validated[i]
+        _, new_logits, new_values = validated[i + 1]
+        policy_max = None
+        value_max = None
+        for state in range(len(old_logits)):
+            old_x = old_logits[state]
+            old_m = max(old_x)
+            old_z = 0.0
+            for x in old_x:
+                old_z += math.exp(x - old_m)
+            old_log_z = math.log(old_z)
+            old_l = [x - old_m - old_log_z for x in old_x]
+            old_p = [math.exp(x) for x in old_l]
+            new_x = new_logits[state]
+            new_m = max(new_x)
+            new_z = 0.0
+            for x in new_x:
+                new_z += math.exp(x - new_m)
+            new_log_z = math.log(new_z)
+            new_q = [x - new_m - new_log_z for x in new_x]
+            kl = 0.0
+            for j in range(4):
+                kl += old_p[j] * (old_l[j] - new_q[j])
+            difference = abs(old_values[state] - new_values[state])
+            if not (math.isfinite(kl) and math.isfinite(difference)):
+                raise ValueError(
+                    "policy and value differences must be finite"
+                )
+            if policy_max is None or kl > policy_max:
+                policy_max = kl
+            if value_max is None or difference > value_max:
+                value_max = difference
+        checks.append(
+            [
+                i + 1,
+                policy_max,
+                value_max,
+                policy_max <= policy_tolerance
+                and value_max <= value_tolerance,
+            ]
+        )
+
+    consecutive = 0
+    converged_snapshot = None
+    for row in checks:
+        if row[3]:
+            consecutive += 1
+            if consecutive >= patience:
+                converged_snapshot = row[0]
+                break
+        else:
+            consecutive = 0
+    return {
+        "converged": converged_snapshot is not None,
+        "snapshot": converged_snapshot,
+        "checks": checks,
+    }
+
+
 def _write_line(text):
     sys.stdout.buffer.write(text.encode("utf-8") + b"\n")
 
