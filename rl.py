@@ -15370,6 +15370,90 @@ def ppo_evaluate_trace_many(
     }
 
 
+def ppo_audit(env, h, seeds, episodes=100, max_steps=1000) -> dict:
+    """只读 PPO 审计：聚合策略表、优势、轨迹复现与收敛报告。
+
+    参数合法域及 TypeError/ValueError 分类沿用 ppo_evaluate_trace_many
+    （env、h、episodes、max_steps 经 ppo_evaluate_trace 校验；seeds 须为
+    非空 list/tuple，元素为非 bool 的 int，允许重复且不修改 seeds）；
+    全部参数校验在首次 reset/step 前完成，不修改 h 或 seeds。评估复用
+    ppo_evaluate_trace_many，各 seed 使用各自独立的 random.Random(seed)
+    随机流，可重复复现。
+
+    返回键依次为 policy、evaluation、advantages、convergence。policy
+    按 h 行序逐行为 [r, c, pU, pR, pD, pL]：r、c 为 int 坐标，四个概率
+    按 U/R/D/L 以稳定 softmax exp(x-max)/sum(..., 0.0) 计算，均为
+    float。evaluation 即 ppo_evaluate_trace_many 的完整返回值。
+    advantages 与 evaluation.results 同序，每项为 [seed, reports]：
+    reports 逐回合以步奖励为 r、等长全 0.0 为 v 与 n、步 done 为 term、
+    仅末步未 done 时为 trunc 调用 segmented_gae，保存其完整结果。
+    convergence 同序，每项为 [seed, report]：report 为该 seed 逐回合
+    success 序列以默认参数调用 ppo_success_streak 的完整结果。
+
+    运算出现非有限值抛 ValueError；无论成功或异常均恢复 env.state 与
+    env.done，相同参数逐值一致。仅用标准库。
+    """
+    saved = None
+    if isinstance(env, GridWorld):
+        saved = (env.state, env.done)
+    try:
+        evaluation = ppo_evaluate_trace_many(
+            env, h, seeds, episodes=episodes, max_steps=max_steps
+        )
+
+        policy = []
+        for row in h:
+            r = int(row[0])
+            c = int(row[1])
+            logits = row[2:6]
+            m = max(logits)
+            weights = [math.exp(x - m) for x in logits]
+            total = sum(weights, 0.0)
+            probs = []
+            for weight in weights:
+                p = weight / total
+                if not math.isfinite(p):
+                    raise ValueError("policy probabilities must be finite")
+                probs.append(p)
+            policy.append([r, c, probs[0], probs[1], probs[2], probs[3]])
+
+        advantages = []
+        convergence = []
+        for item in evaluation["results"]:
+            reports = []
+            for episode in item["result"]["episodes"]:
+                trace = episode["trace"]
+                length = len(trace)
+                rewards = [step[5] for step in trace]
+                term = [step[6] for step in trace]
+                trunc = [False] * length
+                if not term[-1]:
+                    trunc[-1] = True
+                reports.append(
+                    segmented_gae(
+                        rewards,
+                        [0.0] * length,
+                        [0.0] * length,
+                        term,
+                        trunc,
+                    )
+                )
+            advantages.append([item["seed"], reports])
+            convergence.append(
+                [item["seed"], ppo_success_streak(item["summary"][2])]
+            )
+
+        return {
+            "policy": policy,
+            "evaluation": evaluation,
+            "advantages": advantages,
+            "convergence": convergence,
+        }
+    finally:
+        if saved is not None:
+            env.state, env.done = saved
+
+
 def ppo_evaluate_many(
     env, h, seeds, episodes=100, max_steps=1000, window=20, threshold=0.9
 ) -> dict:
