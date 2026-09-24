@@ -4888,6 +4888,263 @@ def off_policy_actor_critic(
     return {"h": h_table, "v": v_table, "episodes": episode_results}
 
 
+def vtrace_actor_critic(
+    env,
+    behavior,
+    episodes=500,
+    alpha=0.05,
+    beta=0.1,
+    gamma=0.9,
+    rho_clip=1.0,
+    c_clip=1.0,
+    seed=0,
+    max_steps=1000,
+) -> dict:
+    """整回合 V-trace 离策略 actor-critic，以 softmax 策略为目标、
+    behavior 为行为策略，返回 h/v 表与逐回合统计。
+
+    behavior 单侧行为策略契约、episodes、alpha、beta、gamma、seed、
+    max_steps 的校验，H/V 键域与初值，reset 与 done/max_steps 边界，
+    以及返回契约均同 off_policy_actor_critic。rho_clip 契约亦同
+    off_policy_actor_critic；c_clip 为非 bool 的有限 int/float 且 > 0，
+    错型抛 TypeError，非有限或越界抛 ValueError。
+
+    每步以旧 H 按稳定 softmax 得 URDL 概率 p；仅以一个
+    random.Random(seed) 调用一次 random()，按 behavior 的 URDL 累计
+    概率取首个严格大于样本的动作，未命中取 URDL 中最后一个正概率动作
+    （故 behavior[s][a] 必为正）。step 得 (s2, r, done)，记录 s、a、
+    r、p、b=behavior[s][a]、v=V[s]、n=0.0 if done else V[s2] 及
+    term=done；仅未终止末步的 trunc 为 True。回合末调用
+    segmented_vtrace(r, v, n, log(b), log(p[a]), term, trunc, gamma,
+    rho_clip, c_clip) 取得 values 与 advantages，再按原步序以所存 p
+    先对各 b 同步作 H[s,b]+=alpha*advantages[t]*(I[b=a]-p[b])，再作
+    V[s]+=beta*(values[t]-v)。softmax、对数、优势递推中间量或任一
+    更新值非有限即抛 ValueError。全部随机性来自一个
+    random.Random(seed)。
+
+    返回键依次为 h、v、episodes；h 项按坐标升序为
+    [r, c, hU, hR, hD, hL]，v 项为 [r, c, V]，其中数均为 float；
+    episodes 项为 [steps, reward, done]，类型依次为 int/int/bool，
+    reward 为未折扣回报和。
+    """
+    if not isinstance(env, GridWorld):
+        raise TypeError("env must be a GridWorld")
+    if isinstance(episodes, bool) or not isinstance(episodes, int):
+        raise TypeError("episodes must be an int")
+    if isinstance(seed, bool) or not isinstance(seed, int):
+        raise TypeError("seed must be an int")
+    if isinstance(max_steps, bool) or not isinstance(max_steps, int):
+        raise TypeError("max_steps must be an int")
+    if isinstance(alpha, bool) or not isinstance(alpha, (int, float)):
+        raise TypeError("alpha must be an int or float")
+    if isinstance(beta, bool) or not isinstance(beta, (int, float)):
+        raise TypeError("beta must be an int or float")
+    if isinstance(gamma, bool) or not isinstance(gamma, (int, float)):
+        raise TypeError("gamma must be an int or float")
+    if isinstance(rho_clip, bool) or not isinstance(
+        rho_clip, (int, float)
+    ):
+        raise TypeError("rho_clip must be an int or float")
+    if isinstance(c_clip, bool) or not isinstance(c_clip, (int, float)):
+        raise TypeError("c_clip must be an int or float")
+    if episodes <= 0:
+        raise ValueError("episodes must be positive")
+    if max_steps <= 0:
+        raise ValueError("max_steps must be positive")
+    if not _is_finite_number(alpha) or alpha <= 0 or alpha > 1:
+        raise ValueError("alpha must be finite and in (0, 1]")
+    if not _is_finite_number(beta) or beta <= 0 or beta > 1:
+        raise ValueError("beta must be finite and in (0, 1]")
+    if not _is_finite_number(gamma) or gamma < 0 or gamma >= 1:
+        raise ValueError("gamma must be finite and in [0, 1)")
+    if not _is_finite_number(rho_clip) or rho_clip <= 0:
+        raise ValueError("rho_clip must be finite and positive")
+    if not _is_finite_number(c_clip) or c_clip <= 0:
+        raise ValueError("c_clip must be finite and positive")
+
+    actions = tuple(_ACTIONS)  # U, R, D, L
+    states = sorted(
+        state
+        for state in _reachable_cells(env)
+        if env._cell(state) != "G"
+    )
+
+    if not isinstance(behavior, dict):
+        raise TypeError("behavior policy must be a dict")
+    for key in behavior:
+        if (
+            not isinstance(key, tuple)
+            or len(key) != 2
+            or any(
+                isinstance(v, bool) or not isinstance(v, int)
+                for v in key
+            )
+        ):
+            raise TypeError(
+                "behavior policy keys must be tuples of two non-bool ints"
+            )
+    if set(behavior) != set(states):
+        raise ValueError(
+            "behavior policy keys must exactly be the reachable "
+            "non-goal cells"
+        )
+    for cell in states:
+        row = behavior[cell]
+        if not isinstance(row, list):
+            raise TypeError("behavior policy rows must be lists")
+        if len(row) != 4:
+            raise ValueError(
+                "behavior policy rows must have four entries in "
+                "U, R, D, L order"
+            )
+        for probability in row:
+            if isinstance(probability, bool) or not isinstance(
+                probability, float
+            ):
+                raise TypeError(
+                    "behavior policy probabilities must be floats"
+                )
+        for probability in row:
+            if not math.isfinite(probability):
+                raise ValueError(
+                    "behavior policy probabilities must be finite"
+                )
+            if probability < 0:
+                raise ValueError(
+                    "behavior policy probabilities must be non-negative"
+                )
+        if sum(row, 0.0) != 1.0:
+            raise ValueError("behavior policy rows must sum to 1.0")
+
+    h = {(state, action): 0.0 for state in states for action in actions}
+    v = {state: 0.0 for state in states}
+    rng = random.Random(seed)
+    episode_results = []
+
+    for _ in range(episodes):
+        state = env.reset()
+        trajectory = []
+        steps = 0
+        total_reward = 0
+        done = False
+        for _ in range(max_steps):
+            m = max(h[(state, a)] for a in actions)
+            weights = [math.exp(h[(state, a)] - m) for a in actions]
+            total = sum(weights)
+            probs = [weight / total for weight in weights]
+            if not all(math.isfinite(p_b) for p_b in probs):
+                raise ValueError("softmax probabilities must remain finite")
+            sample = rng.random()
+            cumulative = 0.0
+            action_index = 3
+            for index, probability in enumerate(behavior[state]):
+                if probability > 0.0:
+                    action_index = index
+                cumulative += probability
+                if cumulative > sample:
+                    break
+            action = actions[action_index]
+            value = v[state]
+            next_state, reward, done = env.step(action)
+            steps += 1
+            total_reward += reward
+            next_value = 0.0 if done else v[next_state]
+            behavior_prob = behavior[state][action_index]
+            trajectory.append(
+                (
+                    state,
+                    action,
+                    reward,
+                    probs,
+                    probs[action_index],
+                    behavior_prob,
+                    value,
+                    next_value,
+                    bool(done),
+                )
+            )
+            if done:
+                break
+            state = next_state
+
+        truncs = [False] * len(trajectory)
+        if not done:
+            truncs[-1] = True
+        rewards = [record[2] for record in trajectory]
+        old_values = [record[6] for record in trajectory]
+        next_values = [record[7] for record in trajectory]
+        log_behavior = []
+        log_target = []
+        for record in trajectory:
+            log_b = math.log(record[5])
+            log_p = math.log(record[4])
+            if not math.isfinite(log_b) or not math.isfinite(log_p):
+                raise ValueError("log probabilities must remain finite")
+            log_behavior.append(log_b)
+            log_target.append(log_p)
+        terms = [record[8] for record in trajectory]
+
+        vtrace_result = segmented_vtrace(
+            rewards,
+            old_values,
+            next_values,
+            log_behavior,
+            log_target,
+            terms,
+            truncs,
+            gamma,
+            rho_clip,
+            c_clip,
+        )
+        targets = vtrace_result["values"]
+        advantages = vtrace_result["advantages"]
+
+        for t, record in enumerate(trajectory):
+            st, action, _reward, probs, _p_a, _b, old_v, _n, _term = (
+                record
+            )
+            advantage = advantages[t]
+            if not math.isfinite(advantage):
+                raise ValueError("advantage must remain finite")
+            new_h_values = {}
+            for b_action, p_b in zip(actions, probs):
+                indicator = 1.0 if b_action == action else 0.0
+                update = alpha * advantage * (indicator - p_b)
+                if not math.isfinite(update):
+                    raise ValueError("policy gradient must remain finite")
+                new_h = h[(st, b_action)] + update
+                if not math.isfinite(new_h):
+                    raise ValueError("H value must remain finite")
+                new_h_values[b_action] = new_h
+            for b_action in actions:
+                h[(st, b_action)] = new_h_values[b_action]
+            critic_delta = targets[t] - old_v
+            if not math.isfinite(critic_delta):
+                raise ValueError("critic target delta must remain finite")
+            new_v = v[st] + beta * critic_delta
+            if not math.isfinite(new_v):
+                raise ValueError("V value must remain finite")
+            v[st] = new_v
+
+        episode_results.append([steps, total_reward, done])
+
+    h_table = [
+        [
+            float(r),
+            float(c),
+            h[((r, c), "U")],
+            h[((r, c), "R")],
+            h[((r, c), "D")],
+            h[((r, c), "L")],
+        ]
+        for (r, c) in states
+    ]
+    v_table = [
+        [float(r), float(c), v[(r, c)]] for (r, c) in states
+    ]
+    return {"h": h_table, "v": v_table, "episodes": episode_results}
+
+
 def true_online_td_lambda_prediction(
     env,
     policy,
