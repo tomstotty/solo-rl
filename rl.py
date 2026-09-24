@@ -1723,6 +1723,115 @@ def replay_q_learning(
     return {"q": q, "buffer": [list(row) for row in buffer], "updates": updates}
 
 
+def bonus_q(
+    env,
+    episodes=500,
+    alpha=0.5,
+    gamma=0.9,
+    epsilon=0.1,
+    bonus=1.0,
+    power=0.5,
+    seed=0,
+    max_steps=1000,
+) -> dict:
+    """带计数探索奖励的 Q 学习，返回 {"q": Q, "counts": N}。
+
+    Q 与 N 覆盖从 S 可达的非 G 格与 U/R/D/L 的全部组合，键序相同，
+    初始分别为 0.0 与 0。每回合 reset，done 即停；单回合最多
+    max_steps 步（截断末步照常自举）。每步先且仅调用一次
+    rng.random() 决定是否探索，探索时再按 URDL 调用
+    rng.randrange(4)，否则取 URDL 中首个最大 Q 动作。步后先
+    N[s, a] += 1，再令 b = bonus / N[s, a] ** power；done 时目标为
+    reward + b，否则为 reward + b + gamma * maxQ(next)，按当前 Q
+    作 Q += alpha * (目标 - Q)。b、目标或新 Q 非有限即抛
+    ValueError。全部随机性来自一个 random.Random(seed)。
+    """
+    if not isinstance(env, GridWorld):
+        raise TypeError("env must be a GridWorld")
+    if isinstance(episodes, bool) or not isinstance(episodes, int):
+        raise TypeError("episodes must be an int")
+    if isinstance(seed, bool) or not isinstance(seed, int):
+        raise TypeError("seed must be an int")
+    if isinstance(max_steps, bool) or not isinstance(max_steps, int):
+        raise TypeError("max_steps must be an int")
+    if isinstance(alpha, bool) or not isinstance(alpha, (int, float)):
+        raise TypeError("alpha must be an int or float")
+    if isinstance(gamma, bool) or not isinstance(gamma, (int, float)):
+        raise TypeError("gamma must be an int or float")
+    if isinstance(epsilon, bool) or not isinstance(epsilon, (int, float)):
+        raise TypeError("epsilon must be an int or float")
+    if isinstance(bonus, bool) or not isinstance(bonus, (int, float)):
+        raise TypeError("bonus must be an int or float")
+    if isinstance(power, bool) or not isinstance(power, (int, float)):
+        raise TypeError("power must be an int or float")
+    if episodes <= 0:
+        raise ValueError("episodes must be positive")
+    if max_steps <= 0:
+        raise ValueError("max_steps must be positive")
+    if not _is_finite_number(alpha) or alpha <= 0 or alpha > 1:
+        raise ValueError("alpha must be finite and in (0, 1]")
+    if not _is_finite_number(gamma) or gamma < 0 or gamma >= 1:
+        raise ValueError("gamma must be finite and in [0, 1)")
+    if not _is_finite_number(epsilon) or epsilon < 0 or epsilon > 1:
+        raise ValueError("epsilon must be finite and in [0, 1]")
+    try:
+        bonus = float(bonus)
+    except OverflowError:
+        raise ValueError("bonus must convert to a finite float")
+    if not math.isfinite(bonus):
+        raise ValueError("bonus must be finite")
+    if bonus < 0.0:
+        raise ValueError("bonus must be non-negative")
+    try:
+        power = float(power)
+    except OverflowError:
+        raise ValueError("power must convert to a finite float")
+    if not math.isfinite(power):
+        raise ValueError("power must be finite")
+    if power <= 0.0 or power > 1.0:
+        raise ValueError("power must be in (0, 1]")
+
+    actions = tuple(_ACTIONS)  # U, R, D, L
+    states = sorted(
+        state
+        for state in _reachable_cells(env)
+        if env._cell(state) != "G"
+    )
+    q = {(state, action): 0.0 for state in states for action in actions}
+    counts = {(state, action): 0 for state in states for action in actions}
+    rng = random.Random(seed)
+
+    for _ in range(episodes):
+        state = env.reset()
+        for _ in range(max_steps):
+            if rng.random() < epsilon:
+                action = actions[rng.randrange(4)]
+            else:
+                action = max(actions, key=lambda a: q[(state, a)])
+            next_state, reward, done = env.step(action)
+            key = (state, action)
+            counts[key] += 1
+            b = bonus / counts[key] ** power
+            if done:
+                target = reward + b
+            else:
+                target = reward + b + gamma * max(
+                    q[(next_state, a)] for a in actions
+                )
+            new_q = q[key] + alpha * (target - q[key])
+            if (
+                not _is_finite_number(b)
+                or not _is_finite_number(target)
+                or not _is_finite_number(new_q)
+            ):
+                raise ValueError("Q value must remain finite")
+            q[key] = new_q
+            if done:
+                break
+            state = next_state
+    return {"q": q, "counts": counts}
+
+
 def prioritized_replay_q(
     env,
     episodes=500,
