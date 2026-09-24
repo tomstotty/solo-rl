@@ -1539,6 +1539,167 @@ def replay_q_learning(
     return {"q": q, "buffer": [list(row) for row in buffer], "updates": updates}
 
 
+def prioritized_replay_q(
+    env,
+    episodes=500,
+    alpha=0.5,
+    gamma=0.9,
+    epsilon=0.1,
+    beta=0.4,
+    seed=0,
+) -> dict:
+    """按比例的优先经验回放 Q 学习，返回
+    {"q": Q, "buffer": 缓冲副本, "priorities": float 列表, "updates": int}。
+
+    契约同 replay_q_learning（容量固定 1000、每步回放 4 次、单回合至多
+    1000 步，末步照常入缓冲并回放），差异如下。缓冲并行维护同序优先级
+    列表：追加时若缓冲已满（长度达到 1000），同步删首行与首优先级；
+    新项优先级取现存优先级最大值，无旧项取 1.0。每次回放重算
+    w_i = priority_i ** 0.6，以一次 rng.random() * sum(w) 取样，累计值
+    首个严格大于样本者命中，均不大于则取末项。P_i = w_i / sum(w)，
+    重要度 I_i = (N * P_i) ** (-beta) 后除以全部 I 的最大值归一，仅以
+    命中项的归一 I 作 Q += alpha * I * delta，其中
+    delta = reward + (done 时 0，否则 gamma * maxQ(next)) - Q（按当前
+    Q 计算），随后命中项优先级置为 abs(delta) + 1e-6。任何运算溢出或
+    非有限结果均抛 ValueError。全部随机性来自一个 random.Random(seed)。
+    """
+    if not isinstance(env, GridWorld):
+        raise TypeError("env must be a GridWorld")
+    if isinstance(episodes, bool) or not isinstance(episodes, int):
+        raise TypeError("episodes must be an int")
+    if isinstance(seed, bool) or not isinstance(seed, int):
+        raise TypeError("seed must be an int")
+    if isinstance(alpha, bool) or not isinstance(alpha, (int, float)):
+        raise TypeError("alpha must be an int or float")
+    if isinstance(gamma, bool) or not isinstance(gamma, (int, float)):
+        raise TypeError("gamma must be an int or float")
+    if isinstance(epsilon, bool) or not isinstance(epsilon, (int, float)):
+        raise TypeError("epsilon must be an int or float")
+    if isinstance(beta, bool) or not isinstance(beta, (int, float)):
+        raise TypeError("beta must be an int or float")
+    if episodes <= 0:
+        raise ValueError("episodes must be positive")
+    if not _is_finite_number(alpha) or alpha <= 0 or alpha > 1:
+        raise ValueError("alpha must be finite and in (0, 1]")
+    if not _is_finite_number(gamma) or gamma < 0 or gamma >= 1:
+        raise ValueError("gamma must be finite and in [0, 1)")
+    if not _is_finite_number(epsilon) or epsilon < 0 or epsilon > 1:
+        raise ValueError("epsilon must be finite and in [0, 1]")
+    try:
+        beta = float(beta)
+    except OverflowError:
+        raise ValueError("beta must convert to a finite float")
+    if not math.isfinite(beta):
+        raise ValueError("beta must be finite")
+    if beta < 0.0 or beta > 1.0:
+        raise ValueError("beta must be in [0, 1]")
+
+    actions = tuple(_ACTIONS)  # U, R, D, L
+    states = sorted(
+        state
+        for state in _reachable_cells(env)
+        if env._cell(state) != "G"
+    )
+    q = {(state, action): 0.0 for state in states for action in actions}
+    buffer = []
+    priorities = []
+    updates = 0
+    rng = random.Random(seed)
+
+    capacity = 1000
+    replay_steps = 4
+    max_steps = 1000
+
+    for _ in range(episodes):
+        state = env.reset()
+        for _ in range(max_steps):
+            if rng.random() < epsilon:
+                action = actions[rng.randrange(4)]
+            else:
+                action = max(actions, key=lambda a: q[(state, a)])
+            next_state, reward, done = env.step(action)
+            if len(buffer) >= capacity:
+                del buffer[0]
+                del priorities[0]
+            new_priority = max(priorities) if priorities else 1.0
+            buffer.append([
+                state[0],
+                state[1],
+                action,
+                next_state[0],
+                next_state[1],
+                reward,
+                done,
+            ])
+            priorities.append(float(new_priority))
+            for _ in range(replay_steps):
+                n_items = len(buffer)
+                try:
+                    weights = [p ** 0.6 for p in priorities]
+                    total_w = sum(weights)
+                    sample = rng.random() * total_w
+                    cumulative = 0.0
+                    index = n_items - 1
+                    for j, w in enumerate(weights):
+                        cumulative += w
+                        if cumulative > sample:
+                            index = j
+                            break
+                    probs = [w / total_w for w in weights]
+                    raw_weights = [
+                        (n_items * p) ** (-beta) for p in probs
+                    ]
+                    max_raw = max(raw_weights)
+                    importance = raw_weights[index] / max_raw
+                    r, c, act, nr, nc, rew, dn = buffer[index]
+                    key = ((r, c), act)
+                    if dn:
+                        target = rew
+                    else:
+                        target = rew + gamma * max(
+                            q[((nr, nc), a)] for a in actions
+                        )
+                    delta = target - q[key]
+                    new_q = q[key] + alpha * importance * delta
+                    new_priority = abs(delta) + 1e-6
+                except OverflowError as exc:
+                    raise ValueError(
+                        "Replay arithmetic must remain finite"
+                    ) from exc
+                if not all(math.isfinite(w) for w in weights):
+                    raise ValueError("Replay arithmetic must remain finite")
+                if not all(math.isfinite(p) for p in probs):
+                    raise ValueError("Replay arithmetic must remain finite")
+                if not all(math.isfinite(iw) for iw in raw_weights):
+                    raise ValueError("Replay arithmetic must remain finite")
+                for value in (
+                    total_w,
+                    sample,
+                    max_raw,
+                    importance,
+                    target,
+                    delta,
+                    new_q,
+                    new_priority,
+                ):
+                    if not math.isfinite(value):
+                        raise ValueError(
+                            "Replay arithmetic must remain finite"
+                        )
+                q[key] = new_q
+                priorities[index] = float(new_priority)
+                updates += 1
+            if done:
+                break
+            state = next_state
+    return {
+        "q": q,
+        "buffer": [list(row) for row in buffer],
+        "priorities": [float(p) for p in priorities],
+        "updates": updates,
+    }
+
+
 def prioritized_sweeping(
     env,
     episodes=500,
