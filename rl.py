@@ -4871,6 +4871,185 @@ def actor_critic(
     return {"h": h_table, "v": v_table, "episodes": episode_results}
 
 
+def actor_critic_convergence(
+    snapshots, policy_tol=1e-4, value_tol=1e-3, patience=3
+) -> dict:
+    """逐快照比较 actor-critic 的 H/V 表并判定策略与价值是否收敛。
+
+    snapshots 须为至少 2 项的 list，每项为键序恰为 h、v 的 dict；
+    h、v 各为非空 list，行依次为 [r, c, hU, hR, hD, hL]、
+    [r, c, V]，元素均为有限 float；坐标按 (r, c) 升序、唯一且
+    各表一致。容器或元素错型抛 TypeError，其余结构或有限性违约
+    抛 ValueError。policy_tol、value_tol 须为非 bool 的 int/float，
+    patience 须为非 bool 的 int；错型抛 TypeError，转换溢出、
+    非有限、容差为负或 patience 非正抛 ValueError。全部校验先于
+    计算且不修改输入。
+
+    逐对相邻快照、逐状态取 URDL 的 H 行 x，令 m=max(x)、
+    z=sum(exp(x-m),0.0)、l=x-m-log(z)、p=exp(l)；旧行得 (l,p)，
+    新行同式得 q，KL 散度 K 从 0.0 按 URDL 累加 Σp*(l-q)，
+    P=max(K)（各状态 K 的最大值），D=max 对应 V 绝对差；任一
+    中间结果非有限抛 ValueError。i 从 0 起为每对相邻快照记录
+    检查行 [i+1, P, D, P<=policy_tol and D<=value_tol]；首次
+    出现连续 patience 个通过行时，取该连续段末行的首项（1 基
+    快照对序号）为 snapshot，不存在则为 None。
+
+    返回键序恰为 converged、snapshot、checks 的 dict：converged
+    为 bool，snapshot 为该 int 或 None，checks 为上述检查行。
+    仅用标准库，不引入命令行入口。
+    """
+    if not isinstance(snapshots, list):
+        raise TypeError("snapshots must be a list")
+    if len(snapshots) < 2:
+        raise ValueError("snapshots must contain at least two entries")
+    if isinstance(policy_tol, bool) or not isinstance(
+        policy_tol, (int, float)
+    ):
+        raise TypeError("policy_tol must be an int or float")
+    if isinstance(value_tol, bool) or not isinstance(
+        value_tol, (int, float)
+    ):
+        raise TypeError("value_tol must be an int or float")
+    if isinstance(patience, bool) or not isinstance(patience, int):
+        raise TypeError("patience must be an int")
+    try:
+        ptol = float(policy_tol)
+    except OverflowError as exc:
+        raise ValueError(
+            "policy_tol must be convertible to a finite float"
+        ) from exc
+    try:
+        vtol = float(value_tol)
+    except OverflowError as exc:
+        raise ValueError(
+            "value_tol must be convertible to a finite float"
+        ) from exc
+    if not math.isfinite(ptol) or ptol < 0:
+        raise ValueError("policy_tol must be a finite non-negative number")
+    if not math.isfinite(vtol) or vtol < 0:
+        raise ValueError("value_tol must be a finite non-negative number")
+    if patience <= 0:
+        raise ValueError("patience must be positive")
+
+    normalized = []
+
+    def _read_row(row, width, label):
+        if not isinstance(row, list):
+            raise TypeError("%s rows must be lists" % label)
+        if len(row) != width:
+            raise ValueError("%s rows must have %d elements" % (label, width))
+        for element in row:
+            if not isinstance(element, float):
+                raise TypeError("%s row elements must be floats" % label)
+            if not math.isfinite(element):
+                raise ValueError("%s row elements must be finite" % label)
+        return row
+
+    for snapshot in snapshots:
+        if not isinstance(snapshot, dict):
+            raise TypeError("each snapshot must be a dict")
+        if tuple(snapshot.keys()) != ("h", "v"):
+            raise ValueError("each snapshot must have exactly keys h, v")
+        h_rows = snapshot["h"]
+        v_rows = snapshot["v"]
+        if not isinstance(h_rows, list) or not isinstance(v_rows, list):
+            raise TypeError("snapshot h and v must be lists")
+        if not h_rows or not v_rows:
+            raise ValueError("snapshot h and v tables must be non-empty")
+
+        h_table = []
+        h_coords = []
+        for row in h_rows:
+            parsed = _read_row(row, 6, "h")
+            coord = (parsed[0], parsed[1])
+            h_coords.append(coord)
+            h_table.append(parsed[2:])
+        v_table = {}
+        v_coords = []
+        for row in v_rows:
+            parsed = _read_row(row, 3, "v")
+            coord = (parsed[0], parsed[1])
+            v_coords.append(coord)
+            v_table[coord] = parsed[2]
+        for coords in (h_coords, v_coords):
+            if any(
+                coords[index] >= coords[index + 1]
+                for index in range(len(coords) - 1)
+            ):
+                raise ValueError(
+                    "snapshot coordinates must be unique and ascending"
+                )
+        if h_coords != v_coords:
+            raise ValueError(
+                "h and v tables must cover the same coordinates"
+            )
+        normalized.append((h_coords, h_table, v_table))
+
+    reference_coords = normalized[0][0]
+    for coords, _h_table, _v_table in normalized[1:]:
+        if coords != reference_coords:
+            raise ValueError(
+                "all snapshots must cover the same coordinates"
+            )
+
+    def _log_probs(values):
+        """按 URDL 计算稳定 softmax 的 log 概率与概率。"""
+        m = max(values)
+        z = sum((math.exp(value - m) for value in values), 0.0)
+        log_z = math.log(z)
+        log_probs = [value - m - log_z for value in values]
+        probs = [math.exp(log_prob) for log_prob in log_probs]
+        if not all(math.isfinite(value) for value in log_probs):
+            raise ValueError("policy log-probabilities must be finite")
+        if not all(math.isfinite(value) for value in probs):
+            raise ValueError("policy probabilities must be finite")
+        return log_probs, probs
+
+    checks = []
+    for index in range(len(normalized) - 1):
+        old_coords, old_h, old_v = normalized[index]
+        _new_coords, new_h, new_v = normalized[index + 1]
+        max_kl = None
+        max_value_diff = None
+        for state_index, coord in enumerate(old_coords):
+            old_log, old_prob = _log_probs(old_h[state_index])
+            new_log, _new_prob = _log_probs(new_h[state_index])
+            kl = 0.0
+            for action_index in range(4):
+                kl += (
+                    old_prob[action_index]
+                    * (old_log[action_index] - new_log[action_index])
+                )
+            if not math.isfinite(kl):
+                raise ValueError("KL divergence must be finite")
+            if max_kl is None or kl > max_kl:
+                max_kl = kl
+            value_diff = abs(old_v[coord] - new_v[coord])
+            if not math.isfinite(value_diff):
+                raise ValueError("value difference must be finite")
+            if max_value_diff is None or value_diff > max_value_diff:
+                max_value_diff = value_diff
+        passed = max_kl <= ptol and max_value_diff <= vtol
+        checks.append([index + 1, max_kl, max_value_diff, passed])
+
+    snapshot = None
+    streak = 0
+    for check in checks:
+        if check[3]:
+            streak += 1
+            if streak >= patience:
+                snapshot = check[0]
+                break
+        else:
+            streak = 0
+
+    return {
+        "converged": snapshot is not None,
+        "snapshot": snapshot,
+        "checks": checks,
+    }
+
+
 def entropy_actor_critic(
     env,
     episodes=500,
