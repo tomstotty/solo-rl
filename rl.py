@@ -1051,6 +1051,182 @@ def q_learning_trace_convergence(
     }
 
 
+def q_trace_stability(env, runs, tol=0.01, ratio=1.0, patience=2) -> dict:
+    """跨 seed 诊断 q_learning_trace_bytes 轨迹的稳定性与收敛。
+
+    env 须为 GridWorld，否则抛 TypeError。runs 须为至少 2 项的 list，
+    每项恰为 [seed, payloads]：seed 为互异的非 bool int，payloads 为
+    至少 2 项的 bytes list，各 run 的 payloads 等长；runs 非 list、
+    项非 list、seed/payload/patience 等类型违约抛 TypeError，空、项
+    数不足、seed 重复、payloads 不等长、patience 非正抛 ValueError。
+    tol、ratio 须为非 bool 的有限 int/float（tol≥0、ratio∈[0, 1]），
+    类型违约抛 TypeError，NaN/Infinity、越界或 float 转换溢出抛
+    ValueError。
+
+    每个 payload 须经 q_learning_trace_replay 重放且 matched 为真，
+    否则抛 ValueError（payload 非规范产物同样抛 ValueError）。全程
+    不修改 env 与任何入参。
+
+    自检查点 2 起逐项比较相邻检查点（index 为 1 基）：D 为全部 seed、
+    全部 Q 键在相邻检查点间差的绝对值之最大；A 为状态跨 seed 贪心
+    动作一致的比例——每状态以 URDL 序取首个最大 Q 动作为贪心动作，
+    所有 seed 一致才计入，A=一致状态数/状态数。每 checkpoint 为
+    [index, D, A, passed]，passed 等价于 D≤tol 且 A≥ratio。checkpoint
+    取首次连续 patience 个 passed 项的 index，否则为 None。
+
+    返回键序恰为 converged、checkpoint、checkpoints；converged 等价
+    于 checkpoint 非 None。仅用标准库，不引入命令行入口；其余 API
+    与 run/value 行为不变。
+    """
+    if not isinstance(env, GridWorld):
+        raise TypeError("env must be a GridWorld")
+    if not isinstance(runs, list):
+        raise TypeError("runs must be a list")
+    if isinstance(tol, bool) or not isinstance(tol, (int, float)):
+        raise TypeError("tol must be an int or float")
+    if isinstance(ratio, bool) or not isinstance(ratio, (int, float)):
+        raise TypeError("ratio must be an int or float")
+    if isinstance(patience, bool) or not isinstance(patience, int):
+        raise TypeError("patience must be an int")
+    try:
+        tol_value = float(tol)
+    except OverflowError as exc:
+        raise ValueError(
+            "tol must be convertible to a finite float"
+        ) from exc
+    try:
+        ratio_value = float(ratio)
+    except OverflowError as exc:
+        raise ValueError(
+            "ratio must be convertible to a finite float"
+        ) from exc
+    if not math.isfinite(tol_value) or tol_value < 0:
+        raise ValueError("tol must be a finite non-negative number")
+    if (
+        not math.isfinite(ratio_value)
+        or ratio_value < 0
+        or ratio_value > 1
+    ):
+        raise ValueError("ratio must be finite and in [0, 1]")
+    if patience <= 0:
+        raise ValueError("patience must be positive")
+    if len(runs) < 2:
+        raise ValueError("runs must contain at least 2 items")
+
+    seeds = []
+    run_payloads = []
+    for run_index, item in enumerate(runs):
+        if not isinstance(item, list):
+            raise TypeError(f"runs[{run_index}] must be a list")
+        if len(item) != 2:
+            raise ValueError(
+                f"runs[{run_index}] must be exactly [seed, payloads]"
+            )
+        seed, payloads = item
+        if isinstance(seed, bool) or not isinstance(seed, int):
+            raise TypeError(
+                f"runs[{run_index}] seed must be a non-bool int"
+            )
+        if seed in seeds:
+            raise ValueError(f"duplicate seed: {seed}")
+        seeds.append(seed)
+        if not isinstance(payloads, list):
+            raise TypeError(
+                f"runs[{run_index}] payloads must be a list"
+            )
+        if len(payloads) < 2:
+            raise ValueError(
+                f"runs[{run_index}] payloads must contain at least 2"
+                " items"
+            )
+        for payload_index, payload in enumerate(payloads):
+            if not isinstance(payload, bytes):
+                raise TypeError(
+                    f"runs[{run_index}] payloads[{payload_index}] must"
+                    " be bytes"
+                )
+        run_payloads.append(payloads)
+
+    checkpoint_count = len(run_payloads[0])
+    for run_index, payloads in enumerate(run_payloads):
+        if len(payloads) != checkpoint_count:
+            raise ValueError(
+                f"runs[{run_index}] payloads must have equal length"
+            )
+
+    actions = tuple(_ACTIONS)  # U, R, D, L
+    states = [
+        state
+        for state in sorted(_reachable_cells(env))
+        if env._cell(state) != "G"
+    ]
+
+    # matched 为真时记录 Q 与重放 Q 逐项 float.hex 一致，直接以记录 Q
+    # 作为各检查点 Q 表；每次重放不修改 env 与 payload。
+    tables = []
+    for run_index, payloads in enumerate(run_payloads):
+        series = []
+        for payload_index, payload in enumerate(payloads):
+            result = q_learning_trace_replay(env, payload)
+            if not result["matched"]:
+                raise ValueError(
+                    f"runs[{run_index}] payloads[{payload_index}] replay"
+                    " does not match recorded Q"
+                )
+            _states, _actions, _episodes, recorded_q = (
+                _load_q_learning_trace_payload(env, payload)
+            )
+            series.append(recorded_q)
+        tables.append(series)
+
+    checkpoints = []
+    for index in range(2, checkpoint_count + 1):
+        current = [series[index - 1] for series in tables]
+        previous = [series[index - 2] for series in tables]
+        d_max = 0.0
+        for cur_q, prev_q in zip(current, previous):
+            for state in states:
+                for action in actions:
+                    key = (state, action)
+                    difference = abs(cur_q[key] - prev_q[key])
+                    if difference > d_max:
+                        d_max = difference
+        consistent = 0
+        for state in states:
+            greedy = [
+                max(
+                    actions,
+                    key=lambda action, q_table=cur_q: q_table[
+                        (state, action)
+                    ],
+                )
+                for cur_q in current
+            ]
+            first = greedy[0]
+            if all(action == first for action in greedy[1:]):
+                consistent += 1
+        a_ratio = consistent / len(states)
+        passed = d_max <= tol_value and a_ratio >= ratio_value
+        checkpoints.append([index, d_max, a_ratio, passed])
+
+    checkpoint = None
+    streak = 0
+    for entry in checkpoints:
+        if entry[3]:
+            streak += 1
+            if streak >= patience:
+                checkpoint = entry[0]
+                break
+        else:
+            streak = 0
+
+    return {
+        "converged": checkpoint is not None,
+        "checkpoint": checkpoint,
+        "checkpoints": checkpoints,
+    }
+
+
 def dueling_q_learning(
     env,
     episodes=500,
