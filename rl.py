@@ -3768,6 +3768,167 @@ def td_lambda_prediction(
     return v
 
 
+def off_policy_td(
+    env,
+    behavior,
+    target,
+    episodes=500,
+    alpha=0.1,
+    gamma=0.9,
+    lambda_=0.9,
+    seed=0,
+    max_steps=1000,
+) -> dict:
+    """按行为策略采样、对目标策略做离策略 TD(λ) 评估，返回 V 表。
+
+    behavior、target 均为 dict，键恰为从 S 可达的非 G 格（二元非 bool
+    整数 tuple），值为 U/R/D/L 序的四项 list，各项为有限非负 float 且
+    行和为 1.0；target 取正概率处 behavior 也必须为正。余参数校验、
+    V 键域与初值、G 格 V 恒 0.0、reset 与 done/max_steps 边界均同
+    td_lambda_prediction。每回合非 G 格 E 清零，每步仅调用一次
+    random()，按 behavior 的 URDL 累计概率取首个严格大于样本的动作，
+    未命中取 L。step 得 (s2, r, done)，rho=target[s][a]/behavior[s][a]；
+    done 时 δ=r-V[s]，否则 δ=r+gamma*V[s2]-V[s]（截断末步仍自举）。
+    随后按坐标序同步置 E[x]=rho*(gamma*lambda_*E[x]+I[x=s])，再按
+    坐标序作 V[x]+=alpha*δ*E[x]。rho、δ、E 或 V 非有限即抛
+    ValueError。全部随机性来自一个 random.Random(seed)。
+    """
+    if not isinstance(env, GridWorld):
+        raise TypeError("env must be a GridWorld")
+    if isinstance(episodes, bool) or not isinstance(episodes, int):
+        raise TypeError("episodes must be an int")
+    if isinstance(seed, bool) or not isinstance(seed, int):
+        raise TypeError("seed must be an int")
+    if isinstance(max_steps, bool) or not isinstance(max_steps, int):
+        raise TypeError("max_steps must be an int")
+    if isinstance(alpha, bool) or not isinstance(alpha, (int, float)):
+        raise TypeError("alpha must be an int or float")
+    if isinstance(gamma, bool) or not isinstance(gamma, (int, float)):
+        raise TypeError("gamma must be an int or float")
+    if isinstance(lambda_, bool) or not isinstance(lambda_, (int, float)):
+        raise TypeError("lambda_ must be an int or float")
+    if episodes <= 0:
+        raise ValueError("episodes must be positive")
+    if max_steps <= 0:
+        raise ValueError("max_steps must be positive")
+    if not _is_finite_number(alpha) or alpha <= 0 or alpha > 1:
+        raise ValueError("alpha must be finite and in (0, 1]")
+    if not _is_finite_number(gamma) or gamma < 0 or gamma >= 1:
+        raise ValueError("gamma must be finite and in [0, 1)")
+    if not _is_finite_number(lambda_) or lambda_ < 0 or lambda_ > 1:
+        raise ValueError("lambda_ must be finite and in [0, 1]")
+
+    actions = tuple(_ACTIONS)  # U, R, D, L
+    states = sorted(
+        state
+        for state in _reachable_cells(env)
+        if env._cell(state) != "G"
+    )
+    all_states = sorted(_reachable_cells(env))
+
+    def _validate_policy(policy, name):
+        if not isinstance(policy, dict):
+            raise TypeError(name + " must be a dict")
+        for key in policy:
+            if (
+                not isinstance(key, tuple)
+                or len(key) != 2
+                or any(
+                    isinstance(v, bool) or not isinstance(v, int)
+                    for v in key
+                )
+            ):
+                raise TypeError(
+                    name + " keys must be tuples of two non-bool ints"
+                )
+        if set(policy) != set(states):
+            raise ValueError(
+                name
+                + " keys must exactly be the reachable non-goal cells"
+            )
+        for cell in states:
+            row = policy[cell]
+            if not isinstance(row, list):
+                raise TypeError(name + " rows must be lists")
+            if len(row) != 4:
+                raise ValueError(
+                    name
+                    + " rows must have four entries in U, R, D, L order"
+                )
+            for probability in row:
+                if isinstance(probability, bool) or not isinstance(
+                    probability, float
+                ):
+                    raise TypeError(name + " probabilities must be floats")
+            for probability in row:
+                if not math.isfinite(probability):
+                    raise ValueError(
+                        name + " probabilities must be finite"
+                    )
+                if probability < 0:
+                    raise ValueError(
+                        name + " probabilities must be non-negative"
+                    )
+            if sum(row, 0.0) != 1.0:
+                raise ValueError(name + " rows must sum to 1.0")
+
+    _validate_policy(behavior, "behavior policy")
+    _validate_policy(target, "target policy")
+    for cell in states:
+        for index in range(4):
+            if target[cell][index] > 0.0 and behavior[cell][index] <= 0.0:
+                raise ValueError(
+                    "behavior policy must have positive probability wherever "
+                    "target policy does"
+                )
+
+    v = {cell: 0.0 for cell in all_states}
+    rng = random.Random(seed)
+    decay = gamma * lambda_
+
+    for _ in range(episodes):
+        state = env.reset()
+        trace = {cell: 0.0 for cell in states}
+        for _ in range(max_steps):
+            sample = rng.random()
+            cumulative = 0.0
+            action = "L"
+            action_index = 3
+            for index, probability in enumerate(behavior[state]):
+                cumulative += probability
+                if cumulative > sample:
+                    action = actions[index]
+                    action_index = index
+                    break
+            rho = (
+                target[state][action_index]
+                / behavior[state][action_index]
+            )
+            if not math.isfinite(rho):
+                raise ValueError("importance ratio must remain finite")
+            next_state, reward, done = env.step(action)
+            if done:
+                delta = reward - v[state]
+            else:
+                delta = reward + gamma * v[next_state] - v[state]
+            if not math.isfinite(delta):
+                raise ValueError("delta must remain finite")
+            for cell in states:
+                indicator = 1.0 if cell == state else 0.0
+                new_trace = rho * (decay * trace[cell] + indicator)
+                if not math.isfinite(new_trace):
+                    raise ValueError("eligibility trace must remain finite")
+                trace[cell] = new_trace
+            for cell in states:
+                v[cell] += alpha * delta * trace[cell]
+                if not math.isfinite(v[cell]):
+                    raise ValueError("V value must remain finite")
+            if done:
+                break
+            state = next_state
+    return v
+
+
 def true_online_td_lambda_prediction(
     env,
     policy,
