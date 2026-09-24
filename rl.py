@@ -5159,6 +5159,162 @@ def segmented_gae(r, v, n, term, trunc, gamma=0.9, lambda_=0.95) -> dict:
     }
 
 
+def segmented_vtrace(
+    r, v, n, b, p, term, trunc, gamma=0.9, rho_clip=1.0, c_clip=1.0
+) -> dict:
+    """分段轨迹的 V-trace 离轨价值目标，区分真正终止与时间截断。
+
+    返回固定键序 values、advantages 的 dict。r（奖励）、v（当前值）、
+    n（后继值）、b（行为策略对数概率）、p（目标策略对数概率）、
+    term（终止标记）、trunc（截断标记）须为等长非空的 list/tuple；
+    r、v、n、b、p 各元素为非 bool 的 int/float，term、trunc 各元素
+    为 bool；同一位置不得两个标记同时为 True，且末位两个标记不得
+    同时为 False（轨迹必须终于终止或截断边界）。gamma、rho_clip、
+    c_clip 为非 bool 的 int/float 标量，其中 gamma 须在 [0, 1]，
+    rho_clip、c_clip 须 > 0。数值输入先复制并转换为 float（转换
+    溢出或结果非有限均抛 ValueError），不修改原序列。逐项令
+    z[t]=exp(p[t]-b[t])（上溢抛 ValueError，下溢为 0.0 合法）、
+    rho[t]=min(z[t],rho_clip)、c[t]=min(z[t],c_clip)。逆序令
+    base=0.0 if term[t] else n[t]、
+    d=rho[t]*(r[t]+gamma*base-v[t])；term[t] 或 trunc[t] 时
+    x[t]=v[t]+d，否则
+    x[t]=v[t]+d+gamma*c[t]*(x[t+1]-n[t])。再令
+    boot=0.0 if term[t]、n[t] if trunc[t]、否则 x[t+1]，
+    A[t]=rho[t]*(r[t]+gamma*boot-v[t])。对数差、中间量或输出非
+    有限均抛 ValueError。values 为 x[0..T-1]，两个列表均按原时序
+    排列为 float 新 list。
+    """
+    for name, seq in (
+        ("r", r),
+        ("v", v),
+        ("n", n),
+        ("b", b),
+        ("p", p),
+        ("term", term),
+        ("trunc", trunc),
+    ):
+        if not isinstance(seq, (list, tuple)):
+            raise TypeError(f"{name} must be a list or tuple")
+    if len(r) == 0:
+        raise ValueError(
+            "r, v, n, b, p, term and trunc must be non-empty"
+        )
+    if not (
+        len(r)
+        == len(v)
+        == len(n)
+        == len(b)
+        == len(p)
+        == len(term)
+        == len(trunc)
+    ):
+        raise ValueError(
+            "r, v, n, b, p, term and trunc must have equal length"
+        )
+
+    def _to_float(item, name):
+        if isinstance(item, bool) or not isinstance(item, (int, float)):
+            raise TypeError(f"{name} must contain only int or float")
+        try:
+            result = float(item)
+        except OverflowError:
+            raise ValueError(f"{name} must convert to a finite float")
+        if not math.isfinite(result):
+            raise ValueError(f"{name} must contain only finite numbers")
+        return result
+
+    rewards = [_to_float(item, "r") for item in r]
+    values = [_to_float(item, "v") for item in v]
+    next_values = [_to_float(item, "n") for item in n]
+    behavior = [_to_float(item, "b") for item in b]
+    target = [_to_float(item, "p") for item in p]
+    for name, seq in (("term", term), ("trunc", trunc)):
+        for item in seq:
+            if not isinstance(item, bool):
+                raise TypeError(f"{name} must contain only bool")
+    for t in range(len(term)):
+        if term[t] and trunc[t]:
+            raise ValueError(
+                "term and trunc must not both be True at the same index"
+            )
+    if not (term[-1] or trunc[-1]):
+        raise ValueError(
+            "term and trunc must not both be False at the last index"
+        )
+
+    def _to_scalar(item, name):
+        if isinstance(item, bool) or not isinstance(item, (int, float)):
+            raise TypeError(f"{name} must be an int or float")
+        try:
+            result = float(item)
+        except OverflowError:
+            raise ValueError(f"{name} must convert to a finite float")
+        if not math.isfinite(result):
+            raise ValueError(f"{name} must be finite")
+        return result
+
+    g = _to_scalar(gamma, "gamma")
+    u = _to_scalar(rho_clip, "rho_clip")
+    clip_c = _to_scalar(c_clip, "c_clip")
+    if g < 0.0 or g > 1.0:
+        raise ValueError("gamma must be in [0, 1]")
+    if u <= 0.0:
+        raise ValueError("rho_clip must be > 0")
+    if clip_c <= 0.0:
+        raise ValueError("c_clip must be > 0")
+
+    T = len(rewards)
+    rho = [0.0] * T
+    c_values = [0.0] * T
+    for t in range(T):
+        diff = target[t] - behavior[t]
+        if not math.isfinite(diff):
+            raise ValueError("log-prob difference must be finite")
+        try:
+            z = math.exp(diff)
+        except OverflowError:
+            raise ValueError("importance ratio exp overflow")
+        rho[t] = min(z, u)
+        c_values[t] = min(z, clip_c)
+
+    x = [0.0] * T
+    for t in range(T - 1, -1, -1):
+        base = 0.0 if term[t] else next_values[t]
+        delta = rewards[t] + g * base - values[t]
+        if not math.isfinite(delta):
+            raise ValueError("segmented vtrace delta must be finite")
+        d = rho[t] * delta
+        if not math.isfinite(d):
+            raise ValueError("clipped delta term must be finite")
+        if term[t] or trunc[t]:
+            x_t = values[t] + d
+        else:
+            gap = x[t + 1] - next_values[t]
+            if not math.isfinite(gap):
+                raise ValueError("value gap must be finite")
+            x_t = values[t] + d + g * c_values[t] * gap
+        if not math.isfinite(x_t):
+            raise ValueError("segmented vtrace target must be finite")
+        x[t] = x_t
+
+    advantages = [0.0] * T
+    for t in range(T):
+        if term[t]:
+            boot = 0.0
+        elif trunc[t]:
+            boot = next_values[t]
+        else:
+            boot = x[t + 1]
+        delta = rewards[t] + g * boot - values[t]
+        if not math.isfinite(delta):
+            raise ValueError("segmented vtrace advantage delta must be finite")
+        advantage = rho[t] * delta
+        if not math.isfinite(advantage):
+            raise ValueError("advantage must be finite")
+        advantages[t] = advantage
+    return {"values": x, "advantages": advantages}
+
+
 def categorical_projection(
     rewards, dones, next_probs, gamma=0.99, v_min=-10.0, v_max=10.0, atoms=51
 ) -> dict:
