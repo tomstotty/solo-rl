@@ -15370,6 +15370,87 @@ def ppo_evaluate_trace_many(
     }
 
 
+def ppo_audit(env, h, seeds, episodes=100, max_steps=1000) -> dict:
+    """只读 PPO 审计，聚合策略、优势、轨迹复现与收敛报告。
+
+    参数合法域及 TypeError/ValueError 分类沿用 ppo_evaluate_trace_many
+    （env 为 GridWorld，h 为逐行六元素 float 的 list，seeds 为非空
+    list/tuple 且元素为非 bool 的 int 并允许重复，episodes、max_steps
+    为正 int）；全部参数校验在首次 reset/step 之前完成，且不修改 h
+    或 seeds。本函数不训练、不改 logits，无论成功或异常均在返回前
+    恢复 env.state 与 env.done。
+
+    返回键依次为 policy、evaluation、advantages、convergence。
+
+    policy 按 h 行序为 [r, c, pU, pR, pD, pL] 列表：r、c 取自 h 行
+    前两列，四个动作概率按 U/R/D/L 对行内 logits 以稳定 softmax
+    exp(x-max)/sum(..., 0.0) 计算，均为 float；概率非有限抛
+    ValueError。
+
+    evaluation 即 ppo_evaluate_trace_many(env, h, seeds, episodes,
+    max_steps) 的完整返回值。
+
+    advantages 按 evaluation["results"] 同序为 [seed, reports] 列表；
+    reports 逐回合以步奖励为 r、等长全 0.0 为 v 与 n、步 done 为
+    term、仅末步未 done 为 trunc 调用 segmented_gae，保存其完整
+    返回 dict。
+
+    convergence 与 advantages 同序为 [seed, report] 列表；report 为
+    该 seed 逐回合 success 序列调用 ppo_success_streak 的完整返回
+    dict。
+
+    相同输入逐值一致，仅用标准库。
+    """
+    saved_state = env.state if isinstance(env, GridWorld) else None
+    saved_done = env.done if isinstance(env, GridWorld) else None
+    try:
+        evaluation = ppo_evaluate_trace_many(
+            env, h, seeds, episodes=episodes, max_steps=max_steps
+        )
+
+        policy = []
+        for row in h:
+            m = max(row[2:])
+            weights = [math.exp(x - m) for x in row[2:]]
+            total = sum(weights, 0.0)
+            probs = [weight / total for weight in weights]
+            for prob in probs:
+                if not math.isfinite(prob):
+                    raise ValueError("policy probabilities must be finite")
+            policy.append([row[0], row[1]] + probs)
+
+        advantages = []
+        convergence = []
+        for item in evaluation["results"]:
+            seed = item["seed"]
+            reports = []
+            successes = []
+            for episode in item["result"]["episodes"]:
+                trace = episode["trace"]
+                r = [step[5] for step in trace]
+                v = [0.0] * len(trace)
+                n = [0.0] * len(trace)
+                term = [step[6] for step in trace]
+                trunc = [False] * len(trace)
+                if not term[-1]:
+                    trunc[-1] = True
+                reports.append(segmented_gae(r, v, n, term, trunc))
+                successes.append(episode["success"])
+            advantages.append([seed, reports])
+            convergence.append([seed, ppo_success_streak(successes)])
+
+        return {
+            "policy": policy,
+            "evaluation": evaluation,
+            "advantages": advantages,
+            "convergence": convergence,
+        }
+    finally:
+        if isinstance(env, GridWorld):
+            env.state = saved_state
+            env.done = saved_done
+
+
 def ppo_evaluate_many(
     env, h, seeds, episodes=100, max_steps=1000, window=20, threshold=0.9
 ) -> dict:
