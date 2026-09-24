@@ -722,8 +722,9 @@ def visit_q(
     reset，单回合最多 M 步；全程随机性来自一个 random.Random(seed)。
 
     每步以 n=visits[s] 计算
-    rate=end+(e-end)/(1+n/d)**p；rate 非有限（含计算溢出）时在
-    N[s] 自增前抛 ValueError，随后 visits[s]+=1。消费一次
+    rate=end+(e-end)/(1+n/d)**p；n/d、1+n/d 或幂溢出/非有限（含
+    计算溢出），或 rate 非有限时，在 visits[s] 自增与 step 前抛
+    ValueError，随后 visits[s]+=1。消费一次
     random()：小于 rate 时再以 randrange(4) 按 URDL 均匀探索，否则
     取 Q 值最大且 URDL 中首个的动作。step 后 done 时目标为
     reward，否则为 reward+g*max_a Q[next,a]，以
@@ -791,10 +792,18 @@ def visit_q(
         for _step in range(M):
             n = visits[state]
             try:
-                rate = end + (e - end) / (1.0 + n / d) ** p
+                ratio = n / d
+                base = 1.0 + ratio
+                power = base**p
+                rate = end + (e - end) / power
             except OverflowError:
                 raise ValueError("exploration rate schedule overflowed")
-            if not math.isfinite(rate):
+            if (
+                not math.isfinite(ratio)
+                or not math.isfinite(base)
+                or not math.isfinite(power)
+                or not math.isfinite(rate)
+            ):
                 raise ValueError("exploration rate must be finite")
             visits[state] = n + 1
             if rng.random() < rate:
@@ -1730,6 +1739,149 @@ def dyna_q(
                 q[plan_key] += alpha * (plan_target - q[plan_key])
                 if not math.isfinite(q[plan_key]):
                     raise ValueError("Q value must remain finite")
+            if done:
+                break
+            state = next_state
+    return q
+
+
+def dyna_q_plus(
+    env,
+    episodes=500,
+    alpha=0.5,
+    gamma=0.9,
+    epsilon=0.1,
+    planning_steps=5,
+    kappa=0.001,
+    seed=0,
+    max_steps=1000,
+) -> dict:
+    """Dyna-Q+，返回 {((row, col), action): float}。
+
+    同名参数的 TypeError/ValueError 合法域与 dyna_q 完全一致；
+    kappa 须为非 bool 的 int/float，否则抛 TypeError，溢出、非有限
+    或小于 0 时抛 ValueError。
+
+    Q 覆盖从 S 可达的非 G 格与 U/R/D/L 的全部组合，初始为 0.0。
+    每回合 reset，done 即停；单回合最多 max_steps 步。time 初值 0。
+    每次处理状态 s 前，按 URDL 将尚未建模的动作以
+    model[s,a]=(s, 0, False) 插入模型并置 last[s,a]=0。随后与
+    dyna_q 相同地消费一次 rng.random() 决定是否探索，探索时再按
+    URDL 调用 rng.randrange(4)，否则取 URDL 中首个最大 Q 动作。
+    真实 step 后 time += 1，按 dyna_q 作真实更新，再以实际转移
+    覆盖模型（保持插入序）并置 last[s,a]=time。
+
+    之后规划 planning_steps 次：按模型插入序以
+    rng.randrange(len(model)) 抽键 (ps, pa)，令
+    b=kappa*sqrt(time-last[ps,pa])；done 时目标为 reward+b，
+    否则为 reward+b+gamma*maxQ(next)，再更新 Q。b、目标或新 Q
+    溢出/非有限时抛 ValueError。全部随机性来自一个
+    random.Random(seed)。
+    """
+    if not isinstance(env, GridWorld):
+        raise TypeError("env must be a GridWorld")
+    if isinstance(episodes, bool) or not isinstance(episodes, int):
+        raise TypeError("episodes must be an int")
+    if isinstance(planning_steps, bool) or not isinstance(planning_steps, int):
+        raise TypeError("planning_steps must be an int")
+    if isinstance(seed, bool) or not isinstance(seed, int):
+        raise TypeError("seed must be an int")
+    if isinstance(max_steps, bool) or not isinstance(max_steps, int):
+        raise TypeError("max_steps must be an int")
+    if isinstance(alpha, bool) or not isinstance(alpha, (int, float)):
+        raise TypeError("alpha must be an int or float")
+    if isinstance(gamma, bool) or not isinstance(gamma, (int, float)):
+        raise TypeError("gamma must be an int or float")
+    if isinstance(epsilon, bool) or not isinstance(epsilon, (int, float)):
+        raise TypeError("epsilon must be an int or float")
+    if isinstance(kappa, bool) or not isinstance(kappa, (int, float)):
+        raise TypeError("kappa must be an int or float")
+    if episodes <= 0:
+        raise ValueError("episodes must be positive")
+    if planning_steps <= 0:
+        raise ValueError("planning_steps must be positive")
+    if max_steps <= 0:
+        raise ValueError("max_steps must be positive")
+    if not _is_finite_number(alpha) or alpha <= 0 or alpha > 1:
+        raise ValueError("alpha must be finite and in (0, 1]")
+    if not _is_finite_number(gamma) or gamma < 0 or gamma >= 1:
+        raise ValueError("gamma must be finite and in [0, 1)")
+    if not _is_finite_number(epsilon) or epsilon < 0 or epsilon > 1:
+        raise ValueError("epsilon must be finite and in [0, 1]")
+    try:
+        kappa = float(kappa)
+    except OverflowError:
+        raise ValueError("kappa is too large to convert to float")
+    if not math.isfinite(kappa) or kappa < 0:
+        raise ValueError("kappa must be finite and in [0, +inf)")
+
+    actions = tuple(_ACTIONS)  # U, R, D, L
+    states = sorted(
+        state
+        for state in _reachable_cells(env)
+        if env._cell(state) != "G"
+    )
+    q = {(state, action): 0.0 for state in states for action in actions}
+    model = {}
+    last = {}
+    rng = random.Random(seed)
+    time = 0
+
+    for _ in range(episodes):
+        state = env.reset()
+        for _ in range(max_steps):
+            # 处理状态 s 前，按 URDL 补齐未建模动作。
+            for a in actions:
+                pending = (state, a)
+                if pending not in model:
+                    model[pending] = (state, 0, False)
+                    last[pending] = 0
+            if rng.random() < epsilon:
+                action = actions[rng.randrange(4)]
+            else:
+                action = max(actions, key=lambda a: q[(state, a)])
+            next_state, reward, done = env.step(action)
+            time += 1
+            if done:
+                target = reward
+            else:
+                target = reward + gamma * max(
+                    q[(next_state, a)] for a in actions
+                )
+            key = (state, action)
+            q[key] += alpha * (target - q[key])
+            if not math.isfinite(q[key]):
+                raise ValueError("Q value must remain finite")
+            # 实际转移覆盖补模型时的占位，保持原插入序。
+            model[key] = (next_state, reward, done)
+            last[key] = time
+            ordered_keys = list(model)
+            for _ in range(planning_steps):
+                plan_key = ordered_keys[rng.randrange(len(ordered_keys))]
+                plan_next, plan_reward, plan_done = model[plan_key]
+                try:
+                    bonus = kappa * math.sqrt(time - last[plan_key])
+                except OverflowError:
+                    raise ValueError("exploration bonus overflowed")
+                if not math.isfinite(bonus):
+                    raise ValueError("exploration bonus must be finite")
+                if plan_done:
+                    plan_target = plan_reward + bonus
+                else:
+                    plan_target = (
+                        plan_reward
+                        + bonus
+                        + gamma
+                        * max(q[(plan_next, a)] for a in actions)
+                    )
+                if not math.isfinite(plan_target):
+                    raise ValueError("target must be finite")
+                new_value = q[plan_key] + alpha * (
+                    plan_target - q[plan_key]
+                )
+                if not math.isfinite(new_value):
+                    raise ValueError("Q value must remain finite")
+                q[plan_key] = new_value
             if done:
                 break
             state = next_state
