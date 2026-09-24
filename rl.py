@@ -2957,6 +2957,8 @@ def bootstrapped_q_learning(
     mask_prob=0.8,
     seed=0,
     max_steps=1000,
+    epsilon_end=None,
+    decay_episodes=None,
 ) -> dict:
     """Bootstrapped Q-learning（多头），返回键序 q、heads 的 dict。
 
@@ -2965,7 +2967,12 @@ def bootstrapped_q_learning(
     每回合先调 randrange(heads) 选定本回合用头再 reset，单回合最多
     max_steps 步；全部随机性来自一个 random.Random(seed)。
 
-    每步先调一次 random()：其值 < epsilon 时按 URDL 调
+    epsilon_end 与 decay_episodes 须同时为 None 或同时给出：均为
+    None 时各回合探索率恒为 epsilon；否则第 e 回合（0 起）令
+    t=min(e/decay_episodes,1)，探索率为
+    epsilon+(epsilon_end-epsilon)*t。
+
+    每步先调一次 random()：其值 < 当回合探索率时按 URDL 调
     randrange(4) 取探索动作，否则按本回合用头取 URDL 首个最大 Q
     动作。step 后各头按序各调一次 random()：其值 < mask_prob 者用
     自身 Q 表更新，done 时目标为 r，否则 g 为该头在 s2 上 URDL
@@ -3012,6 +3019,31 @@ def bootstrapped_q_learning(
         raise ValueError("mask_prob must be finite and in (0, 1]")
     if max_steps <= 0:
         raise ValueError("max_steps must be positive")
+    if epsilon_end is not None and (
+        isinstance(epsilon_end, bool)
+        or not isinstance(epsilon_end, (int, float))
+    ):
+        raise TypeError("epsilon_end must be None, an int or float")
+    if decay_episodes is not None and (
+        isinstance(decay_episodes, bool)
+        or not isinstance(decay_episodes, int)
+    ):
+        raise TypeError("decay_episodes must be None or an int")
+    if (epsilon_end is None) != (decay_episodes is None):
+        raise ValueError(
+            "epsilon_end and decay_episodes must both be None or both set"
+        )
+    if epsilon_end is not None:
+        try:
+            end = float(epsilon_end)
+        except OverflowError:
+            raise ValueError(
+                "epsilon_end must be finite and in [0, 1]"
+            ) from None
+        if not math.isfinite(end) or end < 0 or end > 1:
+            raise ValueError("epsilon_end must be finite and in [0, 1]")
+        if decay_episodes <= 0:
+            raise ValueError("decay_episodes must be positive")
 
     actions = tuple(_ACTIONS)  # U, R, D, L
     states = sorted(
@@ -3025,11 +3057,18 @@ def bootstrapped_q_learning(
     q_tables = [dict(base) for _ in range(heads)]
     rng = random.Random(seed)
 
-    for _ in range(episodes):
+    for episode in range(episodes):
         active = rng.randrange(heads)
+        if epsilon_end is None:
+            rate = epsilon
+        else:
+            t = min(episode / decay_episodes, 1)
+            rate = epsilon + (end - epsilon) * t
+            if not math.isfinite(rate):
+                raise ValueError("epsilon rate must remain finite")
         state = env.reset()
         for _ in range(max_steps):
-            if rng.random() < epsilon:
+            if rng.random() < rate:
                 action = actions[rng.randrange(4)]
             else:
                 action = max(
