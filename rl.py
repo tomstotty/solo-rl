@@ -554,6 +554,128 @@ def qr_q(
     return {"q": q, "z": z_out}
 
 
+def visit_q(
+    env,
+    E=500,
+    a=0.5,
+    g=0.9,
+    e=0.2,
+    end=0.01,
+    d=100.0,
+    p=0.5,
+    seed=0,
+    M=1000,
+) -> dict:
+    """按状态访问数衰减探索率的 Q-learning，返回 {"q": Q, "visits": N}。
+
+    Q 覆盖从 S 可达的非 G 格与 U/R/D/L 的全部组合，初始为 0.0；
+    N 记录各可达非 G 格的访问次数，初始为 0。每回合 reset，单回合
+    最多 M 步（截断末步仍自举）；全部随机性来自一个
+    random.Random(seed)。
+
+    每步令 n=N[s]，探索率 rate=end+(e-end)/(1+n/d)**p，随后
+    N[s]+=1；调一次 random，小于 rate 才按 URDL 调 randrange(4)
+    探索，否则取首个最大 Q 动作（URDL 破同值）。step 后目标为
+    done 时 reward，否则 reward+g*maxQ(next)，作
+    Q+=a*(目标-Q)。调度溢出、rate、目标或新 Q 非有限均抛
+    ValueError。
+
+    返回的 q 按坐标升序乘 U/R/D/L 排列、值为 float，visits 按
+    坐标升序排列、值为 int，两者均为新建字典。
+    """
+    if not isinstance(env, GridWorld):
+        raise TypeError("env must be a GridWorld")
+    if isinstance(E, bool) or not isinstance(E, int):
+        raise TypeError("E must be an int")
+    if isinstance(seed, bool) or not isinstance(seed, int):
+        raise TypeError("seed must be an int")
+    if isinstance(M, bool) or not isinstance(M, int):
+        raise TypeError("M must be an int")
+    for name, value in (
+        ("a", a),
+        ("g", g),
+        ("e", e),
+        ("end", end),
+        ("d", d),
+        ("p", p),
+    ):
+        if isinstance(value, bool) or not isinstance(value, (int, float)):
+            raise TypeError("%s must be an int or float" % name)
+    if E <= 0:
+        raise ValueError("E must be positive")
+    if M <= 0:
+        raise ValueError("M must be positive")
+    try:
+        a = float(a)
+        g = float(g)
+        e = float(e)
+        end = float(end)
+        d = float(d)
+        p = float(p)
+    except OverflowError:
+        raise ValueError(
+            "parameter is too large to convert to float"
+        )
+    if not math.isfinite(a) or a <= 0 or a > 1:
+        raise ValueError("a must be finite and in (0, 1]")
+    if not math.isfinite(g) or g < 0 or g >= 1:
+        raise ValueError("g must be finite and in [0, 1)")
+    if not math.isfinite(e) or e < 0 or e > 1:
+        raise ValueError("e must be finite and in [0, 1]")
+    if not math.isfinite(end) or end < 0 or end > e:
+        raise ValueError("end must be finite and satisfy 0 <= end <= e")
+    if not math.isfinite(d) or d <= 0:
+        raise ValueError("d must be finite and in (0, +inf)")
+    if not math.isfinite(p) or p <= 0 or p > 1:
+        raise ValueError("p must be finite and in (0, 1]")
+
+    actions = tuple(_ACTIONS)  # U, R, D, L
+    states = [
+        state
+        for state in sorted(_reachable_cells(env))
+        if env._cell(state) != "G"
+    ]
+    q = {
+        (state, action): 0.0 for state in states for action in actions
+    }
+    visits = {state: 0 for state in states}
+    rng = random.Random(seed)
+
+    for _ in range(E):
+        state = env.reset()
+        for _ in range(M):
+            n = visits[state]
+            try:
+                rate = end + (e - end) / (1 + n / d) ** p
+            except OverflowError:
+                raise ValueError("exploration schedule overflowed")
+            if not math.isfinite(rate):
+                raise ValueError("exploration rate must remain finite")
+            visits[state] += 1
+            if rng.random() < rate:
+                action = actions[rng.randrange(4)]
+            else:
+                action = max(actions, key=lambda act: q[(state, act)])
+            next_state, reward, done = env.step(action)
+            if done:
+                target = reward
+            else:
+                target = reward + g * max(
+                    q[(next_state, act)] for act in actions
+                )
+            if not math.isfinite(target):
+                raise ValueError("target must remain finite")
+            key = (state, action)
+            new_value = q[key] + a * (target - q[key])
+            if not math.isfinite(new_value):
+                raise ValueError("Q value must remain finite")
+            q[key] = new_value
+            if done:
+                break
+            state = next_state
+    return {"q": dict(q), "visits": dict(visits)}
+
+
 def ucb_q_learning(
     env,
     episodes=500,
