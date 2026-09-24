@@ -9465,6 +9465,177 @@ def segmented_gae(r, v, n, term, trunc, gamma=0.9, lambda_=0.95) -> dict:
     }
 
 
+def segmented_gae_batch(
+    segments, gamma=0.9, lambda_=0.95, epsilon=1e-8
+) -> dict:
+    """多段轨迹的广义优势估计，并对全部优势做整体标准化。
+
+    segments 须为非空 list，每项为键序恰为 r、v、n、term、trunc
+    的 dict；容器或项类型错误抛 TypeError，空 list 或键序不符抛
+    ValueError。五个字段及 gamma、lambda_ 的类型、长度、标记、
+    有限性与值域校验和异常均沿用 segmented_gae。epsilon 须为非
+    bool 的 int/float（错型抛 TypeError），转 float 溢出、结果
+    非有限或 <= 0 均抛 ValueError。全部校验通过后按段序调用
+    segmented_gae，不修改输入。将各段原始 advantages 按段、步序
+    展平，从 0.0 顺序累加求均值 m，再累加 (A-m)**2 除以总步数并
+    开方得标准差 s。s 为 0.0 时标准化值取正 0.0，否则为
+    (A-m)/(s+epsilon)；累加、中间量或输出非有限均抛 ValueError。
+    返回固定键序 segments、mean、std 的新 dict；segments 与输入
+    同序，每项为固定键序 deltas、advantages、returns、normalized
+    的 dict，四个值均为 float 新 list；mean、std 为 float。相同
+    输入结果逐值一致。
+    """
+    if not isinstance(segments, list):
+        raise TypeError("segments must be a list")
+    if len(segments) == 0:
+        raise ValueError("segments must be non-empty")
+    expected_keys = ["r", "v", "n", "term", "trunc"]
+    for segment in segments:
+        if not isinstance(segment, dict):
+            raise TypeError("each segment must be a dict")
+        if list(segment.keys()) != expected_keys:
+            raise ValueError(
+                "each segment must have keys r, v, n, term, trunc "
+                "in order"
+            )
+
+    def _to_float(item, name):
+        if isinstance(item, bool) or not isinstance(item, (int, float)):
+            raise TypeError(f"{name} must contain only int or float")
+        try:
+            result = float(item)
+        except OverflowError:
+            raise ValueError(f"{name} must convert to a finite float")
+        if not math.isfinite(result):
+            raise ValueError(f"{name} must contain only finite numbers")
+        return result
+
+    for segment in segments:
+        r = segment["r"]
+        v = segment["v"]
+        n = segment["n"]
+        term = segment["term"]
+        trunc = segment["trunc"]
+        for name, seq in (
+            ("r", r),
+            ("v", v),
+            ("n", n),
+            ("term", term),
+            ("trunc", trunc),
+        ):
+            if not isinstance(seq, (list, tuple)):
+                raise TypeError(f"{name} must be a list or tuple")
+        if len(r) == 0:
+            raise ValueError("r, v, n, term and trunc must be non-empty")
+        if not (len(r) == len(v) == len(n) == len(term) == len(trunc)):
+            raise ValueError(
+                "r, v, n, term and trunc must have equal length"
+            )
+        for name, seq in (("r", r), ("v", v), ("n", n)):
+            for item in seq:
+                _to_float(item, name)
+        for name, seq in (("term", term), ("trunc", trunc)):
+            for item in seq:
+                if not isinstance(item, bool):
+                    raise TypeError(f"{name} must contain only bool")
+        for t in range(len(term)):
+            if term[t] and trunc[t]:
+                raise ValueError(
+                    "term and trunc must not both be True at the same index"
+                )
+
+    def _to_scalar(item, name):
+        if isinstance(item, bool) or not isinstance(item, (int, float)):
+            raise TypeError(f"{name} must be an int or float")
+        try:
+            result = float(item)
+        except OverflowError:
+            raise ValueError(f"{name} must convert to a finite float")
+        if not math.isfinite(result):
+            raise ValueError(f"{name} must be finite")
+        return result
+
+    g = _to_scalar(gamma, "gamma")
+    l = _to_scalar(lambda_, "lambda_")
+    if g < 0.0 or g > 1.0:
+        raise ValueError("gamma must be in [0, 1]")
+    if l < 0.0 or l > 1.0:
+        raise ValueError("lambda_ must be in [0, 1]")
+    eps = _to_scalar(epsilon, "epsilon")
+    if eps <= 0.0:
+        raise ValueError("epsilon must be > 0")
+
+    results = [
+        segmented_gae(
+            segment["r"],
+            segment["v"],
+            segment["n"],
+            segment["term"],
+            segment["trunc"],
+            gamma,
+            lambda_,
+        )
+        for segment in segments
+    ]
+
+    count = 0
+    total = 0.0
+    for res in results:
+        for advantage in res["advantages"]:
+            total += advantage
+            count += 1
+            if not math.isfinite(total):
+                raise ValueError("advantage sum must be finite")
+    mean = total / count
+    if not math.isfinite(mean):
+        raise ValueError("advantage mean must be finite")
+
+    squared = 0.0
+    for res in results:
+        for advantage in res["advantages"]:
+            diff = advantage - mean
+            if not math.isfinite(diff):
+                raise ValueError("centered advantage must be finite")
+            try:
+                squared += diff ** 2
+            except OverflowError:
+                raise ValueError("squared advantage sum must be finite")
+            if not math.isfinite(squared):
+                raise ValueError("squared advantage sum must be finite")
+    variance = squared / count
+    if not math.isfinite(variance):
+        raise ValueError("advantage variance must be finite")
+    std = math.sqrt(variance)
+    if not math.isfinite(std):
+        raise ValueError("advantage std must be finite")
+
+    out_segments = []
+    for res in results:
+        normalized = []
+        for advantage in res["advantages"]:
+            if std == 0.0:
+                normalized.append(0.0)
+            else:
+                denom = std + eps
+                if not math.isfinite(denom):
+                    raise ValueError("normalizer must be finite")
+                value = (advantage - mean) / denom
+                if not math.isfinite(value):
+                    raise ValueError(
+                        "normalized advantage must be finite"
+                    )
+                normalized.append(value)
+        out_segments.append(
+            {
+                "deltas": res["deltas"],
+                "advantages": res["advantages"],
+                "returns": res["returns"],
+                "normalized": normalized,
+            }
+        )
+    return {"segments": out_segments, "mean": mean, "std": std}
+
+
 def segmented_vtrace(
     r, v, n, b, p, term, trunc, gamma=0.9, rho_clip=1.0, c_clip=1.0
 ) -> dict:
