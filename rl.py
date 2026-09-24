@@ -932,6 +932,134 @@ def q_learning_trace(
     return {"q": q, "episodes": episode_records}
 
 
+def q_evaluate_trace(
+    env,
+    q,
+    episodes=100,
+    max_steps=1000,
+    epsilon=0.0,
+    seed=0,
+) -> dict:
+    """按给定 Q 表贪心评估，返回逐回合轨迹与成功率。
+
+    env 须为 GridWorld；episodes、max_steps、seed 的校验与异常分类
+    沿用 q_learning_trace 同名参数（非 bool int，episodes 与
+    max_steps 须为正）。epsilon 须为非 bool 的有限 int/float 且在
+    [0, 1]，错型抛 TypeError，值错抛 ValueError。全部校验先于首次
+    reset。
+
+    q 须为 dict，键域须与 q_learning 返回的 Q 完全相同（从 S 可达
+    的非 G 格 × U/R/D/L，键为 ((row, col), action)），值须为有限
+    float；容器、键型或值型错抛 TypeError，键域不符或值非有限抛
+    ValueError。不修改 q。
+
+    全部随机性来自一个 random.Random(seed)：每步先取一次
+    random()，小于 epsilon 时按 URDL 序调用 randrange(4) 选动作，
+    否则取 q 值最大且 URDL 序首个的动作。每回合 reset，到达 G 立即
+    结束，到达步限截断时保留末步且末步 done=False。
+
+    返回键序为 episodes、success_rate 的 dict：episodes 为回合
+    列表，每项为键序 trace、total_reward、success 的 dict；trace
+    步结构与类型沿用 q_learning_trace（[r, c, action, next_r,
+    next_c, reward, done]），total_reward 为 int 回报和，success
+    仅表示到达 G。success_rate 为成功数除以回合数的 float。相同
+    参数与 seed 逐值一致。仅用标准库，不引入命令行入口。
+    """
+    if not isinstance(env, GridWorld):
+        raise TypeError("env must be a GridWorld")
+    if isinstance(episodes, bool) or not isinstance(episodes, int):
+        raise TypeError("episodes must be an int")
+    if isinstance(seed, bool) or not isinstance(seed, int):
+        raise TypeError("seed must be an int")
+    if isinstance(max_steps, bool) or not isinstance(max_steps, int):
+        raise TypeError("max_steps must be an int")
+    if isinstance(epsilon, bool) or not isinstance(epsilon, (int, float)):
+        raise TypeError("epsilon must be an int or float")
+    if episodes <= 0:
+        raise ValueError("episodes must be positive")
+    if max_steps <= 0:
+        raise ValueError("max_steps must be positive")
+    if not _is_finite_number(epsilon) or epsilon < 0 or epsilon > 1:
+        raise ValueError("epsilon must be finite and in [0, 1]")
+
+    actions = tuple(_ACTIONS)  # U, R, D, L
+    states = [
+        state
+        for state in sorted(_reachable_cells(env))
+        if env._cell(state) != "G"
+    ]
+    expected_keys = {
+        (state, action) for state in states for action in actions
+    }
+
+    if not isinstance(q, dict):
+        raise TypeError("q must be a dict")
+    for key, value in q.items():
+        if (
+            not isinstance(key, tuple)
+            or len(key) != 2
+            or not isinstance(key[0], tuple)
+            or len(key[0]) != 2
+            or any(
+                isinstance(v, bool) or not isinstance(v, int)
+                for v in key[0]
+            )
+            or not isinstance(key[1], str)
+        ):
+            raise TypeError(
+                "q keys must be ((row, col), action) tuples"
+            )
+        if not isinstance(value, float):
+            raise TypeError("q values must be floats")
+    if set(q) != expected_keys:
+        raise ValueError(
+            "q must cover exactly the reachable non-G cells times"
+            " U, R, D, L"
+        )
+    for value in q.values():
+        if not math.isfinite(value):
+            raise ValueError("q values must be finite")
+
+    rng = random.Random(seed)
+
+    episode_records = []
+    successes = 0
+    for _ in range(episodes):
+        state = env.reset()
+        trace = []
+        total_reward = 0
+        success = False
+        for _ in range(max_steps):
+            r, c = state
+            if rng.random() < epsilon:
+                action = actions[rng.randrange(4)]
+            else:
+                action = max(actions, key=lambda a: q[(state, a)])
+            next_state, reward, done = env.step(action)
+            next_r, next_c = next_state
+            trace.append(
+                [r, c, action, next_r, next_c, reward, done]
+            )
+            total_reward += reward
+            if done:
+                success = True
+                break
+            state = next_state
+        if success:
+            successes += 1
+        episode_records.append(
+            {
+                "trace": trace,
+                "total_reward": total_reward,
+                "success": success,
+            }
+        )
+    return {
+        "episodes": episode_records,
+        "success_rate": successes / episodes,
+    }
+
+
 def q_learning_trace_bytes(env, data) -> bytes:
     """将 q_learning_trace 的结果严格校验并规范序列化为单行 JSON 字节。
 
@@ -5730,7 +5858,7 @@ def lspi(
     max_steps=1000,
     max_iterations=20,
 ) -> dict:
-    """最小二乘策略迭代：在 lstdq 策略评估外做确定性情商策略改进。
+    """最小二乘策略迭代：在 lstdq 策略评估外做确定性贪心策略改进。
 
     env、episodes、gamma、lambda_、ridge、seed、max_steps 同名参数的
     校验顺序、合法域与异常分类完全沿用 lstdq；max_iterations 须为非
