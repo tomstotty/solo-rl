@@ -12721,6 +12721,99 @@ def ppo_success_streak(successes, window=20, threshold=0.9, patience=3) -> dict:
     }
 
 
+def return_plateau(returns, window=20, tol=0.01, min_episodes=40) -> dict:
+    """根据相邻两窗回报均值差判定训练回报平台期，返回诊断字典。
+
+    returns 须为非空 list/tuple，成员为非 bool 的 int/float；容器或
+    成员类型错抛 TypeError，空序列抛 ValueError。window、min_episodes
+    须为非 bool 正 int；tol 须为非 bool 的 int/float。两整数 <= 0、
+    成员或 tol 转 float 溢出或非有限、tol < 0 均抛 ValueError。
+
+    先取 float 副本 R 及 T=float(tol)，不修改输入。令 w=window、稳定
+    数初值 0；对 e=2w 至 len(R)（含）依次取前窗 R[e-2w:e-w] 与近窗
+    R[e-w:e]，均从 0.0 按序求和后除以 w，change 为两均值差绝对值；
+    change <= T 则稳定数加 1，否则归零。episode 取首个 e >=
+    min_episodes 且稳定数 >= w 的 e，但始终计算至末尾。
+
+    返回键序 converged、episode、previous、recent、change、stable：
+    previous、recent、change 取末次 e 的前窗均值、近窗均值与差值
+    （float），无双窗（len(R) < 2w）时均为 None；stable 为末尾稳定
+    数（int），converged 等价于 episode 非 None。运算或输出出现非有
+    限值抛 ValueError。相同输入逐值一致，仅用标准库。
+    """
+    if not isinstance(returns, (list, tuple)):
+        raise TypeError("returns must be a list or tuple")
+    for item in returns:
+        if isinstance(item, bool) or not isinstance(item, (int, float)):
+            raise TypeError("returns must contain only int or float")
+    if isinstance(window, bool) or not isinstance(window, int):
+        raise TypeError("window must be a non-bool int")
+    if isinstance(min_episodes, bool) or not isinstance(min_episodes, int):
+        raise TypeError("min_episodes must be a non-bool int")
+    if isinstance(tol, bool) or not isinstance(tol, (int, float)):
+        raise TypeError("tol must be an int or float")
+
+    if len(returns) == 0:
+        raise ValueError("returns must be non-empty")
+    if window <= 0:
+        raise ValueError("window must be positive")
+    if min_episodes <= 0:
+        raise ValueError("min_episodes must be positive")
+
+    r_values = []
+    for item in returns:
+        try:
+            value = float(item)
+        except OverflowError:
+            raise ValueError("returns values must convert to finite floats")
+        if not math.isfinite(value):
+            raise ValueError("returns values must be finite")
+        r_values.append(value)
+
+    try:
+        tolerance = float(tol)
+    except OverflowError:
+        raise ValueError("tol must convert to a finite float")
+    if not math.isfinite(tolerance):
+        raise ValueError("tol must be finite")
+    if tolerance < 0.0:
+        raise ValueError("tol must be >= 0")
+
+    w = window
+    n = len(r_values)
+    stable = 0
+    episode = None
+    previous = None
+    recent = None
+    change = None
+    for e in range(2 * w, n + 1):
+        prev_mean = sum(r_values[e - 2 * w:e - w], 0.0) / w
+        recent_mean = sum(r_values[e - w:e], 0.0) / w
+        if not math.isfinite(prev_mean) or not math.isfinite(recent_mean):
+            raise ValueError("window means must be finite")
+        delta = abs(prev_mean - recent_mean)
+        if not math.isfinite(delta):
+            raise ValueError("change must be finite")
+        previous = prev_mean
+        recent = recent_mean
+        change = delta
+        if delta <= tolerance:
+            stable += 1
+        else:
+            stable = 0
+        if episode is None and e >= min_episodes and stable >= w:
+            episode = e
+
+    return {
+        "converged": episode is not None,
+        "episode": episode,
+        "previous": previous,
+        "recent": recent,
+        "change": change,
+        "stable": stable,
+    }
+
+
 def ppo_train_until(
     env,
     max_episodes=100,
