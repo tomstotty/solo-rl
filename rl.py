@@ -4882,6 +4882,177 @@ def off_policy_td(
     return v
 
 
+def off_policy_mc_prediction(
+    env,
+    behavior,
+    target,
+    episodes=500,
+    gamma=0.9,
+    seed=0,
+    max_steps=1000,
+) -> dict:
+    """按行为策略采样、对目标策略做离策略 MC 预测，返回 V/C 表。
+
+    behavior、target 的结构、取值与异常均同 off_policy_td：dict 键恰为
+    从 S 可达的非 G 格（二元非 bool 整数 tuple），值为 U/R/D/L 序的
+    四项 list，各项为有限非负 float 且行和为 1.0；target 取正概率处
+    behavior 也必须为正。其余同名参数校验、G 格值恒 0.0、reset 与
+    done/max_steps 边界亦同 off_policy_td。V、C 均覆盖全部 S 可达格，
+    按坐标升序建表，初值 0.0。
+
+    全部随机性来自一个 random.Random(seed)。每回合 reset，至 done 或
+    max_steps 步；每步仅调用一次 random()，按 behavior 的 URDL 累计
+    概率取首个严格大于样本的动作，未命中取最后一个正概率动作。记录
+    state、reward 与 rho=target[s][a]/behavior[s][a]。
+
+    回合结束（终止与截断均不自举）置 G=0.0、W=1.0，逆序对每条记录作
+    G=reward+gamma*G、W*=rho；W 为 0 即停止本回合回溯，否则作
+    C[state]+=W、V[state]+=W/C[state]*(G-V[state])。rho、G、W、C、V
+    溢出或非有限即抛 ValueError。
+
+    返回键依次为 values、weights、episodes：values 与 weights 均为
+    {cell: float}；episodes 项为 [steps, total_reward, done]，依次为
+    int、int、bool，total_reward 自 0 按步累加。
+    """
+    if not isinstance(env, GridWorld):
+        raise TypeError("env must be a GridWorld")
+    if isinstance(episodes, bool) or not isinstance(episodes, int):
+        raise TypeError("episodes must be an int")
+    if isinstance(seed, bool) or not isinstance(seed, int):
+        raise TypeError("seed must be an int")
+    if isinstance(max_steps, bool) or not isinstance(max_steps, int):
+        raise TypeError("max_steps must be an int")
+    if isinstance(gamma, bool) or not isinstance(gamma, (int, float)):
+        raise TypeError("gamma must be an int or float")
+    if episodes <= 0:
+        raise ValueError("episodes must be positive")
+    if max_steps <= 0:
+        raise ValueError("max_steps must be positive")
+    if not _is_finite_number(gamma) or gamma < 0 or gamma >= 1:
+        raise ValueError("gamma must be finite and in [0, 1)")
+
+    actions = tuple(_ACTIONS)  # U, R, D, L
+    states = sorted(
+        state
+        for state in _reachable_cells(env)
+        if env._cell(state) != "G"
+    )
+    all_states = sorted(_reachable_cells(env))
+
+    def _validate_policy(policy, name):
+        if not isinstance(policy, dict):
+            raise TypeError(name + " must be a dict")
+        for key in policy:
+            if (
+                not isinstance(key, tuple)
+                or len(key) != 2
+                or any(
+                    isinstance(v, bool) or not isinstance(v, int)
+                    for v in key
+                )
+            ):
+                raise TypeError(
+                    name + " keys must be tuples of two non-bool ints"
+                )
+        if set(policy) != set(states):
+            raise ValueError(
+                name
+                + " keys must exactly be the reachable non-goal cells"
+            )
+        for cell in states:
+            row = policy[cell]
+            if not isinstance(row, list):
+                raise TypeError(name + " rows must be lists")
+            if len(row) != 4:
+                raise ValueError(
+                    name
+                    + " rows must have four entries in U, R, D, L order"
+                )
+            for probability in row:
+                if isinstance(probability, bool) or not isinstance(
+                    probability, float
+                ):
+                    raise TypeError(name + " probabilities must be floats")
+            for probability in row:
+                if not math.isfinite(probability):
+                    raise ValueError(
+                        name + " probabilities must be finite"
+                    )
+                if probability < 0:
+                    raise ValueError(
+                        name + " probabilities must be non-negative"
+                    )
+            if sum(row, 0.0) != 1.0:
+                raise ValueError(name + " rows must sum to 1.0")
+
+    _validate_policy(behavior, "behavior policy")
+    _validate_policy(target, "target policy")
+    for cell in states:
+        for index in range(4):
+            if target[cell][index] > 0.0 and behavior[cell][index] <= 0.0:
+                raise ValueError(
+                    "behavior policy must have positive probability wherever "
+                    "target policy does"
+                )
+
+    v = {cell: 0.0 for cell in all_states}
+    c = {cell: 0.0 for cell in all_states}
+    rng = random.Random(seed)
+    episode_results = []
+
+    for _ in range(episodes):
+        state = env.reset()
+        trajectory = []
+        total_reward = 0
+        done = False
+        for _ in range(max_steps):
+            row = behavior[state]
+            fallback = 3
+            while row[fallback] <= 0.0:
+                fallback -= 1
+            sample = rng.random()
+            cumulative = 0.0
+            action_index = fallback
+            for index, probability in enumerate(row):
+                cumulative += probability
+                if cumulative > sample:
+                    action_index = index
+                    break
+            behavior_probability = row[action_index]
+            rho = (
+                target[state][action_index] / behavior_probability
+            )
+            if not math.isfinite(rho):
+                raise ValueError("importance ratio must remain finite")
+            next_state, reward, done = env.step(actions[action_index])
+            trajectory.append([state, reward, rho])
+            total_reward += reward
+            if done:
+                break
+            state = next_state
+        episode_results.append([len(trajectory), total_reward, done])
+
+        g_return = 0.0
+        weight = 1.0
+        for st, reward, rho in reversed(trajectory):
+            g_return = reward + gamma * g_return
+            if not math.isfinite(g_return):
+                raise ValueError("return must remain finite")
+            weight *= rho
+            if not math.isfinite(weight):
+                raise ValueError("weight must remain finite")
+            if weight == 0.0:
+                break
+            c[st] += weight
+            if not math.isfinite(c[st]):
+                raise ValueError("C value must remain finite")
+            v[st] += weight / c[st] * (g_return - v[st])
+            if not math.isfinite(v[st]):
+                raise ValueError("V value must remain finite")
+
+    return {"values": v, "weights": c, "episodes": episode_results}
+
+
 def emphatic_td_lambda(
     env,
     behavior,
