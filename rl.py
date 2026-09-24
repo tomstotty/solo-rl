@@ -5258,10 +5258,10 @@ def off_policy_mc_converge(
             delta = 0.0
             for cell in all_states:
                 change = abs(v[cell] - snapshot[cell])
+                if not math.isfinite(change):
+                    raise ValueError("convergence delta must be finite")
                 if change > delta:
                     delta = change
-            if not math.isfinite(delta):
-                raise ValueError("convergence delta must be finite")
             passed = delta <= tolerance
             checks.append([ran, delta, passed])
             snapshot = dict(v)
@@ -5278,6 +5278,105 @@ def off_policy_mc_converge(
         "weights": c,
         "episodes": history,
         "checks": checks,
+        "converged": converged,
+    }
+
+
+def off_policy_mc_converge_many(
+    env,
+    behavior,
+    target,
+    seeds,
+    episodes=500,
+    minimum=0.8,
+    spread=0.01,
+) -> dict:
+    """按多种子独立运行 off_policy_mc_converge 并汇总跨种子收敛情况。
+
+    seeds 须为非空 list/tuple，成员为非 bool 的 int，允许重复；容器或
+    成员错型抛 TypeError，seeds 为空抛 ValueError。minimum、spread 须
+    为非 bool 的 int/float，错型抛 TypeError；转 float 溢出或非有限抛
+    ValueError，minimum 越出 [0, 1]、spread 为负抛 ValueError。env、
+    behavior、target、episodes 及其余训练契约均沿用 off_policy_mc_converge
+    的单次接口，其异常原样透传。全部校验在首次 reset 前完成。
+
+    校验通过后按 seeds 序逐项独立训练，每项仅替换 seed（各自独立的随机
+    流），不修改 seeds、策略等任何输入。
+
+    返回键序为 results、rate、spreads、converged：results 为与 seeds
+    同序的 [seed, report] 行，report 为 off_policy_mc_converge 的完整
+    单次返回值；rate 为 report.converged 为真的项数除以总项数所得
+    float；spreads 按全部可达格（含 G）坐标升序排列，每行
+    [r, c, min, max, gap]，后三项依次为各 report.values 对应格 float
+    的最小值、最大值及二者之差，汇总中出现非有限值抛 ValueError；
+    converged 仅当 rate >= float(minimum) 且所有 gap <= float(spread)
+    时为 True。相同输入逐值一致，仅用标准库，不引入命令行入口。
+    """
+    if not isinstance(seeds, (list, tuple)):
+        raise TypeError("seeds must be a list or tuple")
+    if not seeds:
+        raise ValueError("seeds must be non-empty")
+    for seed in seeds:
+        if isinstance(seed, bool) or not isinstance(seed, int):
+            raise TypeError("every seed must be a non-bool int")
+    if isinstance(minimum, bool) or not isinstance(minimum, (int, float)):
+        raise TypeError("minimum must be an int or float")
+    if isinstance(spread, bool) or not isinstance(spread, (int, float)):
+        raise TypeError("spread must be an int or float")
+    try:
+        minimum_rate = float(minimum)
+    except OverflowError:
+        raise ValueError("minimum must be finite") from None
+    if not math.isfinite(minimum_rate):
+        raise ValueError("minimum must be finite and in [0, 1]")
+    if minimum_rate < 0.0 or minimum_rate > 1.0:
+        raise ValueError("minimum must be finite and in [0, 1]")
+    try:
+        spread_limit = float(spread)
+    except OverflowError:
+        raise ValueError("spread must be finite") from None
+    if not math.isfinite(spread_limit):
+        raise ValueError("spread must be finite and non-negative")
+    if spread_limit < 0.0:
+        raise ValueError("spread must be finite and non-negative")
+
+    results = []
+    for seed in seeds:
+        report = off_policy_mc_converge(
+            env,
+            behavior,
+            target,
+            episodes=episodes,
+            seed=seed,
+        )
+        results.append([seed, report])
+
+    rate = sum(
+        1 for _, report in results if report["converged"]
+    ) / len(results)
+
+    spreads_rows = []
+    for cell in sorted(_reachable_cells(env)):
+        values = [report["values"][cell] for _, report in results]
+        low = min(values)
+        high = max(values)
+        gap = high - low
+        if (
+            not math.isfinite(low)
+            or not math.isfinite(high)
+            or not math.isfinite(gap)
+        ):
+            raise ValueError("value spread must be finite")
+        spreads_rows.append([cell[0], cell[1], low, high, gap])
+
+    converged = rate >= minimum_rate and all(
+        row[4] <= spread_limit for row in spreads_rows
+    )
+
+    return {
+        "results": results,
+        "rate": rate,
+        "spreads": spreads_rows,
         "converged": converged,
     }
 
