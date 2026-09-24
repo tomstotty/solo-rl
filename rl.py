@@ -1427,6 +1427,135 @@ def dyna_q(
     return q
 
 
+def prioritized_sweeping(
+    env,
+    episodes=500,
+    alpha=0.5,
+    gamma=0.9,
+    epsilon=0.1,
+    planning_steps=5,
+    theta=1e-6,
+    seed=0,
+    max_steps=1000,
+) -> dict:
+    """优先扫描（Prioritized Sweeping），返回 {((row, col), action): float}。
+
+    Q 覆盖从 S 可达的非 G 格与 U/R/D/L 的全部组合，初始为 0.0。
+    每回合 reset，done 即停；单回合最多 max_steps 步（末步照常执行）。
+    每个真实步先且仅调用一次 rng.random() 决定是否探索，探索时再按
+    URDL 调用 rng.randrange(4)，否则取 URDL 中首个最大 Q 动作。
+    真实步不直接更新 Q，而是以 (state, action) 覆盖模型值
+    (next_state, reward, done)（重复键覆盖但保持插入序），并计算优先级
+    p = abs(target - Q)，p > theta 时把队列该键设为 p 与旧优先级的较大者。
+    随后每步至多规划 planning_steps 次：队列空即停，否则弹出优先级最大项
+    （平局取 Q 键序首项），按模型与当前 Q 重算目标并更新 Q，再按 Q 键序
+    扫描已建模键，凡其 next_state 等于刚更新键的 state 者重算 p 并按同一
+    规则入队。模型与队列跨回合保留，规划过程不消耗随机数。
+    全部随机性来自一个 random.Random(seed)。
+    """
+    if not isinstance(env, GridWorld):
+        raise TypeError("env must be a GridWorld")
+    if isinstance(episodes, bool) or not isinstance(episodes, int):
+        raise TypeError("episodes must be an int")
+    if isinstance(planning_steps, bool) or not isinstance(planning_steps, int):
+        raise TypeError("planning_steps must be an int")
+    if isinstance(seed, bool) or not isinstance(seed, int):
+        raise TypeError("seed must be an int")
+    if isinstance(max_steps, bool) or not isinstance(max_steps, int):
+        raise TypeError("max_steps must be an int")
+    if isinstance(alpha, bool) or not isinstance(alpha, (int, float)):
+        raise TypeError("alpha must be an int or float")
+    if isinstance(gamma, bool) or not isinstance(gamma, (int, float)):
+        raise TypeError("gamma must be an int or float")
+    if isinstance(epsilon, bool) or not isinstance(epsilon, (int, float)):
+        raise TypeError("epsilon must be an int or float")
+    if isinstance(theta, bool) or not isinstance(theta, (int, float)):
+        raise TypeError("theta must be an int or float")
+    if episodes <= 0:
+        raise ValueError("episodes must be positive")
+    if planning_steps <= 0:
+        raise ValueError("planning_steps must be positive")
+    if max_steps <= 0:
+        raise ValueError("max_steps must be positive")
+    if not _is_finite_number(alpha) or alpha <= 0 or alpha > 1:
+        raise ValueError("alpha must be finite and in (0, 1]")
+    if not _is_finite_number(gamma) or gamma < 0 or gamma >= 1:
+        raise ValueError("gamma must be finite and in [0, 1)")
+    if not _is_finite_number(epsilon) or epsilon < 0 or epsilon > 1:
+        raise ValueError("epsilon must be finite and in [0, 1]")
+    if not _is_finite_number(theta) or theta <= 0:
+        raise ValueError("theta must be finite and positive")
+
+    actions = tuple(_ACTIONS)  # U, R, D, L
+    states = sorted(
+        state
+        for state in _reachable_cells(env)
+        if env._cell(state) != "G"
+    )
+    q = {(state, action): 0.0 for state in states for action in actions}
+    model = {}
+    queue = {}
+    rng = random.Random(seed)
+
+    def _target(key):
+        plan_next, plan_reward, plan_done = model[key]
+        if plan_done:
+            return plan_reward
+        return plan_reward + gamma * max(q[(plan_next, a)] for a in actions)
+
+    def _offer(key):
+        target = _target(key)
+        if not math.isfinite(target):
+            raise ValueError("target must remain finite")
+        p = abs(target - q[key])
+        if not math.isfinite(p):
+            raise ValueError("priority must remain finite")
+        if p > theta:
+            old = queue.get(key)
+            queue[key] = p if old is None else max(p, old)
+
+    for _ in range(episodes):
+        state = env.reset()
+        for _ in range(max_steps):
+            if rng.random() < epsilon:
+                action = actions[rng.randrange(4)]
+            else:
+                action = max(actions, key=lambda a: q[(state, a)])
+            next_state, reward, done = env.step(action)
+            key = (state, action)
+            # 真实步不直接更新 Q，仅覆盖模型值并按优先级入队。
+            model[key] = (next_state, reward, done)
+            _offer(key)
+            for _ in range(planning_steps):
+                if not queue:
+                    break
+                # 弹出优先级最大项，平局取 Q 键序首项。
+                best_key = None
+                best_p = None
+                for q_key in q:
+                    if q_key in queue:
+                        p = queue[q_key]
+                        if best_p is None or p > best_p:
+                            best_key = q_key
+                            best_p = p
+                del queue[best_key]
+                target = _target(best_key)
+                if not math.isfinite(target):
+                    raise ValueError("target must remain finite")
+                new_q = q[best_key] + alpha * (target - q[best_key])
+                if not math.isfinite(new_q):
+                    raise ValueError("Q value must remain finite")
+                q[best_key] = new_q
+                # 按 Q 键序扫描已建模的前驱键，重算 p 并按同一规则入队。
+                for q_key in q:
+                    if q_key in model and model[q_key][0] == best_key[0]:
+                        _offer(q_key)
+            if done:
+                break
+            state = next_state
+    return q
+
+
 def sarsa_lambda(
     env,
     episodes=500,
