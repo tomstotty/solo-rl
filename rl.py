@@ -9605,9 +9605,10 @@ def trpo(logits, batch, max_kl=0.01, steps=10) -> dict:
     J0=sum(A, 0.0)/len(batch)。依 i=0..steps-1，每次均从原 logits 造
     X=logits+(2.0**-i)*d，候选之间不串接；对 X 作稳定 log-softmax
     得 qX，目标
-    J(X)=sum(A*exp(qX[s,a]-q0[s,a]), 0.0)/len(batch)，并以
-    ppo_policy_kl(logits, X)["mean"] 取旧策略到新策略的 mean KL 记为
-    K(X)，将该次的 J、K float 依序加入 objectives、kls。首个满足
+    J(X)=sum(A*exp(qX[s,a]-q0[s,a]), 0.0)/len(batch)，并将原 logits 与
+    X 逐项 float() 转为普通 float（兼容 float 子类，不修改输入）后以
+    ppo_policy_kl(plain, plain_X)["mean"] 取旧策略到新策略的 mean KL 记
+    为 K(X)，将该次的 J、K float 依序加入 objectives、kls。首个满足
     K<=max_kl 且 J>=J0 的候选即接受并停止，列表截止于命中项；全部
     拒绝时两列表各含 steps 项。exp 向下溢出为 0 合法，向上溢出或任
     一中间结果非有限抛 ValueError。成功时 logits 取命中候选矩阵、
@@ -9700,6 +9701,9 @@ def trpo(logits, batch, max_kl=0.01, steps=10) -> dict:
         for s in range(n_rows)
     ]
     q0 = [_log_softmax(row) for row in logits]
+    plain_logits = [
+        [float(value) for value in row] for row in logits
+    ]
     baseline = sum((adv for _s, _a, adv in samples), 0.0) / n_batch
     if not math.isfinite(baseline):
         raise ValueError("baseline objective must be finite")
@@ -9722,6 +9726,9 @@ def trpo(logits, batch, max_kl=0.01, steps=10) -> dict:
                 row.append(value)
             candidate.append(row)
         qx = [_log_softmax(row) for row in candidate]
+        plain_candidate = [
+            [float(value) for value in row] for row in candidate
+        ]
 
         objective = 0.0
         for s, a, adv in samples:
@@ -9742,7 +9749,7 @@ def trpo(logits, batch, max_kl=0.01, steps=10) -> dict:
         if not math.isfinite(objective):
             raise ValueError("objective must be finite")
 
-        kl = ppo_policy_kl(logits, candidate)["mean"]
+        kl = ppo_policy_kl(plain_logits, plain_candidate)["mean"]
         if not math.isfinite(kl):
             raise ValueError("KL must be finite")
 
@@ -10140,6 +10147,192 @@ def ppo_train(
         "h": _ppo_h_table(h, states),
         "episodes": collector.episodes,
         "objectives": collector.objectives,
+    }
+
+
+def trpo_train(
+    env,
+    episodes=100,
+    alpha=0.05,
+    gamma=0.9,
+    lambda_=0.95,
+    max_kl=0.01,
+    steps=10,
+    seed=0,
+    max_steps=1000,
+) -> dict:
+    """TRPO 训练（每回合 GAE 采样后作信赖域回溯线搜索更新），返回 h 表、
+    v 表、逐回合步表与目标/KL/接受记录。
+
+    状态编号、H/V 初值、采样消费随机数、轨迹记录、GAE 递推、V 更新以及
+    终止/截断处理逐项沿用 ppo_train：从 S 可达的非 G 格按坐标升序编号
+    0..n-1，H 为 n×4 的零 logits 表（列序 U/R/D/L），V 为长度 n 的零
+    值表；每回合 reset，至 done 或 max_steps 步；每步按稳定
+    softmax(H[s,·]) 采样动作，仅消费一次 random()，记录
+    (s, a, r, v, v2, done)，done 时 v2=0.0，步限截断仍自举且回合末自
+    A=0.0 逆序递推，不跨回合。回合末按步序将 [s, a, float(A)] 批次传给
+    trpo(H, batch, max_kl, steps)，以其返回 logits 续训，再按步序作
+    V[s]+=alpha*(A+v-V[s])。全部随机性来自一个 random.Random(seed)。
+
+    env、episodes、alpha、gamma、lambda_、seed、max_steps 的同名参数
+    校验顺序与 TypeError/ValueError 沿用 ppo_train；max_kl、steps 沿用
+    trpo（max_kl 为非 bool 的有限正 int/float；steps 为属于 [1, 61] 的
+    非 bool int）。全部校验在首次 reset 前完成。更新器抛出的异常原样
+    透传，且不返回部分结果。
+
+    返回键依次为 h、v、episodes、objectives、kls、accepted、
+    step_factors；h、v 行按坐标升序分别为
+    [r, c, lU, lR, lD, lL] 与 [r, c, value]，均为 float；episodes 为
+    各回合的 [r, c, action, reward, done] 步列表；后四项逐回合记录
+    trpo 返回：objectives、kls 为 float 列表，accepted 为 bool，
+    step_factors 为命中倍率 float 或 None。新运算结果非有限均抛
+    ValueError。同参同 seed 逐值一致，仅用标准库。
+    """
+    if not isinstance(env, GridWorld):
+        raise TypeError("env must be a GridWorld")
+    if isinstance(episodes, bool) or not isinstance(episodes, int):
+        raise TypeError("episodes must be an int")
+    if isinstance(seed, bool) or not isinstance(seed, int):
+        raise TypeError("seed must be an int")
+    if isinstance(max_steps, bool) or not isinstance(max_steps, int):
+        raise TypeError("max_steps must be an int")
+    if isinstance(alpha, bool) or not isinstance(alpha, (int, float)):
+        raise TypeError("alpha must be an int or float")
+    if isinstance(gamma, bool) or not isinstance(gamma, (int, float)):
+        raise TypeError("gamma must be an int or float")
+    if isinstance(lambda_, bool) or not isinstance(lambda_, (int, float)):
+        raise TypeError("lambda_ must be an int or float")
+    if isinstance(max_kl, bool) or not isinstance(
+        max_kl, (int, float)
+    ):
+        raise TypeError("max_kl must be a non-bool int or float")
+    if isinstance(steps, bool) or not isinstance(steps, int):
+        raise TypeError("steps must be a non-bool int")
+    if episodes <= 0:
+        raise ValueError("episodes must be positive")
+    if max_steps <= 0:
+        raise ValueError("max_steps must be positive")
+    if not _is_finite_number(alpha) or alpha <= 0 or alpha > 1:
+        raise ValueError("alpha must be finite and in (0, 1]")
+    if not _is_finite_number(gamma) or gamma < 0 or gamma > 1:
+        raise ValueError("gamma must be finite and in [0, 1]")
+    if not _is_finite_number(lambda_) or lambda_ < 0 or lambda_ > 1:
+        raise ValueError("lambda_ must be finite and in [0, 1]")
+    try:
+        max_kl = float(max_kl)
+    except OverflowError:
+        raise ValueError("max_kl must convert to a finite float")
+    if not math.isfinite(max_kl) or max_kl <= 0.0:
+        raise ValueError("max_kl must be finite and > 0")
+    if steps < 1 or steps > 61:
+        raise ValueError("steps must be in [1, 61]")
+
+    actions, states, state_index, h, values, rng = _ppo_training_setup(
+        env, seed
+    )
+    all_episodes = []
+    all_objectives = []
+    all_kls = []
+    all_accepted = []
+    all_step_factors = []
+
+    for _ in range(episodes):
+        state = env.reset()
+        trajectory = []
+        step_records = []
+        for _ in range(max_steps):
+            s = state_index[state]
+            row = h[s]
+            m = max(row)
+            softmax_weights = [
+                math.exp(logit - m) for logit in row
+            ]
+            total = sum(softmax_weights)
+            if not math.isfinite(total) or total <= 0.0:
+                raise ValueError(
+                    "softmax normalizer must be finite and positive"
+                )
+            probs = [weight / total for weight in softmax_weights]
+            u = rng.random()
+            cumulative = 0.0
+            a = 3
+            for k, p_k in enumerate(probs):
+                cumulative += p_k
+                if cumulative > u:
+                    a = k
+                    break
+            action = actions[a]
+            value = values[s]
+            next_state, reward, done = env.step(action)
+            value_next = (
+                0.0 if done else values[state_index[next_state]]
+            )
+            trajectory.append(
+                (s, a, reward, value, value_next, done)
+            )
+            step_records.append(
+                [state[0], state[1], action, reward, done]
+            )
+            if done:
+                break
+            state = next_state
+
+        advantages = [0.0] * len(trajectory)
+        a_t = 0.0
+        for t in range(len(trajectory) - 1, -1, -1):
+            (
+                _s,
+                _a,
+                reward,
+                value,
+                value_next,
+                _done,
+            ) = trajectory[t]
+            delta = reward + gamma * value_next - value
+            if not math.isfinite(delta):
+                raise ValueError("GAE delta must be finite")
+            a_t = delta + gamma * lambda_ * a_t
+            if not math.isfinite(a_t):
+                raise ValueError("GAE advantage must be finite")
+            advantages[t] = a_t
+
+        batch = [
+            [s, a, float(adv)]
+            for (s, a, _r, _v, _v2, _done), adv in zip(
+                trajectory, advantages
+            )
+        ]
+        result = trpo(h, batch, max_kl, steps)
+        h = result["logits"]
+        all_objectives.append(result["objectives"])
+        all_kls.append(result["kls"])
+        all_accepted.append(result["accepted"])
+        all_step_factors.append(result["step"])
+
+        for (s, _a, _r, value, _v2, _done), adv in zip(
+            trajectory, advantages
+        ):
+            new_value = values[s] + alpha * (
+                adv + value - values[s]
+            )
+            if not math.isfinite(new_value):
+                raise ValueError("updated value must be finite")
+            values[s] = new_value
+
+        all_episodes.append(step_records)
+
+    v_table = [
+        [float(r), float(c), values[i]]
+        for i, (r, c) in enumerate(states)
+    ]
+    return {
+        "h": _ppo_h_table(h, states),
+        "v": v_table,
+        "episodes": all_episodes,
+        "objectives": all_objectives,
+        "kls": all_kls,
+        "accepted": all_accepted,
+        "step_factors": all_step_factors,
     }
 
 
