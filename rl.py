@@ -1044,6 +1044,76 @@ def q_evaluate_trace(
     }
 
 
+def q_evaluate_many(env, q, seeds, window=20, threshold=0.9, minimum=0.8) -> dict:
+    """按多种子复用 q_evaluate_trace 评估 Q 表，返回滑窗收敛汇总。
+
+    env、q 的合法域与异常分类沿用 q_evaluate_trace。seeds 须为非空
+    list/tuple，成员为非 bool 的 int 且允许重复；容器或成员类型不符
+    抛 TypeError，空序列抛 ValueError，不修改 seeds。window 须为非
+    bool 的正 int，类型错抛 TypeError，非正抛 ValueError。
+    threshold、minimum 须为非 bool 的有限 int/float 且在 [0, 1]，
+    类型错抛 TypeError，溢出、非有限或越界抛 ValueError。全部参数
+    校验先于首次 reset。
+
+    按 seeds 顺序逐项调用 q_evaluate_trace(env, q, seed=seed)，各自
+    独立随机流。每项以 result.episodes 的 success 生成完整长度为
+    window 的滑窗均值：按起点升序，窗内 success 从 0.0 累加后除以
+    window，得 float 列表；回合数不足 window 时为空列表；该项
+    converged 仅在列表非空且末值 >= threshold 时为 True。
+
+    返回键序为 results、pass_rate、converged；results 与 seeds 同
+    序，每项为 [seed, result, windows, converged]，result 即对应
+    q_evaluate_trace 的完整返回值。pass_rate 为 converged 项数除
+    以种子数所得 float；顶层 converged 等价于 pass_rate >=
+    minimum。重复 seed 及重复调用逐值一致。仅用标准库，不引入命令
+    行入口。
+    """
+    if not isinstance(seeds, (list, tuple)):
+        raise TypeError("seeds must be a list or tuple")
+    if not seeds:
+        raise ValueError("seeds must be non-empty")
+    for seed in seeds:
+        if isinstance(seed, bool) or not isinstance(seed, int):
+            raise TypeError("every seed must be a non-bool int")
+    if isinstance(window, bool) or not isinstance(window, int):
+        raise TypeError("window must be an int")
+    if isinstance(threshold, bool) or not isinstance(
+        threshold, (int, float)
+    ):
+        raise TypeError("threshold must be an int or float")
+    if isinstance(minimum, bool) or not isinstance(minimum, (int, float)):
+        raise TypeError("minimum must be an int or float")
+    if window <= 0:
+        raise ValueError("window must be positive")
+    if not _is_finite_number(threshold) or threshold < 0 or threshold > 1:
+        raise ValueError("threshold must be finite and in [0, 1]")
+    if not _is_finite_number(minimum) or minimum < 0 or minimum > 1:
+        raise ValueError("minimum must be finite and in [0, 1]")
+
+    results = []
+    converged_count = 0
+    for seed in seeds:
+        result = q_evaluate_trace(env, q, seed=seed)
+        episodes = result["episodes"]
+        windows = []
+        for start in range(len(episodes) - window + 1):
+            total = 0.0
+            for episode in episodes[start:start + window]:
+                total += episode["success"]
+            windows.append(total / window)
+        converged = bool(windows) and windows[-1] >= threshold
+        if converged:
+            converged_count += 1
+        results.append([seed, result, windows, converged])
+
+    pass_rate = converged_count / len(seeds)
+    return {
+        "results": results,
+        "pass_rate": pass_rate,
+        "converged": pass_rate >= minimum,
+    }
+
+
 def q_learning_trace_bytes(env, data) -> bytes:
     """将 q_learning_trace 的结果严格校验并规范序列化为单行 JSON 字节。
 
