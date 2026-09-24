@@ -5640,7 +5640,11 @@ def lstdq(
                     break
             next_state, reward, done = env.step(action)
             steps += 1
-            if not math.isfinite(reward):
+            try:
+                reward_finite = math.isfinite(reward)
+            except OverflowError:
+                raise ValueError("reward must remain finite") from None
+            if not reward_finite:
                 raise ValueError("reward must remain finite")
             for i in range(size):
                 trace[i] *= decay
@@ -5714,6 +5718,121 @@ def lstdq(
                 raise ValueError("q values must remain finite")
             q[(state, action)] = value
     return {"q": q, "steps": steps}
+
+
+def lspi(
+    env,
+    episodes=500,
+    gamma=0.9,
+    lambda_=0.9,
+    ridge=1e-8,
+    seed=0,
+    max_steps=1000,
+    max_iterations=20,
+) -> dict:
+    """以 LSTDQ 为评估子过程做最小二乘策略迭代（LSPI），返回确定性策略。
+
+    同名参数的校验顺序、合法域与异常分类均沿用 lstdq；max_iterations 须
+    为非 bool 的正 int，错型抛 TypeError、非正抛 ValueError。全部校验
+    先于首次 reset（先于首轮 lstdq 调用）。
+
+    将从 S 可达的非 G 格按坐标升序排列，初始策略每格为 URDL 序的
+    [0.25, 0.25, 0.25, 0.25]。第 i 轮（i 从 0 起）以当前策略与
+    seed+i 调用 lstdq（episodes、gamma、lambda_、ridge、max_steps
+    原样透传），按所得 q 在 URDL 序中取首个最大值动作，同步生成一热
+    float 策略（该格对应项 1.0、其余 0.0）。新策略与当前策略逐格相同
+    即收敛返回；完成 max_iterations 轮评估后策略仍在变化则抛
+    RuntimeError。被调子过程的异常原样透传，不返回部分结果。
+
+    返回 {"policy", "q", "iterations", "steps"}：policy 为按坐标升序
+    的 dict，键为 (row, col)，值为四项 URDL float 概率 list；q 沿用
+    lstdq 的键插入序与值（((row, col), action): float）；iterations 为
+    已评估轮数，steps 为各轮 env.step 调用数之和，二者均为 int。同参
+    同 seed 结果逐值一致，仅用标准库。
+    """
+    if not isinstance(env, GridWorld):
+        raise TypeError("env must be a GridWorld")
+    if isinstance(episodes, bool) or not isinstance(episodes, int):
+        raise TypeError("episodes must be an int")
+    if isinstance(seed, bool) or not isinstance(seed, int):
+        raise TypeError("seed must be an int")
+    if isinstance(max_steps, bool) or not isinstance(max_steps, int):
+        raise TypeError("max_steps must be an int")
+    if isinstance(max_iterations, bool) or not isinstance(
+        max_iterations, int
+    ):
+        raise TypeError("max_iterations must be an int")
+    if isinstance(gamma, bool) or not isinstance(gamma, (int, float)):
+        raise TypeError("gamma must be an int or float")
+    if isinstance(lambda_, bool) or not isinstance(lambda_, (int, float)):
+        raise TypeError("lambda_ must be an int or float")
+    if isinstance(ridge, bool) or not isinstance(ridge, (int, float)):
+        raise TypeError("ridge must be an int or float")
+    if episodes <= 0:
+        raise ValueError("episodes must be positive")
+    if max_steps <= 0:
+        raise ValueError("max_steps must be positive")
+    if max_iterations <= 0:
+        raise ValueError("max_iterations must be positive")
+    if not _is_finite_number(gamma) or gamma < 0 or gamma >= 1:
+        raise ValueError("gamma must be finite and in [0, 1)")
+    if not _is_finite_number(lambda_) or lambda_ < 0 or lambda_ > 1:
+        raise ValueError("lambda_ must be finite and in [0, 1]")
+    try:
+        ridge_value = float(ridge)
+    except OverflowError:
+        raise ValueError("ridge must convert to a finite float")
+    if not math.isfinite(ridge_value) or ridge_value <= 0.0:
+        raise ValueError("ridge must be finite and positive")
+
+    actions = tuple(_ACTIONS)  # U, R, D, L
+    states = sorted(
+        state
+        for state in _reachable_cells(env)
+        if env._cell(state) != "G"
+    )
+    policy = {state: [0.25, 0.25, 0.25, 0.25] for state in states}
+    total_steps = 0
+
+    for i in range(max_iterations):
+        result = lstdq(
+            env,
+            policy,
+            episodes=episodes,
+            gamma=gamma,
+            lambda_=lambda_,
+            ridge=ridge,
+            seed=seed + i,
+            max_steps=max_steps,
+        )
+        q = result["q"]
+        total_steps += result["steps"]
+
+        new_policy = {}
+        for state in states:
+            best_index = 0
+            best_value = q[(state, actions[0])]
+            for action_index in range(1, 4):
+                value = q[(state, actions[action_index])]
+                if value > best_value:
+                    best_value = value
+                    best_index = action_index
+            row = [0.0, 0.0, 0.0, 0.0]
+            row[best_index] = 1.0
+            new_policy[state] = row
+
+        if new_policy == policy:
+            return {
+                "policy": new_policy,
+                "q": q,
+                "iterations": i + 1,
+                "steps": total_steps,
+            }
+        policy = new_policy
+
+    raise RuntimeError(
+        "lspi did not converge within max_iterations"
+    )
 
 
 def off_policy_td(
