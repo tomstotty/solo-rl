@@ -1427,6 +1427,120 @@ def dyna_q(
     return q
 
 
+def experience_replay_q_learning(
+    env,
+    episodes=500,
+    alpha=0.5,
+    gamma=0.9,
+    epsilon=0.1,
+    capacity=1000,
+    replay_steps=4,
+    seed=0,
+    max_steps=1000,
+) -> dict:
+    """经验回放 Q 学习，返回 {"q": Q, "buffer": 缓冲副本, "updates": int}。
+
+    Q 覆盖从 S 可达的非 G 格与 U/R/D/L 的全部组合，初始为 0.0。
+    每回合 reset，done 即停；单回合最多 max_steps 步（末步照常执行，
+    截断末步仍入缓冲并回放）。每个真实步先且仅调用一次 rng.random()
+    与 epsilon 比较，小于则按 rng.randrange(4) 在 U/R/D/L 中探索，
+    否则取 URDL 顺序中首个最大 Q 动作。step 后容量满先删头，再追加
+    [r, c, action, nr, nc, reward, done]；继而恰回放 replay_steps 次：
+    每次 rng.randrange(len(buffer)) 抽一行，done 行目标为 reward，
+    否则为 reward + gamma * max Q(next)，按 Q += alpha * (目标 - Q)
+    更新；目标或新 Q 非有限抛 ValueError。缓冲跨回合保留。
+    全部随机性来自一个 random.Random(seed)。
+    """
+    if not isinstance(env, GridWorld):
+        raise TypeError("env must be a GridWorld")
+    if isinstance(episodes, bool) or not isinstance(episodes, int):
+        raise TypeError("episodes must be an int")
+    if isinstance(capacity, bool) or not isinstance(capacity, int):
+        raise TypeError("capacity must be an int")
+    if isinstance(replay_steps, bool) or not isinstance(replay_steps, int):
+        raise TypeError("replay_steps must be an int")
+    if isinstance(seed, bool) or not isinstance(seed, int):
+        raise TypeError("seed must be an int")
+    if isinstance(max_steps, bool) or not isinstance(max_steps, int):
+        raise TypeError("max_steps must be an int")
+    if isinstance(alpha, bool) or not isinstance(alpha, (int, float)):
+        raise TypeError("alpha must be an int or float")
+    if isinstance(gamma, bool) or not isinstance(gamma, (int, float)):
+        raise TypeError("gamma must be an int or float")
+    if isinstance(epsilon, bool) or not isinstance(epsilon, (int, float)):
+        raise TypeError("epsilon must be an int or float")
+    if episodes <= 0:
+        raise ValueError("episodes must be positive")
+    if capacity <= 0:
+        raise ValueError("capacity must be positive")
+    if replay_steps <= 0:
+        raise ValueError("replay_steps must be positive")
+    if max_steps <= 0:
+        raise ValueError("max_steps must be positive")
+    if not _is_finite_number(alpha) or alpha <= 0 or alpha > 1:
+        raise ValueError("alpha must be finite and in (0, 1]")
+    if not _is_finite_number(gamma) or gamma < 0 or gamma >= 1:
+        raise ValueError("gamma must be finite and in [0, 1)")
+    if not _is_finite_number(epsilon) or epsilon < 0 or epsilon > 1:
+        raise ValueError("epsilon must be finite and in [0, 1]")
+
+    actions = tuple(_ACTIONS)  # U, R, D, L
+    states = sorted(
+        state
+        for state in _reachable_cells(env)
+        if env._cell(state) != "G"
+    )
+    q = {(state, action): 0.0 for state in states for action in actions}
+    buffer = []
+    updates = 0
+    rng = random.Random(seed)
+
+    for _ in range(episodes):
+        state = env.reset()
+        for _ in range(max_steps):
+            if rng.random() < epsilon:
+                action = actions[rng.randrange(4)]
+            else:
+                action = max(actions, key=lambda a: q[(state, a)])
+            next_state, reward, done = env.step(action)
+            if len(buffer) >= capacity:
+                del buffer[0]
+            buffer.append(
+                [
+                    state[0],
+                    state[1],
+                    action,
+                    next_state[0],
+                    next_state[1],
+                    reward,
+                    done,
+                ]
+            )
+            for _ in range(replay_steps):
+                row = buffer[rng.randrange(len(buffer))]
+                if row[6]:
+                    target = row[5]
+                else:
+                    target = row[5] + gamma * max(
+                        q[((row[3], row[4]), a)] for a in actions
+                    )
+                if not _is_finite_number(target):
+                    raise ValueError("target must remain finite")
+                key = ((row[0], row[1]), row[2])
+                q[key] += alpha * (target - q[key])
+                if not math.isfinite(q[key]):
+                    raise ValueError("Q value must remain finite")
+                updates += 1
+            if done:
+                break
+            state = next_state
+    return {
+        "q": q,
+        "buffer": [list(row) for row in buffer],
+        "updates": updates,
+    }
+
+
 def prioritized_sweeping(
     env,
     episodes=500,
