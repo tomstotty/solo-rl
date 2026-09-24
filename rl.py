@@ -370,17 +370,36 @@ def q_learning(
     return q
 
 
-def qr_q(env, E=500, a=0.05, g=0.99, e=0.1, N=51, k=1.0, seed=0, M=1000) -> dict:
+def qr_q(
+    env,
+    E=500,
+    a=0.05,
+    g=0.99,
+    e=0.1,
+    N=51,
+    k=1.0,
+    seed=0,
+    M=1000,
+    risk="mean",
+    level=0.1,
+) -> dict:
     """分位 Q 学习（quantile regression Q-learning），返回 {"q": Q, "z": Z}。
 
     Z 覆盖从 S 可达的非 G 格与 U/R/D/L 的全部组合，每项为 N 个
     初始 0.0 的分位值，tau_i=(i+0.5)/N。每回合 reset，单回合最多 M
-    步；全部随机性来自一个 random.Random(seed)。按 Z 均值 epsilon
+    步；全部随机性来自一个 random.Random(seed)。按动作评分 epsilon
     贪心（每步 random 一次，探索才调 randrange(4)，URDL 破同值）。
-    非终止步按更新前均值取 next 贪心 b，y_j=reward+g*Z[next,b][j]；
+    非终止步按更新前评分取 next 贪心 b，y_j=reward+g*Z[next,b][j]；
     终止步 y_j=reward。令 d=y_j-x_i，G_i 按 j 序从 0.0 累加
     abs(tau_i-I[d<0])*min(max(d,-k),k)，同步取新值 x_i+a*G_i/N；
     中间量或新值非有限抛 ValueError。截断末步仍自举。
+
+    risk 选择动作评分且不改变 Z 原序："mean" 为分位值按原序从 0.0
+    求和除 N；"lower"/"upper" 先将该动作分位值升序/降序复制，令
+    w=level*N、m=floor(w)、f=w-m，分子为前 m 项从 0.0 累加并在
+    f>0 时加 f 倍第 m 项（0 起），再除 w。当前动作与非终止下一动作
+    均取评分最大且 URDL 首个。任一动作均值、风险评分或最终 q 值
+    非有限时在 step 或返回前抛 ValueError。
 
     返回的 q、z 均按坐标升序乘 U/R/D/L 排列，z 的每个值为独立的
     float 列表，q[key]=sum(z[key], 0.0)/N。
@@ -426,6 +445,18 @@ def qr_q(env, E=500, a=0.05, g=0.99, e=0.1, N=51, k=1.0, seed=0, M=1000) -> dict
         raise ValueError("e must be finite and in [0, 1]")
     if not math.isfinite(k) or k <= 0:
         raise ValueError("k must be finite and in (0, +inf)")
+    if not isinstance(risk, str):
+        raise TypeError("risk must be a str")
+    if risk not in ("mean", "lower", "upper"):
+        raise ValueError("risk must be one of mean, lower, upper")
+    if isinstance(level, bool) or not isinstance(level, (int, float)):
+        raise TypeError("level must be an int or float")
+    try:
+        level = float(level)
+    except OverflowError:
+        raise ValueError("level is too large to convert to float")
+    if not math.isfinite(level) or level <= 0 or level > 1:
+        raise ValueError("level must be finite and in (0, 1]")
 
     actions = tuple(_ACTIONS)  # U, R, D, L
     z = {
@@ -437,24 +468,55 @@ def qr_q(env, E=500, a=0.05, g=0.99, e=0.1, N=51, k=1.0, seed=0, M=1000) -> dict
     taus = tuple((i + 0.5) / N for i in range(N))
     rng = random.Random(seed)
 
+    def score(state):
+        """按 risk 返回各动作的评分（URDL 顺序），非有限即抛 ValueError。
+
+        均值与风险评分均在此校验，确保 step 前发现非有限值；不修改
+        Z 中各分位值的原序，仅对排序副本累加。
+        """
+        scores = []
+        for act in actions:
+            values = z[(state, act)]
+            mean = sum(values, 0.0) / N
+            if not math.isfinite(mean):
+                raise ValueError("Z mean must remain finite")
+            if risk == "mean":
+                value = mean
+            else:
+                ordered = sorted(values, reverse=(risk == "upper"))
+                w = level * N
+                m = math.floor(w)
+                f = w - m
+                numerator = 0.0
+                for idx in range(m):
+                    numerator += ordered[idx]
+                if f > 0:
+                    numerator += f * ordered[m]
+                value = numerator / w
+            if not math.isfinite(value):
+                raise ValueError("risk score must remain finite")
+            scores.append(value)
+        return scores
+
+    def greedy_from_scores(scores):
+        return actions[max(range(len(actions)), key=scores.__getitem__)]
+
+    def greedy_action(state):
+        return greedy_from_scores(score(state))
+
     for _ in range(E):
         state = env.reset()
         for _ in range(M):
+            scores = score(state)
             if rng.random() < e:
                 action = actions[rng.randrange(4)]
             else:
-                action = max(
-                    actions,
-                    key=lambda act: sum(z[(state, act)], 0.0) / N,
-                )
+                action = greedy_from_scores(scores)
             next_state, reward, done = env.step(action)
             if done:
                 targets = [reward] * N
             else:
-                best = max(
-                    actions,
-                    key=lambda act: sum(z[(next_state, act)], 0.0) / N,
-                )
+                best = greedy_action(next_state)
                 next_values = z[(next_state, best)]
                 targets = [reward + g * next_values[j] for j in range(N)]
             key = (state, action)
@@ -486,6 +548,9 @@ def qr_q(env, E=500, a=0.05, g=0.99, e=0.1, N=51, k=1.0, seed=0, M=1000) -> dict
 
     z_out = {key: [float(v) for v in values] for key, values in z.items()}
     q = {key: sum(values, 0.0) / N for key, values in z_out.items()}
+    for key, value in q.items():
+        if not math.isfinite(value):
+            raise ValueError("q value must remain finite")
     return {"q": q, "z": z_out}
 
 
