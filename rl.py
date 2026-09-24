@@ -2947,6 +2947,126 @@ def double_q_learning(
     return {"q1": q1, "q2": q2, "q": q}
 
 
+def bootstrapped_q_learning(
+    env,
+    episodes=500,
+    heads=5,
+    alpha=0.5,
+    gamma=0.9,
+    epsilon=0.1,
+    mask_prob=0.8,
+    seed=0,
+    max_steps=1000,
+) -> dict:
+    """Bootstrapped Q-learning，返回键序 q、heads 的 dict。
+
+    heads 张 Q 表均覆盖从 S 可达的非 G 格与 U/R/D/L 的全部组合，
+    初始为 0.0，同键序、同键域且互相独立。每回合先调
+    randrange(heads) 选出本回合使用的头，再 reset；单回合最多
+    max_steps 步；全部随机性来自一个 random.Random(seed)。
+
+    选动作先调一次 random()：其值 < epsilon 时按 URDL 调
+    randrange(4) 取探索动作，否则按本回合选中头的 Q 取 URDL 中
+    首个最大动作。step 后各头按序各调一次 random()：其值 <
+    mask_prob 的头以自身 Q 更新，done 时目标为 r，否则目标为
+    r+gamma*该头 Q 在 s2 上的最大值，随后
+    Q[s,a]+=alpha*(目标-Q[s,a])；未被掩码抽中的头不更新但仍照
+    常消耗随机数。新值非有限抛 ValueError。done 即停；到达步限
+    且未终止的末步仍照常自举更新并抽完全部头的掩码。
+
+    返回的 heads 为各头 Q 表组成的列表；q 以同键序从 0.0 起按
+    头顺序逐值累加后除以 heads 取 float 均值。
+    """
+    if not isinstance(env, GridWorld):
+        raise TypeError("env must be a GridWorld")
+    if isinstance(episodes, bool) or not isinstance(episodes, int):
+        raise TypeError("episodes must be an int")
+    if isinstance(heads, bool) or not isinstance(heads, int):
+        raise TypeError("heads must be an int")
+    if isinstance(alpha, bool) or not isinstance(alpha, (int, float)):
+        raise TypeError("alpha must be an int or float")
+    if isinstance(gamma, bool) or not isinstance(gamma, (int, float)):
+        raise TypeError("gamma must be an int or float")
+    if isinstance(epsilon, bool) or not isinstance(epsilon, (int, float)):
+        raise TypeError("epsilon must be an int or float")
+    if isinstance(mask_prob, bool) or not isinstance(mask_prob, (int, float)):
+        raise TypeError("mask_prob must be an int or float")
+    if isinstance(seed, bool) or not isinstance(seed, int):
+        raise TypeError("seed must be an int")
+    if isinstance(max_steps, bool) or not isinstance(max_steps, int):
+        raise TypeError("max_steps must be an int")
+    if episodes <= 0:
+        raise ValueError("episodes must be positive")
+    if heads < 2:
+        raise ValueError("heads must be at least 2")
+    if not _is_finite_number(alpha) or alpha <= 0 or alpha > 1:
+        raise ValueError("alpha must be finite and in (0, 1]")
+    if not _is_finite_number(gamma) or gamma < 0 or gamma >= 1:
+        raise ValueError("gamma must be finite and in [0, 1)")
+    if not _is_finite_number(epsilon) or epsilon < 0 or epsilon > 1:
+        raise ValueError("epsilon must be finite and in [0, 1]")
+    if (
+        not _is_finite_number(mask_prob)
+        or mask_prob <= 0
+        or mask_prob > 1
+    ):
+        raise ValueError("mask_prob must be finite and in (0, 1]")
+    if max_steps <= 0:
+        raise ValueError("max_steps must be positive")
+
+    actions = tuple(_ACTIONS)  # U, R, D, L
+    states = sorted(
+        state
+        for state in _reachable_cells(env)
+        if env._cell(state) != "G"
+    )
+    q_heads = [
+        {(state, action): 0.0 for state in states for action in actions}
+        for _ in range(heads)
+    ]
+    rng = random.Random(seed)
+
+    for _ in range(episodes):
+        head = rng.randrange(heads)
+        state = env.reset()
+        q_head = q_heads[head]
+        for _ in range(max_steps):
+            if rng.random() < epsilon:
+                action = actions[rng.randrange(4)]
+            else:
+                action = max(
+                    actions, key=lambda a: q_head[(state, a)]
+                )
+            next_state, reward, done = env.step(action)
+            key = (state, action)
+            for qi in q_heads:
+                if rng.random() < mask_prob:
+                    if done:
+                        target = reward
+                    else:
+                        greedy = max(
+                            actions, key=lambda a: qi[(next_state, a)]
+                        )
+                        target = (
+                            reward + gamma * qi[(next_state, greedy)]
+                        )
+                    new_value = qi[key] + alpha * (target - qi[key])
+                    if not math.isfinite(new_value):
+                        raise ValueError("Q value must remain finite")
+                    qi[key] = new_value
+            if done:
+                break
+            state = next_state
+
+    q = {key: 0.0 for key in q_heads[0]}
+    for qi in q_heads:
+        for key in q:
+            q[key] += qi[key]
+    for key in q:
+        q[key] /= float(heads)
+    return {"q": q, "heads": q_heads}
+
+
 def off_policy_mc_control(
     env,
     episodes=500,
