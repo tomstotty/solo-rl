@@ -12539,6 +12539,96 @@ def convergence_report(
     }
 
 
+def return_plateau(returns, window=20, tol=0.01, min_episodes=40) -> dict:
+    """根据逐回合 return 的相邻双窗均值差判定平台期，返回诊断字典。
+
+    returns 须为非空 list/tuple，成员为非 bool 的 int/float 且可转为
+    有限 float；window、min_episodes 为非 bool 正 int，tol 为非 bool
+    的 int/float 且转为有限 float 后 >= 0。类型错抛 TypeError，空
+    returns、整数参数 <= 0、成员或 tol 转 float 溢出/非有限、tol<0
+    抛 ValueError。
+
+    取 float 副本 R 与 T=float(tol)，不修改输入。令 w=window、稳定数
+    初值 0；对 e=2w..len(R)，前窗 R[e-2w:e-w]、近窗 R[e-w:e] 均从
+    0.0 起按序求和后除 w，change 为两均值差的绝对值；change<=T 则
+    稳定数加 1，否则归零。episode 取首个 e>=min_episodes 且稳定数
+    >=w 的 e，但始终计算至末尾。返回键序为 converged、episode、
+    previous、recent、change、stable：previous、recent、change 取末次
+    e 的 float，无双窗（len(R)<2w）时均为 None；stable 为末尾稳定数，
+    converged 当且仅当 episode 非 None。运算或输出出现非有限值抛
+    ValueError。同输入逐值一致，仅用标准库。
+    """
+    if not isinstance(returns, (list, tuple)):
+        raise TypeError("returns must be a list or tuple")
+    if isinstance(window, bool) or not isinstance(window, int):
+        raise TypeError("window must be an int")
+    if isinstance(min_episodes, bool) or not isinstance(min_episodes, int):
+        raise TypeError("min_episodes must be an int")
+    if isinstance(tol, bool) or not isinstance(tol, (int, float)):
+        raise TypeError("tol must be an int or float")
+    if not returns:
+        raise ValueError("returns must be non-empty")
+    if window <= 0:
+        raise ValueError("window must be positive")
+    if min_episodes <= 0:
+        raise ValueError("min_episodes must be positive")
+    try:
+        tolerance = float(tol)
+    except OverflowError:
+        raise ValueError("tol must be convertible to a finite float")
+    if not math.isfinite(tolerance) or tolerance < 0:
+        raise ValueError("tol must be finite and >= 0")
+
+    values = []
+    for value in returns:
+        if isinstance(value, bool) or not isinstance(value, (int, float)):
+            raise TypeError("every return must be a non-bool int or float")
+        try:
+            converted = float(value)
+        except OverflowError:
+            raise ValueError(
+                "every return must be convertible to a finite float"
+            )
+        if not math.isfinite(converted):
+            raise ValueError("every return must be a finite number")
+        values.append(converted)
+
+    w = window
+    stable = 0
+    episode = None
+    previous = None
+    recent = None
+    change = None
+    for e in range(2 * w, len(values) + 1):
+        prev_mean = sum(values[e - 2 * w:e - w], 0.0) / w
+        recent_mean = sum(values[e - w:e], 0.0) / w
+        difference = abs(prev_mean - recent_mean)
+        if not (
+            math.isfinite(prev_mean)
+            and math.isfinite(recent_mean)
+            and math.isfinite(difference)
+        ):
+            raise ValueError("plateau statistics must be finite")
+        previous = prev_mean
+        recent = recent_mean
+        change = difference
+        if difference <= tolerance:
+            stable += 1
+        else:
+            stable = 0
+        if episode is None and e >= min_episodes and stable >= w:
+            episode = e
+
+    return {
+        "converged": episode is not None,
+        "episode": episode,
+        "previous": previous,
+        "recent": recent,
+        "change": change,
+        "stable": stable,
+    }
+
+
 def ppo_seed_convergence_report(
     runs, window=20, tolerance=0.01, patience=3
 ) -> dict:
