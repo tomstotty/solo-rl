@@ -7611,6 +7611,74 @@ def weighted_doubly_robust(trajectories, gamma=0.9) -> dict:
     return {"estimate": estimate, "contributions": contributions}
 
 
+def wdr_bootstrap(data, gamma=0.9, n=1000, level=0.95, seed=0) -> dict:
+    """WDR 点估计的自助法置信区间，对有放回重抽样复用既有评估。
+
+    data 与 gamma 的校验及异常完全沿用 weighted_doubly_robust，
+    不修改 data。n、seed 须为非 bool 的 int，错型抛 TypeError，
+    n<=0 抛 ValueError。level 须为非 bool 的 int/float，错型抛
+    TypeError；转 float 溢出、非有限或不在 (0, 1) 抛 ValueError。
+
+    点估计取 weighted_doubly_robust(data, gamma) 的 estimate。
+    用 random.Random(seed)，令 m=len(data)，每轮按序调用 m 次
+    randrange(m) 组成有放回样本交既有函数，共 n 轮，samples 按
+    生成序保存 float estimate。令 x 为 samples 升序副本、
+    a=(1-level)/2，位置为 a*(n-1)、(1-a)*(n-1)；位置 p 为整数
+    时取 x[p]，否则令 l=floor(p)、u=ceil(p)，取
+    x[l]+(x[u]-x[l])*(p-l)。区间端点非有限抛 ValueError。
+
+    返回新 dict，键序 estimate、interval、samples：estimate 为
+    float 点估计；interval 为 [lower, upper] 两个 float 的新
+    list；samples 为 float 新列表。同输入同 seed 逐值一致。
+    """
+    if isinstance(n, bool) or not isinstance(n, int):
+        raise TypeError("n must be an int")
+    if n <= 0:
+        raise ValueError("n must be positive")
+    if isinstance(seed, bool) or not isinstance(seed, int):
+        raise TypeError("seed must be an int")
+    if isinstance(level, bool) or not isinstance(level, (int, float)):
+        raise TypeError("level must be an int or float")
+    try:
+        lv = float(level)
+    except OverflowError:
+        raise ValueError("level must convert to a finite float")
+    if not math.isfinite(lv):
+        raise ValueError("level must be finite")
+    if lv <= 0.0 or lv >= 1.0:
+        raise ValueError("level must be in (0, 1)")
+
+    estimate = weighted_doubly_robust(data, gamma)["estimate"]
+
+    rng = random.Random(seed)
+    m = len(data)
+    samples = []
+    for _ in range(n):
+        sample = [data[rng.randrange(m)] for _ in range(m)]
+        samples.append(weighted_doubly_robust(sample, gamma)["estimate"])
+
+    x = sorted(samples)
+    a = (1.0 - lv) / 2.0
+
+    def _quantile(p):
+        if p.is_integer():
+            return x[int(p)]
+        l = math.floor(p)
+        u = math.ceil(p)
+        return x[l] + (x[u] - x[l]) * (p - l)
+
+    lower = _quantile(a * (n - 1))
+    upper = _quantile((1.0 - a) * (n - 1))
+    if not math.isfinite(lower) or not math.isfinite(upper):
+        raise ValueError("interval endpoints must be finite")
+
+    return {
+        "estimate": estimate,
+        "interval": [lower, upper],
+        "samples": samples,
+    }
+
+
 def segmented_gae(r, v, n, term, trunc, gamma=0.9, lambda_=0.95) -> dict:
     """分段轨迹的广义优势估计，区分真正终止与时间截断。
 
