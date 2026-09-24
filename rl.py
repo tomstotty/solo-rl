@@ -370,6 +370,125 @@ def q_learning(
     return q
 
 
+def qr_q(env, E=500, a=0.05, g=0.99, e=0.1, N=51, k=1.0, seed=0, M=1000) -> dict:
+    """分位 Q 学习（quantile regression Q-learning），返回 {"q": Q, "z": Z}。
+
+    Z 覆盖从 S 可达的非 G 格与 U/R/D/L 的全部组合，每项为 N 个
+    初始 0.0 的分位值，tau_i=(i+0.5)/N。每回合 reset，单回合最多 M
+    步；全部随机性来自一个 random.Random(seed)。按 Z 均值 epsilon
+    贪心（每步 random 一次，探索才调 randrange(4)，URDL 破同值）。
+    非终止步按更新前均值取 next 贪心 b，y_j=reward+g*Z[next,b][j]；
+    终止步 y_j=reward。令 d=y_j-x_i，G_i 按 j 序从 0.0 累加
+    abs(tau_i-I[d<0])*min(max(d,-k),k)，同步取新值 x_i+a*G_i/N；
+    中间量或新值非有限抛 ValueError。截断末步仍自举。
+
+    返回的 q、z 均按坐标升序乘 U/R/D/L 排列，z 的每个值为独立的
+    float 列表，q[key]=sum(z[key], 0.0)/N。
+    """
+    if not isinstance(env, GridWorld):
+        raise TypeError("env must be a GridWorld")
+    if isinstance(E, bool) or not isinstance(E, int):
+        raise TypeError("E must be an int")
+    if isinstance(N, bool) or not isinstance(N, int):
+        raise TypeError("N must be an int")
+    if isinstance(seed, bool) or not isinstance(seed, int):
+        raise TypeError("seed must be an int")
+    if isinstance(M, bool) or not isinstance(M, int):
+        raise TypeError("M must be an int")
+    if isinstance(a, bool) or not isinstance(a, (int, float)):
+        raise TypeError("a must be an int or float")
+    if isinstance(g, bool) or not isinstance(g, (int, float)):
+        raise TypeError("g must be an int or float")
+    if isinstance(e, bool) or not isinstance(e, (int, float)):
+        raise TypeError("e must be an int or float")
+    if isinstance(k, bool) or not isinstance(k, (int, float)):
+        raise TypeError("k must be an int or float")
+    if E <= 0:
+        raise ValueError("E must be positive")
+    if M <= 0:
+        raise ValueError("M must be positive")
+    if N < 2:
+        raise ValueError("N must be at least 2")
+    try:
+        a = float(a)
+        g = float(g)
+        e = float(e)
+        k = float(k)
+    except OverflowError:
+        raise ValueError(
+            "parameter is too large to convert to float"
+        )
+    if not math.isfinite(a) or a <= 0 or a > 1:
+        raise ValueError("a must be finite and in (0, 1]")
+    if not math.isfinite(g) or g < 0 or g >= 1:
+        raise ValueError("g must be finite and in [0, 1)")
+    if not math.isfinite(e) or e < 0 or e > 1:
+        raise ValueError("e must be finite and in [0, 1]")
+    if not math.isfinite(k) or k <= 0:
+        raise ValueError("k must be finite and in (0, +inf)")
+
+    actions = tuple(_ACTIONS)  # U, R, D, L
+    z = {
+        (state, action): [0.0] * N
+        for state in sorted(_reachable_cells(env))
+        if env._cell(state) != "G"
+        for action in actions
+    }
+    taus = tuple((i + 0.5) / N for i in range(N))
+    rng = random.Random(seed)
+
+    for _ in range(E):
+        state = env.reset()
+        for _ in range(M):
+            if rng.random() < e:
+                action = actions[rng.randrange(4)]
+            else:
+                action = max(
+                    actions,
+                    key=lambda act: sum(z[(state, act)], 0.0) / N,
+                )
+            next_state, reward, done = env.step(action)
+            if done:
+                targets = [reward] * N
+            else:
+                best = max(
+                    actions,
+                    key=lambda act: sum(z[(next_state, act)], 0.0) / N,
+                )
+                next_values = z[(next_state, best)]
+                targets = [reward + g * next_values[j] for j in range(N)]
+            key = (state, action)
+            values = z[key]
+            updated = [0.0] * N
+            for i in range(N):
+                x_i = values[i]
+                tau_i = taus[i]
+                gradient = 0.0
+                for j in range(N):
+                    d = targets[j] - x_i
+                    if not math.isfinite(d):
+                        raise ValueError("intermediate must remain finite")
+                    if d < 0:
+                        weight = 1.0 - tau_i
+                    else:
+                        weight = tau_i
+                    gradient += weight * min(max(d, -k), k)
+                    if not math.isfinite(gradient):
+                        raise ValueError("intermediate must remain finite")
+                new_value = x_i + a * gradient / N
+                if not math.isfinite(new_value):
+                    raise ValueError("Z value must remain finite")
+                updated[i] = new_value
+            z[key] = updated
+            if done:
+                break
+            state = next_state
+
+    z_out = {key: [float(v) for v in values] for key, values in z.items()}
+    q = {key: sum(values, 0.0) / N for key, values in z_out.items()}
+    return {"q": q, "z": z_out}
+
+
 def ucb_q_learning(
     env,
     episodes=500,
