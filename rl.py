@@ -3117,6 +3117,184 @@ def bootstrapped_q_learning(
     return {"q": q, "heads": q_tables}
 
 
+def bootstrapped_q_converge(
+    env,
+    episodes=500,
+    seed=0,
+    check_every=10,
+    tolerance=0.01,
+    patience=3,
+) -> dict:
+    """带收敛早停报告的多头 Bootstrapped Q-learning，返回键序 q、
+    heads、episodes、checks、converged 的 dict。
+
+    训练超参取 bootstrapped_q_learning 默认项（heads=5、alpha=0.5、
+    gamma=0.9、epsilon=0.1、mask_prob=0.8、max_steps=1000，不启用
+    epsilon 衰减），随机消费顺序、更新式、Q 非有限异常与该函数逐字
+    一致；env、episodes、seed 的校验沿用该函数。check_every、
+    patience 须为非 bool 正 int，tolerance 须为非 bool 的有限非负
+    int/float：类型违约抛 TypeError，其余抛 ValueError，全部于首次
+    reset 前校验。
+
+    第 e 回合（0 起）结束后，逢 (e+1) 为 check_every 的倍数或末回合
+    时作一次检查，检查不消费任何随机性：按 Q 键序把五头 Q 值从 0.0
+    顺序累加取均值 M（算法与 bootstrapped_q_learning 的 q 相同）；
+    旧 M 首次为全 0 表，D=max|M-old|（float）；逐状态取各头在
+    URDL 上的首个最大动作，A 为五头动作全同状态数除以状态数所得
+    float。checks 末尾追加 [e, D, A, D<=tolerance 且 A==1.0]，四项
+    依次为 int、float、float、bool，随后以当前 M 更新旧 M。D、A
+    非有限抛 ValueError。
+
+    连续 patience 个检查行通过即提前停止，converged 表示是否命中；
+    否则跑满 episodes。返回的 episodes 为实际运行回数；q、heads 与
+    同 seed 下 bootstrapped_q_learning 跑相同回数的结果同构同值。
+    仅用标准库，不引入命令行入口。
+    """
+    if not isinstance(env, GridWorld):
+        raise TypeError("env must be a GridWorld")
+    if isinstance(episodes, bool) or not isinstance(episodes, int):
+        raise TypeError("episodes must be an int")
+    if isinstance(seed, bool) or not isinstance(seed, int):
+        raise TypeError("seed must be an int")
+    if isinstance(check_every, bool) or not isinstance(check_every, int):
+        raise TypeError("check_every must be an int")
+    if isinstance(patience, bool) or not isinstance(patience, int):
+        raise TypeError("patience must be an int")
+    if isinstance(tolerance, bool) or not isinstance(
+        tolerance, (int, float)
+    ):
+        raise TypeError("tolerance must be an int or float")
+    if episodes <= 0:
+        raise ValueError("episodes must be positive")
+    if check_every <= 0:
+        raise ValueError("check_every must be positive")
+    if patience <= 0:
+        raise ValueError("patience must be positive")
+    if not _is_finite_number(tolerance) or tolerance < 0:
+        raise ValueError("tolerance must be a finite non-negative number")
+
+    heads = 5
+    alpha = 0.5
+    gamma = 0.9
+    epsilon = 0.1
+    mask_prob = 0.8
+    max_steps = 1000
+
+    actions = tuple(_ACTIONS)  # U, R, D, L
+    states = sorted(
+        state
+        for state in _reachable_cells(env)
+        if env._cell(state) != "G"
+    )
+    base = {
+        (state, action): 0.0 for state in states for action in actions
+    }
+    q_tables = [dict(base) for _ in range(heads)]
+    old_mean = dict(base)
+    rng = random.Random(seed)
+
+    checks = []
+    streak = 0
+    ran = episodes
+    converged = False
+
+    for episode in range(episodes):
+        active = rng.randrange(heads)
+        state = env.reset()
+        for _ in range(max_steps):
+            if rng.random() < epsilon:
+                action = actions[rng.randrange(4)]
+            else:
+                action = max(
+                    actions,
+                    key=lambda a: q_tables[active][(state, a)],
+                )
+            next_state, reward, done = env.step(action)
+            key = (state, action)
+            for h in range(heads):
+                if rng.random() < mask_prob:
+                    q_table = q_tables[h]
+                    if done:
+                        target = reward
+                    else:
+                        greedy = max(
+                            actions,
+                            key=lambda a: q_table[(next_state, a)],
+                        )
+                        target = (
+                            reward
+                            + gamma * q_table[(next_state, greedy)]
+                        )
+                    new_value = (
+                        q_table[key] + alpha * (target - q_table[key])
+                    )
+                    if not math.isfinite(new_value):
+                        raise ValueError("Q value must remain finite")
+                    q_table[key] = new_value
+            if done:
+                break
+            state = next_state
+
+        if (episode + 1) % check_every == 0 or episode == episodes - 1:
+            mean_q = {}
+            for key in q_tables[0]:
+                total = 0.0
+                for q_table in q_tables:
+                    total += q_table[key]
+                mean_q[key] = total / heads
+            delta = 0.0
+            for key in mean_q:
+                change = abs(mean_q[key] - old_mean[key])
+                if change > delta:
+                    delta = change
+            agreed = 0
+            for grid_state in states:
+                greedy_actions = []
+                for h in range(heads):
+                    q_table = q_tables[h]
+                    greedy_actions.append(
+                        max(
+                            actions,
+                            key=lambda a: q_table[(grid_state, a)],
+                        )
+                    )
+                if all(
+                    greedy_action == greedy_actions[0]
+                    for greedy_action in greedy_actions
+                ):
+                    agreed += 1
+            agreement = agreed / len(states)
+            if not math.isfinite(delta) or not math.isfinite(agreement):
+                raise ValueError(
+                    "convergence metrics must remain finite"
+                )
+            passed = delta <= tolerance and agreement == 1.0
+            checks.append([episode, delta, agreement, passed])
+            old_mean = mean_q
+            if passed:
+                streak += 1
+                if streak >= patience:
+                    ran = episode + 1
+                    converged = True
+                    break
+            else:
+                streak = 0
+
+    q = {}
+    for key in q_tables[0]:
+        total = 0.0
+        for q_table in q_tables:
+            total += q_table[key]
+        q[key] = total / heads
+    return {
+        "q": q,
+        "heads": q_tables,
+        "episodes": ran,
+        "checks": checks,
+        "converged": converged,
+    }
+
+
 def off_policy_mc_control(
     env,
     episodes=500,
