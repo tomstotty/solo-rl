@@ -5052,6 +5052,236 @@ def off_policy_mc_prediction(
     return {"values": v, "weights": c, "episodes": history}
 
 
+def off_policy_mc_converge(
+    env,
+    behavior,
+    target,
+    episodes=500,
+    gamma=0.9,
+    seed=0,
+    max_steps=1000,
+    check_every=10,
+    tolerance=0.01,
+    patience=3,
+) -> dict:
+    """离策略 MC 预测带固定种子收敛早停，返回键序 values、weights、
+    episodes、checks、converged 的 dict。
+
+    env、behavior、target 及 episodes、gamma、seed、max_steps 的校验、
+    异常分类、策略采样、加权重要性采样更新、终止/截断处理与随机数消费
+    均沿用 off_policy_mc_prediction。check_every、patience 须为非
+    bool 的正 int，tolerance 须为非 bool 的 int/float；类型违约抛
+    TypeError，check_every、patience 非正、tolerance 转 float 溢出、
+    非有限或为负抛 ValueError。全部校验在首次 reset 前完成。
+
+    每逢 check_every 回合（1 基，即第 check_every、2*check_every、…
+    回合完成后）及最终回合完成后作一次检查，检查只读取 V 表、不消费
+    任何随机数：D 为全部可达格（含 G）上 V 与上次快照各键最大绝对差，
+    首次检查时快照为全 0.0 的同键 dict，随后以当前 V 更新快照；D 非
+    有限抛 ValueError。checks 追加 [episode, D, D<=tolerance]，三项
+    依次为 int、float、bool，episode 为 1 基回合号。连续 patience 行
+    末项为真即在该回合后停止训练，否则跑满 episodes 回合。
+
+    episodes 为实际运行的回合记录，结构同 off_policy_mc_prediction；
+    converged 表示是否命中早停；实际运行 k 回合时 values、weights、
+    episodes 逐值等同 off_policy_mc_prediction 在 episodes=k 与相同
+    其余参数下的结果。仅用标准库，不引入命令行入口。
+    """
+    if not isinstance(env, GridWorld):
+        raise TypeError("env must be a GridWorld")
+    if isinstance(episodes, bool) or not isinstance(episodes, int):
+        raise TypeError("episodes must be an int")
+    if isinstance(seed, bool) or not isinstance(seed, int):
+        raise TypeError("seed must be an int")
+    if isinstance(max_steps, bool) or not isinstance(max_steps, int):
+        raise TypeError("max_steps must be an int")
+    if isinstance(gamma, bool) or not isinstance(gamma, (int, float)):
+        raise TypeError("gamma must be an int or float")
+    if isinstance(check_every, bool) or not isinstance(check_every, int):
+        raise TypeError("check_every must be an int")
+    if isinstance(patience, bool) or not isinstance(patience, int):
+        raise TypeError("patience must be an int")
+    if isinstance(tolerance, bool) or not isinstance(
+        tolerance, (int, float)
+    ):
+        raise TypeError("tolerance must be an int or float")
+    if episodes <= 0:
+        raise ValueError("episodes must be positive")
+    if max_steps <= 0:
+        raise ValueError("max_steps must be positive")
+    if not _is_finite_number(gamma) or gamma < 0 or gamma >= 1:
+        raise ValueError("gamma must be finite and in [0, 1)")
+    if check_every <= 0:
+        raise ValueError("check_every must be positive")
+    if patience <= 0:
+        raise ValueError("patience must be positive")
+    try:
+        tolerance = float(tolerance)
+    except OverflowError:
+        raise ValueError(
+            "tolerance must be convertible to a finite float"
+        ) from None
+    if not math.isfinite(tolerance):
+        raise ValueError("tolerance must be finite")
+    if tolerance < 0.0:
+        raise ValueError("tolerance must be non-negative")
+
+    actions = tuple(_ACTIONS)  # U, R, D, L
+    states = sorted(
+        state
+        for state in _reachable_cells(env)
+        if env._cell(state) != "G"
+    )
+    all_states = sorted(_reachable_cells(env))
+
+    def _validate_policy(policy, name):
+        if not isinstance(policy, dict):
+            raise TypeError(name + " must be a dict")
+        for key in policy:
+            if (
+                not isinstance(key, tuple)
+                or len(key) != 2
+                or any(
+                    isinstance(v, bool) or not isinstance(v, int)
+                    for v in key
+                )
+            ):
+                raise TypeError(
+                    name + " keys must be tuples of two non-bool ints"
+                )
+        if set(policy) != set(states):
+            raise ValueError(
+                name
+                + " keys must exactly be the reachable non-goal cells"
+            )
+        for cell in states:
+            row = policy[cell]
+            if not isinstance(row, list):
+                raise TypeError(name + " rows must be lists")
+            if len(row) != 4:
+                raise ValueError(
+                    name
+                    + " rows must have four entries in U, R, D, L order"
+                )
+            for probability in row:
+                if isinstance(probability, bool) or not isinstance(
+                    probability, float
+                ):
+                    raise TypeError(name + " probabilities must be floats")
+            for probability in row:
+                if not math.isfinite(probability):
+                    raise ValueError(
+                        name + " probabilities must be finite"
+                    )
+                if probability < 0:
+                    raise ValueError(
+                        name + " probabilities must be non-negative"
+                    )
+            if sum(row, 0.0) != 1.0:
+                raise ValueError(name + " rows must sum to 1.0")
+
+    _validate_policy(behavior, "behavior policy")
+    _validate_policy(target, "target policy")
+    for cell in states:
+        for index in range(4):
+            if target[cell][index] > 0.0 and behavior[cell][index] <= 0.0:
+                raise ValueError(
+                    "behavior policy must have positive probability wherever "
+                    "target policy does"
+                )
+
+    v = {cell: 0.0 for cell in all_states}
+    c = {cell: 0.0 for cell in all_states}
+    history = []
+    rng = random.Random(seed)
+
+    checks = []
+    snapshot = {cell: 0.0 for cell in all_states}
+    streak = 0
+    converged = False
+
+    for episode in range(episodes):
+        state = env.reset()
+        trajectory = []
+        steps = 0
+        total_reward = 0
+        done = False
+        for _ in range(max_steps):
+            sample = rng.random()
+            cumulative = 0.0
+            action_index = -1
+            for index, probability in enumerate(behavior[state]):
+                cumulative += probability
+                if cumulative > sample:
+                    action_index = index
+                    break
+            if action_index < 0:
+                for index in range(3, -1, -1):
+                    if behavior[state][index] > 0.0:
+                        action_index = index
+                        break
+            rho = (
+                target[state][action_index]
+                / behavior[state][action_index]
+            )
+            if not math.isfinite(rho):
+                raise ValueError("importance ratio must remain finite")
+            next_state, reward, done = env.step(actions[action_index])
+            trajectory.append((state, reward, rho))
+            steps += 1
+            total_reward += reward
+            if done:
+                break
+            state = next_state
+
+        g_return = 0.0
+        weight = 1.0
+        for cell, reward, rho in reversed(trajectory):
+            g_return = reward + gamma * g_return
+            if not math.isfinite(g_return):
+                raise ValueError("return must remain finite")
+            weight *= rho
+            if not math.isfinite(weight):
+                raise ValueError("weight must remain finite")
+            if weight == 0.0:
+                break
+            c[cell] += weight
+            if not math.isfinite(c[cell]):
+                raise ValueError("C value must remain finite")
+            v[cell] += weight / c[cell] * (g_return - v[cell])
+            if not math.isfinite(v[cell]):
+                raise ValueError("V value must remain finite")
+        history.append([steps, total_reward, done])
+
+        ran = episode + 1
+        if ran % check_every == 0 or ran == episodes:
+            delta = 0.0
+            for cell in all_states:
+                change = abs(v[cell] - snapshot[cell])
+                if change > delta:
+                    delta = change
+            if not math.isfinite(delta):
+                raise ValueError("convergence delta must be finite")
+            passed = delta <= tolerance
+            checks.append([ran, delta, passed])
+            snapshot = dict(v)
+            if passed:
+                streak += 1
+                if streak >= patience:
+                    converged = True
+                    break
+            else:
+                streak = 0
+
+    return {
+        "values": v,
+        "weights": c,
+        "episodes": history,
+        "checks": checks,
+        "converged": converged,
+    }
+
+
 def emphatic_td_lambda(
     env,
     behavior,
