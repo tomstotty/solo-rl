@@ -703,6 +703,131 @@ def ucb_q_learning(
     return {"q": q, "counts": counts}
 
 
+def visit_q(
+    env,
+    E=500,
+    a=0.5,
+    g=0.9,
+    e=0.2,
+    end=0.01,
+    d=100.0,
+    p=0.5,
+    seed=0,
+    M=1000,
+) -> dict:
+    """基于状态访问数衰减 epsilon 的 Q-learning，返回键序 q、visits 的 dict。
+
+    Q 覆盖从 S 可达的非 G 格与 U/R/D/L 的全部组合，键序为坐标升序 ×
+    URDL，初始 0.0；visits 为状态访问数，按坐标升序置 0。每回合
+    reset，单回合最多 M 步；全程随机性来自一个 random.Random(seed)。
+
+    每步以 n=visits[s] 计算
+    rate=end+(e-end)/(1+n/d)**p；rate 非有限（含计算溢出）时在
+    N[s] 自增前抛 ValueError，随后 visits[s]+=1。消费一次
+    random()：小于 rate 时再以 randrange(4) 按 URDL 均匀探索，否则
+    取 Q 值最大且 URDL 中首个的动作。step 后 done 时目标为
+    reward，否则为 reward+g*max_a Q[next,a]，以
+    Q+=a*(目标-Q) 更新；目标或新 Q 非有限时抛 ValueError。到达 G
+    立即结束；M 步截断时末步 done=False，仍照常自举更新。
+    """
+    if not isinstance(env, GridWorld):
+        raise TypeError("env must be a GridWorld")
+    if isinstance(E, bool) or not isinstance(E, int):
+        raise TypeError("E must be an int")
+    if isinstance(seed, bool) or not isinstance(seed, int):
+        raise TypeError("seed must be an int")
+    if isinstance(M, bool) or not isinstance(M, int):
+        raise TypeError("M must be an int")
+    if isinstance(a, bool) or not isinstance(a, (int, float)):
+        raise TypeError("a must be an int or float")
+    if isinstance(g, bool) or not isinstance(g, (int, float)):
+        raise TypeError("g must be an int or float")
+    if isinstance(e, bool) or not isinstance(e, (int, float)):
+        raise TypeError("e must be an int or float")
+    if isinstance(end, bool) or not isinstance(end, (int, float)):
+        raise TypeError("end must be an int or float")
+    if isinstance(d, bool) or not isinstance(d, (int, float)):
+        raise TypeError("d must be an int or float")
+    if isinstance(p, bool) or not isinstance(p, (int, float)):
+        raise TypeError("p must be an int or float")
+    if E <= 0:
+        raise ValueError("E must be positive")
+    if M <= 0:
+        raise ValueError("M must be positive")
+    try:
+        a = float(a)
+        g = float(g)
+        e = float(e)
+        end = float(end)
+        d = float(d)
+        p = float(p)
+    except OverflowError:
+        raise ValueError("parameter is too large to convert to float")
+    if not math.isfinite(a) or a <= 0 or a > 1:
+        raise ValueError("a must be finite and in (0, 1]")
+    if not math.isfinite(g) or g < 0 or g >= 1:
+        raise ValueError("g must be finite and in [0, 1)")
+    if not math.isfinite(e) or e < 0 or e > 1:
+        raise ValueError("e must be finite and in [0, 1]")
+    if not math.isfinite(end) or end < 0 or end > 1 or end > e:
+        raise ValueError("end must be finite and satisfy 0 <= end <= e")
+    if not math.isfinite(d) or d <= 0:
+        raise ValueError("d must be finite and in (0, +inf)")
+    if not math.isfinite(p) or p <= 0 or p > 1:
+        raise ValueError("p must be finite and in (0, 1]")
+
+    actions = tuple(_ACTIONS)  # U, R, D, L
+    states = sorted(
+        state
+        for state in _reachable_cells(env)
+        if env._cell(state) != "G"
+    )
+    q = {(state, action): 0.0 for state in states for action in actions}
+    visits = {state: 0 for state in states}
+    rng = random.Random(seed)
+
+    for _episode in range(E):
+        state = env.reset()
+        for _step in range(M):
+            n = visits[state]
+            try:
+                rate = end + (e - end) / (1.0 + n / d) ** p
+            except OverflowError:
+                raise ValueError("exploration rate schedule overflowed")
+            if not math.isfinite(rate):
+                raise ValueError("exploration rate must be finite")
+            visits[state] = n + 1
+            if rng.random() < rate:
+                action = actions[rng.randrange(4)]
+            else:
+                action = actions[0]
+                best = q[(state, action)]
+                for candidate in actions[1:]:
+                    value = q[(state, candidate)]
+                    if value > best:
+                        action = candidate
+                        best = value
+            next_state, reward, done = env.step(action)
+            key = (state, action)
+            if done:
+                target = reward
+            else:
+                target = reward + g * max(
+                    q[(next_state, candidate)] for candidate in actions
+                )
+            if not math.isfinite(target):
+                raise ValueError("target must be finite")
+            new_value = q[key] + a * (target - q[key])
+            if not math.isfinite(new_value):
+                raise ValueError("Q value must remain finite")
+            q[key] = new_value
+            if done:
+                break
+            state = next_state
+
+    return {"q": q, "visits": visits}
+
+
 def q_learning_trace(
     env,
     episodes=500,
