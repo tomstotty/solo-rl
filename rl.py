@@ -8231,14 +8231,26 @@ def emphatic_actor_critic(
             weights = [math.exp(h[(state, a)] - m) for a in actions]
             total = sum(weights)
             probs = [weight / total for weight in weights]
-            followon = interest[state] + gamma * rho_prev * followon
-            if not math.isfinite(followon):
+            try:
+                followon = interest[state] + gamma * rho_prev * followon
+                followon_finite = math.isfinite(followon)
+            except OverflowError as exc:
+                raise ValueError(
+                    "follow-on trace must remain finite"
+                ) from exc
+            if not followon_finite:
                 raise ValueError("follow-on trace must remain finite")
-            emphasis = (
-                lambda_ * interest[state]
-                + (1.0 - lambda_) * followon
-            )
-            if not math.isfinite(emphasis):
+            try:
+                emphasis = (
+                    lambda_ * interest[state]
+                    + (1.0 - lambda_) * followon
+                )
+                emphasis_finite = math.isfinite(emphasis)
+            except OverflowError as exc:
+                raise ValueError(
+                    "emphasis must remain finite"
+                ) from exc
+            if not emphasis_finite:
                 raise ValueError("emphasis must remain finite")
             sample = rng.random()
             cumulative = 0.0
@@ -8301,6 +8313,319 @@ def emphatic_actor_critic(
         [float(r), float(c), v[(r, c)]] for (r, c) in states
     ]
     return {"h": h_table, "v": v_table, "episodes": episode_results}
+
+
+def emphatic_ac_until(
+    env,
+    behavior,
+    interest,
+    episodes=500,
+    alpha=0.05,
+    beta=0.1,
+    gamma=0.9,
+    lambda_=0.9,
+    seed=0,
+    max_steps=1000,
+    check_every=10,
+    policy_tol=1e-4,
+    value_tol=1e-3,
+    patience=3,
+) -> dict:
+    """强调离策略在线一步 actor-critic 训练至 H/V 快照收敛或达回合上限。
+
+    训练完全等同 emphatic_actor_critic(env, behavior, interest,
+    episodes, alpha, beta, gamma, lambda_, seed, max_steps)：同一
+    random.Random(seed)，每步仅调用一次 random()，done 不自举，达步限
+    截断的末步照常自举，F/M/ρ/δ 与 H/V 更新次序一致。同名参数的校验
+    完全沿用 emphatic_actor_critic 的契约；check_every、patience 须为
+    非 bool 的正 int，policy_tol、value_tol 须为非 bool 的 int/float；
+    错型抛 TypeError，check_every/patience 非正或容差转 float 溢出、
+    非有限、为负抛 ValueError。全部校验在首次 reset 前完成。
+
+    快照为键序恰为 h、v 的 dict，行结构沿用 emphatic_actor_critic 返回
+    表：训练前先存一份全零表；此后每 check_every 回合及最终回合（第
+    episodes 回合）完成后各存一份当前 H/V 的独立副本。快照达两项后，
+    每次存入即调用 actor_critic_convergence(snapshots, policy_tol,
+    value_tol, patience)；首次 converged 为真即停止训练，否则跑满
+    episodes 回合。F、M、ρ、δ 或更新后的 H/V 出现非有限值即抛
+    ValueError，且不返回部分结果。
+
+    返回键依次为 h、v、episodes、snapshots、report；实际完成 k 回合时，
+    前三项逐值等于 emphatic_actor_critic 同参运行 k 回合的对应结果，
+    report 为末次 actor_critic_convergence 的完整结果。同参同 seed
+    逐值一致。仅用标准库，不引入命令行入口。
+    """
+    if not isinstance(env, GridWorld):
+        raise TypeError("env must be a GridWorld")
+    if isinstance(episodes, bool) or not isinstance(episodes, int):
+        raise TypeError("episodes must be an int")
+    if isinstance(seed, bool) or not isinstance(seed, int):
+        raise TypeError("seed must be an int")
+    if isinstance(max_steps, bool) or not isinstance(max_steps, int):
+        raise TypeError("max_steps must be an int")
+    if isinstance(check_every, bool) or not isinstance(
+        check_every, int
+    ):
+        raise TypeError("check_every must be an int")
+    if isinstance(patience, bool) or not isinstance(patience, int):
+        raise TypeError("patience must be an int")
+    if isinstance(alpha, bool) or not isinstance(alpha, (int, float)):
+        raise TypeError("alpha must be an int or float")
+    if isinstance(beta, bool) or not isinstance(beta, (int, float)):
+        raise TypeError("beta must be an int or float")
+    if isinstance(gamma, bool) or not isinstance(gamma, (int, float)):
+        raise TypeError("gamma must be an int or float")
+    if isinstance(lambda_, bool) or not isinstance(lambda_, (int, float)):
+        raise TypeError("lambda_ must be an int or float")
+    if isinstance(policy_tol, bool) or not isinstance(
+        policy_tol, (int, float)
+    ):
+        raise TypeError("policy_tol must be an int or float")
+    if isinstance(value_tol, bool) or not isinstance(
+        value_tol, (int, float)
+    ):
+        raise TypeError("value_tol must be an int or float")
+    if episodes <= 0:
+        raise ValueError("episodes must be positive")
+    if max_steps <= 0:
+        raise ValueError("max_steps must be positive")
+    if check_every <= 0:
+        raise ValueError("check_every must be positive")
+    if patience <= 0:
+        raise ValueError("patience must be positive")
+    if not _is_finite_number(alpha) or alpha <= 0 or alpha > 1:
+        raise ValueError("alpha must be finite and in (0, 1]")
+    if not _is_finite_number(beta) or beta <= 0 or beta > 1:
+        raise ValueError("beta must be finite and in (0, 1]")
+    if not _is_finite_number(gamma) or gamma < 0 or gamma >= 1:
+        raise ValueError("gamma must be finite and in [0, 1)")
+    if not _is_finite_number(lambda_) or lambda_ < 0 or lambda_ > 1:
+        raise ValueError("lambda_ must be finite and in [0, 1]")
+    try:
+        policy_tol = float(policy_tol)
+    except OverflowError as exc:
+        raise ValueError(
+            "policy_tol must be convertible to a finite float"
+        ) from exc
+    try:
+        value_tol = float(value_tol)
+    except OverflowError as exc:
+        raise ValueError(
+            "value_tol must be convertible to a finite float"
+        ) from exc
+    if not math.isfinite(policy_tol) or policy_tol < 0:
+        raise ValueError("policy_tol must be a finite non-negative number")
+    if not math.isfinite(value_tol) or value_tol < 0:
+        raise ValueError("value_tol must be a finite non-negative number")
+
+    actions = tuple(_ACTIONS)  # U, R, D, L
+    states = sorted(
+        state
+        for state in _reachable_cells(env)
+        if env._cell(state) != "G"
+    )
+
+    if not isinstance(behavior, dict):
+        raise TypeError("behavior policy must be a dict")
+    for key in behavior:
+        if (
+            not isinstance(key, tuple)
+            or len(key) != 2
+            or any(
+                isinstance(v, bool) or not isinstance(v, int)
+                for v in key
+            )
+        ):
+            raise TypeError(
+                "behavior policy keys must be tuples of two non-bool ints"
+            )
+    if set(behavior) != set(states):
+        raise ValueError(
+            "behavior policy keys must exactly be the reachable "
+            "non-goal cells"
+        )
+    for cell in states:
+        row = behavior[cell]
+        if not isinstance(row, list):
+            raise TypeError("behavior policy rows must be lists")
+        if len(row) != 4:
+            raise ValueError(
+                "behavior policy rows must have four entries in "
+                "U, R, D, L order"
+            )
+        for probability in row:
+            if isinstance(probability, bool) or not isinstance(
+                probability, float
+            ):
+                raise TypeError(
+                    "behavior policy probabilities must be floats"
+                )
+        for probability in row:
+            if not math.isfinite(probability):
+                raise ValueError(
+                    "behavior policy probabilities must be finite"
+                )
+            if probability < 0:
+                raise ValueError(
+                    "behavior policy probabilities must be non-negative"
+                )
+        if sum(row, 0.0) != 1.0:
+            raise ValueError("behavior policy rows must sum to 1.0")
+
+    if not isinstance(interest, dict):
+        raise TypeError("interest must be a dict")
+    for key in interest:
+        if (
+            not isinstance(key, tuple)
+            or len(key) != 2
+            or any(
+                isinstance(v, bool) or not isinstance(v, int) for v in key
+            )
+        ):
+            raise TypeError(
+                "interest keys must be tuples of two non-bool ints"
+            )
+    if set(interest) != set(states):
+        raise ValueError(
+            "interest keys must exactly be the reachable non-goal cells"
+        )
+    any_positive = False
+    for cell in states:
+        value = interest[cell]
+        if isinstance(value, bool) or not isinstance(value, (int, float)):
+            raise TypeError("interest values must be ints or floats")
+        if not _is_finite_number(value):
+            raise ValueError("interest values must be finite")
+        if value < 0:
+            raise ValueError("interest values must be non-negative")
+        if value > 0:
+            any_positive = True
+    if not any_positive:
+        raise ValueError("interest must have at least one positive value")
+
+    h = {(state, action): 0.0 for state in states for action in actions}
+    v = {state: 0.0 for state in states}
+    rng = random.Random(seed)
+    episode_results = []
+
+    def _snapshot():
+        return {
+            "h": [
+                [
+                    float(r),
+                    float(c),
+                    h[((r, c), "U")],
+                    h[((r, c), "R")],
+                    h[((r, c), "D")],
+                    h[((r, c), "L")],
+                ]
+                for (r, c) in states
+            ],
+            "v": [
+                [float(r), float(c), v[(r, c)]] for (r, c) in states
+            ],
+        }
+
+    snapshots = [_snapshot()]
+    report = None
+
+    for episode in range(episodes):
+        state = env.reset()
+        steps = 0
+        total_reward = 0
+        done = False
+        followon = 0.0
+        rho_prev = 0.0
+        for _ in range(max_steps):
+            m = max(h[(state, a)] for a in actions)
+            weights = [math.exp(h[(state, a)] - m) for a in actions]
+            total = sum(weights)
+            probs = [weight / total for weight in weights]
+            try:
+                followon = interest[state] + gamma * rho_prev * followon
+                followon_finite = math.isfinite(followon)
+            except OverflowError as exc:
+                raise ValueError(
+                    "follow-on trace must remain finite"
+                ) from exc
+            if not followon_finite:
+                raise ValueError("follow-on trace must remain finite")
+            try:
+                emphasis = (
+                    lambda_ * interest[state]
+                    + (1.0 - lambda_) * followon
+                )
+                emphasis_finite = math.isfinite(emphasis)
+            except OverflowError as exc:
+                raise ValueError(
+                    "emphasis must remain finite"
+                ) from exc
+            if not emphasis_finite:
+                raise ValueError("emphasis must remain finite")
+            sample = rng.random()
+            cumulative = 0.0
+            action_index = 3
+            for index, probability in enumerate(behavior[state]):
+                if probability > 0.0:
+                    action_index = index
+                cumulative += probability
+                if cumulative > sample:
+                    break
+            action = actions[action_index]
+            rho = (
+                probs[action_index] / behavior[state][action_index]
+            )
+            if not math.isfinite(rho):
+                raise ValueError("importance ratio must remain finite")
+            value = v[state]
+            next_state, reward, done = env.step(action)
+            steps += 1
+            total_reward += reward
+            if done:
+                delta = reward - value
+            else:
+                delta = reward + gamma * v[next_state] - value
+            if not math.isfinite(delta):
+                raise ValueError("delta must remain finite")
+            for b, p_b in zip(actions, probs):
+                indicator = 1.0 if b == action else 0.0
+                update = (
+                    alpha * rho * emphasis * delta * (indicator - p_b)
+                )
+                if not math.isfinite(update):
+                    raise ValueError("policy gradient must remain finite")
+                new_h = h[(state, b)] + update
+                if not math.isfinite(new_h):
+                    raise ValueError("H value must remain finite")
+                h[(state, b)] = new_h
+            new_v = value + beta * rho * emphasis * delta
+            if not math.isfinite(new_v):
+                raise ValueError("V value must remain finite")
+            v[state] = new_v
+            if done:
+                break
+            state = next_state
+            rho_prev = rho
+        episode_results.append([steps, total_reward, done])
+
+        ran = episode + 1
+        if ran % check_every == 0 or ran == episodes:
+            snapshots.append(_snapshot())
+            if len(snapshots) >= 2:
+                report = actor_critic_convergence(
+                    snapshots, policy_tol, value_tol, patience
+                )
+                if report["converged"]:
+                    break
+
+    final = _snapshot()
+    return {
+        "h": final["h"],
+        "v": final["v"],
+        "episodes": episode_results,
+        "snapshots": snapshots,
+        "report": report,
+    }
 
 
 def off_policy_reinforce(
