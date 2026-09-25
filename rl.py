@@ -5050,6 +5050,193 @@ def actor_critic_convergence(
     }
 
 
+def ac_until(
+    env,
+    E=500,
+    a=.05,
+    b=.1,
+    g=.9,
+    seed=0,
+    M=1000,
+    K=10,
+    pt=1e-4,
+    vt=1e-3,
+    P=3,
+) -> dict:
+    """在线一步 actor-critic 训练至 H/V 收敛或达回合上限，返回 h/v 表、
+    逐回合统计、快照序列与收敛报告。
+
+    env 非 GridWorld 抛 TypeError；E、seed、M、K、P 须为非 bool 的
+    int，a、b、g、pt、vt 须为非 bool 的 int/float，错型抛 TypeError。
+    E、M、K、P 须为正；a、b 须有限且属 (0, 1]，g 须有限且属 [0, 1)；
+    pt、vt 转 float 溢出、非有限或为负均抛 ValueError。全部校验在首次
+    reset 前完成。
+
+    训练与 actor_critic(env, E, a, b, g, seed, M) 逐值一致：同一
+    random.Random(seed)，每步仅调用一次 random()，done 时不自举，达
+    步限而未 done 的末步自举。训练前先存入全零 H/V 表为首张快照，之后
+    每 K 回合及最终回合各存一份副本；快照为键序 h、v 的 dict，行结构
+    同 actor_critic。快照达两项后，每次存入即调用
+    actor_critic_convergence(snapshots, pt, vt, P)，首次 converged
+    为真即停训。
+
+    返回键依次为 h、v、episodes、snapshots、report；实际完成 k 回合
+    时前三项逐值等于 actor_critic(env, k, a, b, g, seed, M) 的对应
+    返回，snapshots 为全部快照，report 为末次
+    actor_critic_convergence 结果。δ、策略梯度或更新后的 H/V 值非
+    有限即抛 ValueError 且不返回部分结果；同参同 seed 逐值一致。仅用
+    标准库，不引入命令行入口。
+    """
+    if not isinstance(env, GridWorld):
+        raise TypeError("env must be a GridWorld")
+    if isinstance(E, bool) or not isinstance(E, int):
+        raise TypeError("E must be an int")
+    if isinstance(seed, bool) or not isinstance(seed, int):
+        raise TypeError("seed must be an int")
+    if isinstance(M, bool) or not isinstance(M, int):
+        raise TypeError("M must be an int")
+    if isinstance(K, bool) or not isinstance(K, int):
+        raise TypeError("K must be an int")
+    if isinstance(P, bool) or not isinstance(P, int):
+        raise TypeError("P must be an int")
+    if isinstance(a, bool) or not isinstance(a, (int, float)):
+        raise TypeError("a must be an int or float")
+    if isinstance(b, bool) or not isinstance(b, (int, float)):
+        raise TypeError("b must be an int or float")
+    if isinstance(g, bool) or not isinstance(g, (int, float)):
+        raise TypeError("g must be an int or float")
+    if isinstance(pt, bool) or not isinstance(pt, (int, float)):
+        raise TypeError("pt must be an int or float")
+    if isinstance(vt, bool) or not isinstance(vt, (int, float)):
+        raise TypeError("vt must be an int or float")
+    if E <= 0:
+        raise ValueError("E must be positive")
+    if M <= 0:
+        raise ValueError("M must be positive")
+    if K <= 0:
+        raise ValueError("K must be positive")
+    if P <= 0:
+        raise ValueError("P must be positive")
+    if not _is_finite_number(a) or a <= 0 or a > 1:
+        raise ValueError("a must be finite and in (0, 1]")
+    if not _is_finite_number(b) or b <= 0 or b > 1:
+        raise ValueError("b must be finite and in (0, 1]")
+    if not _is_finite_number(g) or g < 0 or g >= 1:
+        raise ValueError("g must be finite and in [0, 1)")
+    try:
+        ptol = float(pt)
+    except OverflowError as exc:
+        raise ValueError(
+            "pt must be convertible to a finite float"
+        ) from exc
+    try:
+        vtol = float(vt)
+    except OverflowError as exc:
+        raise ValueError(
+            "vt must be convertible to a finite float"
+        ) from exc
+    if not math.isfinite(ptol) or ptol < 0:
+        raise ValueError("pt must be a finite non-negative number")
+    if not math.isfinite(vtol) or vtol < 0:
+        raise ValueError("vt must be a finite non-negative number")
+
+    actions = tuple(_ACTIONS)  # U, R, D, L
+    states = sorted(
+        state
+        for state in _reachable_cells(env)
+        if env._cell(state) != "G"
+    )
+    h = {(state, action): 0.0 for state in states for action in actions}
+    v = {state: 0.0 for state in states}
+    rng = random.Random(seed)
+
+    def _snapshot():
+        h_table = [
+            [
+                float(r),
+                float(c),
+                h[((r, c), "U")],
+                h[((r, c), "R")],
+                h[((r, c), "D")],
+                h[((r, c), "L")],
+            ]
+            for (r, c) in states
+        ]
+        v_table = [
+            [float(r), float(c), v[(r, c)]] for (r, c) in states
+        ]
+        return {"h": h_table, "v": v_table}
+
+    snapshots = [_snapshot()]
+    episode_results = []
+    report = None
+
+    for episode in range(1, E + 1):
+        state = env.reset()
+        steps = 0
+        total_reward = 0
+        done = False
+        for _ in range(M):
+            m = max(h[(state, act)] for act in actions)
+            weights = [math.exp(h[(state, act)] - m) for act in actions]
+            total = sum(weights)
+            probs = [weight / total for weight in weights]
+            u = rng.random()
+            cumulative = 0.0
+            action = "L"
+            for act, p_a in zip(actions, probs):
+                cumulative += p_a
+                if cumulative > u:
+                    action = act
+                    break
+            prob = dict(zip(actions, probs))
+            value = v[state]
+            next_state, reward, done = env.step(action)
+            steps += 1
+            total_reward += reward
+            if done:
+                delta = reward - value
+            else:
+                delta = reward + g * v[next_state] - value
+            if not math.isfinite(delta):
+                raise ValueError("delta must remain finite")
+            for act_b in actions:
+                indicator = 1.0 if act_b == action else 0.0
+                update = a * delta * (indicator - prob[act_b])
+                if not math.isfinite(update):
+                    raise ValueError(
+                        "policy gradient must remain finite"
+                    )
+                new_h = h[(state, act_b)] + update
+                if not math.isfinite(new_h):
+                    raise ValueError("H value must remain finite")
+                h[(state, act_b)] = new_h
+            new_v = v[state] + b * delta
+            if not math.isfinite(new_v):
+                raise ValueError("V value must remain finite")
+            v[state] = new_v
+            if done:
+                break
+            state = next_state
+        episode_results.append([steps, total_reward, done])
+
+        if episode % K == 0 or episode == E:
+            snapshots.append(_snapshot())
+            if len(snapshots) >= 2:
+                report = actor_critic_convergence(snapshots, pt, vt, P)
+                if report["converged"]:
+                    break
+
+    final = _snapshot()
+    return {
+        "h": final["h"],
+        "v": final["v"],
+        "episodes": episode_results,
+        "snapshots": snapshots,
+        "report": report,
+    }
+
+
 def entropy_actor_critic(
     env,
     episodes=500,
