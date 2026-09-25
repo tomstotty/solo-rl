@@ -175,6 +175,99 @@ def value_iteration(env, gamma=0.9, tolerance=1e-9, max_iterations=10000):
     raise RuntimeError("value iteration did not converge")
 
 
+def policy_evaluation(env, policy, gamma=0.9, tolerance=1e-9, max_iterations=10000):
+    """同步策略评估，返回 (values, iterations)。
+
+    policy 为 {(row, col): [pU, pR, pD, pL]}，键恰为从 S 四向避墙可达的
+    非 G 格子；values 为含 G 的 {坐标: float}（按坐标升序），
+    iterations 为实际迭代轮数。
+    """
+    if not isinstance(env, GridWorld):
+        raise TypeError("env must be a GridWorld")
+    if isinstance(gamma, bool) or not isinstance(gamma, (int, float)):
+        raise TypeError("gamma must be an int or float")
+    if not _is_finite_number(gamma) or gamma < 0 or gamma >= 1:
+        raise ValueError("gamma must be finite and in [0, 1)")
+    if isinstance(tolerance, bool) or not isinstance(tolerance, (int, float)):
+        raise TypeError("tolerance must be an int or float")
+    if not _is_finite_number(tolerance) or tolerance <= 0:
+        raise ValueError("tolerance must be finite and in (0, +inf)")
+    if isinstance(max_iterations, bool) or not isinstance(max_iterations, int):
+        raise TypeError("max_iterations must be an int")
+    if max_iterations <= 0:
+        raise ValueError("max_iterations must be positive")
+
+    reachable = sorted(_reachable_cells(env))
+    states = [state for state in reachable if env._cell(state) != "G"]
+
+    if not isinstance(policy, dict):
+        raise TypeError("policy must be a dict")
+    for key in policy:
+        if (
+            not isinstance(key, tuple)
+            or len(key) != 2
+            or any(isinstance(v, bool) or not isinstance(v, int) for v in key)
+        ):
+            raise TypeError("policy keys must be tuples of two ints")
+    if set(policy) != set(states):
+        raise ValueError(
+            "policy keys must be exactly the reachable non-goal states"
+        )
+    for state in states:
+        row = policy[state]
+        if not isinstance(row, list):
+            raise TypeError("policy row must be a list")
+        if len(row) != 4:
+            raise ValueError("policy row must contain four probabilities")
+        for probability in row:
+            if not isinstance(probability, float):
+                raise TypeError("probability must be a float")
+            if not math.isfinite(probability):
+                raise ValueError("probability must be finite")
+            if probability < 0:
+                raise ValueError("probability must be non-negative")
+        if sum(row, 0.0) != 1.0:
+            raise ValueError("probabilities must sum to 1.0")
+
+    values = {state: 0.0 for state in reachable}
+
+    iterations = 0
+    while iterations < max_iterations:
+        new_values = {state: 0.0 for state in reachable}
+        for state in states:
+            updated = 0.0
+            for action, probability in zip(_ACTIONS, policy[state]):
+                nxt, reward, _done = env.transition(state, action)
+                term = probability * (reward + gamma * values[nxt])
+                if not math.isfinite(term):
+                    raise ValueError("non-finite value during policy evaluation")
+                updated += term
+                if not math.isfinite(updated):
+                    raise ValueError("non-finite value during policy evaluation")
+            new_values[state] = updated
+
+        delta = 0.0
+        for state in reachable:
+            change = abs(new_values[state] - values[state])
+            if not math.isfinite(change):
+                raise ValueError("non-finite value during policy evaluation")
+            if change > delta:
+                delta = change
+
+        iterations += 1
+        values = new_values
+        if delta <= tolerance:
+            result = {}
+            for state in reachable:
+                value = float(values[state])
+                if not math.isfinite(value):
+                    raise ValueError("non-finite value in policy evaluation output")
+                result[state] = value
+            return result, iterations
+
+    raise RuntimeError("policy evaluation did not converge")
+
+
 def policy_iteration(env, gamma=0.9, tolerance=1e-9, max_iterations=1000):
     """同步策略迭代，返回 (policy, values, iterations)。
 
