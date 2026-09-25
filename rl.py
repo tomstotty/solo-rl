@@ -8628,6 +8628,110 @@ def emphatic_ac_until(
     }
 
 
+def emphatic_ac_many(env, behavior, interest, seeds, episodes=500) -> dict:
+    """按 seeds 顺序多次运行 emphatic_ac_until 并汇总跨种子离散度。
+
+    seeds 须为非空 list/tuple，元素为非 bool 的 int（可重复）；容器或
+    元素错型抛 TypeError，空序列抛 ValueError。env、behavior、
+    interest、episodes 的校验与异常完全沿用 emphatic_ac_until；全部
+    校验在首次 reset 前完成，且不修改输入。
+
+    按 seeds 顺序依次调用 emphatic_ac_until(env, behavior, interest,
+    episodes=episodes, seed=s)，其余参数取默认值，各次运行使用独立
+    随机流；任一运行抛出的异常原样透传，且不返回部分结果。
+
+    返回键依次为 results、rate、h_gap、v_gap、converged：results 为
+    与 seeds 同序的 [seed, 完整报告] 列表；rate 为各完整报告
+    report.converged 真值占比的 float。各报告最终 h 按
+    actor_critic_convergence 的稳定 softmax 口径（m=max(x)、
+    z=sum(exp(x-m),0.0)、l=x-m-log(z)、p=exp(l)）转为 URDL 概率，
+    h_gap 为各坐标各动作跨报告概率极差（max-min）的最大值；v_gap
+    同法取各报告最终 v 的坐标极差最大值；仅单个种子时二者均为
+    0.0，且均为 float。converged 仅当全部报告的 report.converged
+    为 True 时才为 True。概率或极差计算溢出、出现非有限值即抛
+    ValueError。同参同 seeds 顺序逐值一致。仅用标准库，不引入
+    命令行入口。
+    """
+    if not isinstance(seeds, (list, tuple)):
+        raise TypeError("seeds must be a list or tuple")
+    if not seeds:
+        raise ValueError("seeds must be non-empty")
+    for seed in seeds:
+        if isinstance(seed, bool) or not isinstance(seed, int):
+            raise TypeError("seeds elements must be non-bool ints")
+
+    results = []
+    for seed in seeds:
+        report = emphatic_ac_until(
+            env, behavior, interest, episodes=episodes, seed=seed
+        )
+        results.append([seed, report])
+
+    count = len(results)
+    converged_count = sum(
+        1 for _seed, report in results if report["report"]["converged"]
+    )
+    rate = converged_count / count
+    converged = all(
+        report["report"]["converged"] is True for _seed, report in results
+    )
+
+    if count == 1:
+        h_gap = 0.0
+        v_gap = 0.0
+    else:
+
+        def _policy_probs(rows):
+            """按 actor_critic_convergence 口径转 URDL 概率表。"""
+            table = {}
+            for row in rows:
+                coord = (row[0], row[1])
+                values = row[2:]
+                m = max(values)
+                z = sum((math.exp(value - m) for value in values), 0.0)
+                log_z = math.log(z)
+                probs = [math.exp(value - m - log_z) for value in values]
+                if not all(math.isfinite(p) for p in probs):
+                    raise ValueError("policy probabilities must be finite")
+                table[coord] = probs
+            return table
+
+        h_tables = [
+            _policy_probs(report["h"]) for _seed, report in results
+        ]
+        v_tables = [
+            {(row[0], row[1]): row[2] for row in report["v"]}
+            for _seed, report in results
+        ]
+        h_gap = 0.0
+        for coord in h_tables[0]:
+            for action_index in range(4):
+                values = [
+                    table[coord][action_index] for table in h_tables
+                ]
+                gap = max(values) - min(values)
+                if not math.isfinite(gap):
+                    raise ValueError("policy probability gap must be finite")
+                if gap > h_gap:
+                    h_gap = gap
+        v_gap = 0.0
+        for coord in v_tables[0]:
+            values = [table[coord] for table in v_tables]
+            gap = max(values) - min(values)
+            if not math.isfinite(gap):
+                raise ValueError("value gap must be finite")
+            if gap > v_gap:
+                v_gap = gap
+
+    return {
+        "results": results,
+        "rate": rate,
+        "h_gap": h_gap,
+        "v_gap": v_gap,
+        "converged": converged,
+    }
+
+
 def off_policy_reinforce(
     env,
     behavior,
